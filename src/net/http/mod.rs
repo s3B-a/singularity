@@ -1,16 +1,27 @@
-pub mod chunked;
 pub mod client;
 pub mod headers;
 pub mod method;
-pub mod parser;
+pub mod version;
 pub mod request;
 pub mod response;
-pub mod status;
-pub mod version;
+pub mod http2;
 
-pub use client::HttpClient;
+pub use headers::Headers;
+pub use method::HttpMethod;
+pub use version::HttpVersion;
+pub use client::{HttpClient, HttpClientBuilder};
 pub use request::HttpRequest;
 pub use response::HttpResponse;
-pub use method::HttpMethod;
-pub use status::StatusCode;
-pub use version::HttpVersion;
+
+#[cfg(test)]
+mod tests;
+
+pub mod advanced {
+    pub use super::http2::{
+        Http2Connection,
+        Http2Error,
+        ErrorCode,
+        Settings,
+        Priority,
+    };
+}

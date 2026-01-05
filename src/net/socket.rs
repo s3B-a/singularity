@@ -28,6 +28,20 @@ impl Socket {
         Err(last_err.unwrap_or_else(|| io::Error::new(io::ErrorKind::Other, "Connection failed")))
     }
 
+    pub fn bind<A: ToSocketAddrs>(addr: A) -> io::Result<Self> {
+        let listener = std::net::TcpListener::bind(addr)?;
+        let (stream, _) = listener.accept()?;
+        Ok(Self {
+            inner: stream,
+        })
+    }
+
+    pub fn accept(&self) -> io::Result<(Self, SocketAddr)> {
+        let listener = std::net::TcpListener::bind(self.inner.local_addr()?)?;
+        let (stream, addr) = listener.accept()?;
+        Ok((Self { inner: stream }, addr))
+    }
+
     pub fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
         self.inner.set_read_timeout(timeout)
     }
@@ -56,6 +70,10 @@ impl Socket {
         Ok(Self {
             inner: self.inner.try_clone()?,
         })
+    }
+
+    pub fn peek(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.inner.peek(buf)
     }
 }
 

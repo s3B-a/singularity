@@ -1,11 +1,44 @@
 use super::socket::Socket;
 use std::io::{self, BufRead, BufReader, Read, Write};
-use std::net::ToSocketAddrs;
+use std::net::{ToSocketAddrs, SocketAddr};
 use std::time::Duration;
 
 pub struct TcpStream {
     socket: Socket,
     reader: BufReader<Socket>,
+}
+
+pub struct TcpListener {
+    socket: Socket,
+}
+
+impl TcpListener {
+    pub fn bind<A: ToSocketAddrs>(addr: A) -> io::Result<Self> {
+        let socket = Socket::bind(addr)?;
+        Ok(Self { socket })
+    }
+
+    pub fn accept(&self) -> io::Result<(TcpStream, SocketAddr)> {
+        let (stream, addr) = self.socket.accept()?;
+        Ok((TcpStream {
+            socket: stream.try_clone()?,
+            reader: BufReader::new(stream),
+        }, addr))
+    }
+
+    pub fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.socket.local_addr()
+    }
+
+    pub fn try_clone(&self) -> io::Result<Self> {
+        Ok(Self {
+            socket: self.socket.try_clone()?,
+        })
+    }
+
+    pub fn incoming(&self) -> impl Iterator<Item = io::Result<TcpStream>> + '_ {
+        std::iter::repeat_with(move || self.accept().map(|(stream, _)| stream))
+    }
 }
 
 impl TcpStream {
@@ -88,11 +121,25 @@ impl TcpStream {
     pub fn set_write_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
         self.socket.set_write_timeout(timeout)
     }
+
+    pub fn peek(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.socket.peek(buf)
+    }
+
+    pub fn set_nodelay(&self, nodelay: bool) -> io::Result<()> {
+        self.socket.set_nodelay(nodelay)
+    }
 }
 
 impl Read for TcpStream {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         self.reader.get_mut().read(buf)
+    }
+}
+
+impl Read for &TcpStream {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.socket.try_clone()?.read(buf)
     }
 }
 
@@ -103,5 +150,15 @@ impl Write for TcpStream {
 
     fn flush(&mut self) -> io::Result<()> {
         self.socket.flush()
+    }
+}
+
+impl Write for &TcpStream {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.socket.try_clone()?.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.socket.try_clone()?.flush()
     }
 }
