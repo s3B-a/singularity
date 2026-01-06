@@ -8,14 +8,11 @@ pub struct HttpParser;
 impl HttpParser {
     pub fn parse_response(stream: &mut TcpStream) -> io::Result<HttpResponse> {
         let status_line = Self::read_line(stream)?;
-        let (version, status) = Self::parse_status_line(&status_line)?;
+        let (version, status, reason) = Self::parse_status_line(&status_line)?;
         let headers = Self::read_headers(stream)?;
         let body = Self::read_body(stream, &headers)?;
-        let mut response = HttpResponse::new(status);
-
-        response.set_version(version);
-        response.set_headers(headers);
-        response.set_body(body);
+        let headers_map = headers.into_map();
+        let response = HttpResponse::new(status.code(), reason, version, headers_map, body);
 
         Ok(response)
     }
@@ -32,7 +29,7 @@ impl HttpParser {
         Ok(line)
     }
 
-    fn parse_status_line(line: &str) -> io::Result<(HttpVersion, StatusCode)> {
+    fn parse_status_line(line: &str) -> io::Result<(HttpVersion, StatusCode, String)> {
         let parts: Vec<&str> = line.splitn(3, ' ').collect();
         if parts.len() < 2 {
             return Err(io::Error::new(
@@ -49,7 +46,9 @@ impl HttpParser {
             io::Error::new(io::ErrorKind::InvalidData, "Invalid Status Code")
         })?;
 
-        Ok((version, StatusCode::new(status_code)))
+        let reason = parts.get(2).unwrap_or(&"").to_string();
+
+        Ok((version, StatusCode::new(status_code), reason))
     }
 
     fn read_headers(stream: &mut TcpStream) -> io::Result<Headers> {

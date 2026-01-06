@@ -5,7 +5,11 @@ pub mod version;
 pub mod request;
 pub mod response;
 pub mod http2;
+pub mod status;
+pub mod parser;
+pub mod chunked;
 
+pub use status::StatusCode;
 pub use headers::Headers;
 pub use method::HttpMethod;
 pub use version::HttpVersion;

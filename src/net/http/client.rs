@@ -4,6 +4,7 @@ use super::version::HttpVersion;
 use super::request::HttpRequest;
 use super::response::HttpResponse;
 use crate::net::tcp::TcpStream;
+use crate::net::cookie::{CookieJar, Cookie, parse_set_cookie};
 use std::collections::HashMap;
 use std::io::{self, BufRead, BufReader, Read};
 use std::time::{Duration, Instant};
@@ -303,6 +304,11 @@ impl HttpClientBuilder {
         self
     }
 
+    pub fn enable_cookies(mut self, enable: bool) -> Self {
+        self.client.enable_cookies = enable;
+        self
+    }
+
     pub fn build(self) -> HttpClient {
         self.client
     }
@@ -323,6 +329,8 @@ pub struct HttpClient {
     idle_timeout: Duration,
     enable_pipelining: bool,
     expect_100_continue_threshold: usize,
+    cookie_jar: CookieJar,
+    enable_cookies: bool,
 }
 
 impl HttpClient {
@@ -342,6 +350,8 @@ impl HttpClient {
             idle_timeout: Duration::from_secs(30),
             enable_pipelining: false,
             expect_100_continue_threshold: 1024 * 1024,
+            cookie_jar: CookieJar::new(),
+            enable_cookies: true,
         }
     }
 
@@ -369,6 +379,26 @@ impl HttpClient {
         self.preferred_version = version;
     }
 
+    pub fn set_enable_cookies(&mut self, enable: bool) {
+        self.enable_cookies = enable;
+    }
+
+    pub fn cookie_jar(&self) -> &CookieJar {
+        &self.cookie_jar
+    }
+
+    pub fn cookie_jar_mut(&mut self) -> &mut CookieJar {
+        &mut self.cookie_jar
+    }
+
+    pub fn add_cookie(&mut self, cookie: Cookie) {
+        self.cookie_jar.add(cookie);
+    }
+
+    pub fn clear_cookies(&mut self) {
+        self.cookie_jar.clear();
+    }
+
     pub fn get(&mut self, url: &str) -> Result<HttpResponse, io::Error> {
         let request = HttpRequest::new(HttpMethod::GET, url);
         self.execute(request)
@@ -378,6 +408,49 @@ impl HttpClient {
         let mut request = HttpRequest::new(HttpMethod::POST, url);
         request.set_body(body);
         self.execute(request)
+    }
+
+    fn add_cookies_to_request(&mut self, request: &mut HttpRequest) -> Result<(), io::Error> {
+        let url = request.path();
+        let (scheme, host, port, path) = parse_url(url)?;
+
+        self.cookie_jar.remove_expired();
+        let secure = scheme == "https";
+        if let Some(cookie_header) = self.cookie_jar.cookie_header(&host, &path, secure) {
+            request.set_header("Cookie".to_string(), cookie_header);
+        }
+
+        Ok(())
+    }
+
+    fn store_cookies_from_response(&mut self, response: &HttpResponse, url: &str) -> Result<(), io::Error> {
+        if !self.enable_cookies {
+            return Ok(());
+        }
+
+        let (scheme, host, port, path) = parse_url(url)?;
+        for (key, value) in response.headers() {
+            if key.to_lowercase() == "set-cookie" {
+                match parse_set_cookie(value) {
+                    Ok(mut cookie) => {
+                        if cookie.domain().is_none() {
+                            cookie.set_domain(host.clone());
+                        }
+                        
+                        if cookie.path().is_none() {
+                            cookie.set_path(Some(path.clone()));
+                        }
+                        
+                        self.cookie_jar.add(cookie);
+                    }
+                    Err(e) => {
+                        eprintln!("Failed to parse Set-Cookie header: {}", e);
+                    }
+                }
+            }
+        }
+        
+        Ok(())
     }
 
     pub fn execute(&mut self, mut request: HttpRequest) -> Result<HttpResponse, io::Error> {
@@ -391,6 +464,10 @@ impl HttpClient {
             request.set_header("User-Agent".to_string(), self.user_agent.clone());
         }
 
+        if self.enable_cookies {
+            self.add_cookies_to_request(&mut request)?;
+        }
+
         self.execute_with_redirects(request, 0)
     }
 
@@ -402,7 +479,9 @@ impl HttpClient {
             ));
         }
 
-        let response = self.execute_internal(request.clone())?;        
+        let url = request.path().to_string();
+        let response = self.execute_internal(request.clone())?;
+        self.store_cookies_from_response(&response, &url)?;        
         if self.follow_redirects && response.is_redirect() {
             if let Some(location) = response.headers().get("Location") {
                 let new_url = resolve_url(request.path(), location);
@@ -416,7 +495,7 @@ impl HttpClient {
 
     fn execute_internal(&mut self, request: HttpRequest) -> Result<HttpResponse, io::Error> {
         let url = request.path();
-        let (scheme, host, port, _path) = parse_url(url)?;
+        let (scheme, _host, _port, _path) = parse_url(url)?;
         let use_http2 = self.preferred_version == HttpVersion::Http2 && scheme == "https";
         if use_http2 {
             self.execute_http2(request)
@@ -630,18 +709,25 @@ impl HttpClient {
         let url = request.path();
         let (scheme, host, port, path) = parse_url(url)?;
         let connection_key = format!("{}:{}", host, port);
-
         let entry = self.get_or_create_http2_connection(&connection_key, &host, port)?;
         let stream_id = entry.create_tracked_stream(url.to_string())?;
 
+        let mut headers = vec![
+            (":method".to_string(), request.method().as_str().to_string()),
+            (":path".to_string(), path),
+            (":scheme".to_string(), scheme),
+            (":authority".to_string(), format!("{}:{}", host, port)),
+        ];
+
+        for (key, values) in request.headers().iter() {
+            for value in values {
+                headers.push((key.to_lowercase(), value.clone()));
+            }
+        }
+
         entry.connection.send_request(
             stream_id,
-            vec![
-                (":method".to_string(), request.method().as_str().to_string()),
-                (":path".to_string(), path),
-                (":scheme".to_string(), scheme),
-                (":authority".to_string(), format!("{}:{}", host, port)),
-            ],
+            headers,
             Some(request.get_body().to_vec()),
         );
 
@@ -728,7 +814,8 @@ impl HttpClient {
             .max()
             .unwrap_or(0);
         stats.insert("max_concurrent_streams".to_string(), max_streams);
-        
+        stats.insert("total_cookies".to_string(), self.cookie_jar.len());
+
         stats
     }
 
@@ -906,5 +993,20 @@ mod tests {
         assert_eq!(client.user_agent, "CustomAgent/1.0");
         assert!(!client.follow_redirects);
         assert_eq!(client.preferred_version, HttpVersion::Http2);
+    }
+
+    #[test]
+    fn test_cookie_management() {
+        let mut client = HttpClient::new();
+        
+        let mut cookie = Cookie::new("session", "abc123");
+        cookie.set_domain("example.com".to_string());
+        client.add_cookie(cookie);
+
+        assert_eq!(client.cookie_jar().len(), 1);
+        assert!(client.cookie_jar().contains("session"));
+
+        client.clear_cookies();
+        assert_eq!(client.cookie_jar().len(), 0);
     }
 }

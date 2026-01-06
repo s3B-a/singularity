@@ -98,6 +98,12 @@ impl Headers {
     pub fn is_chunked(&self) -> bool {
         self.get("transfer-encoding").map(|v| v.to_lowercase().contains("chunked")).unwrap_or(false)
     }
+
+    pub fn into_map(self) -> HashMap<String, String> {
+        self.headers.into_iter().map(|(k, v)| {
+            (k, v.join(", "))
+        }).collect()
+    }
 }
 
 impl Default for Headers {
