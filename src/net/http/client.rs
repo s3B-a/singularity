@@ -5,8 +5,10 @@ use super::request::HttpRequest;
 use super::response::HttpResponse;
 use crate::net::tcp::TcpStream;
 use crate::net::cookie::{CookieJar, Cookie, parse_set_cookie};
+use crate::net::dns::DnsResolver;
 use std::collections::HashMap;
 use std::io::{self, BufRead, BufReader, Read};
+use std::net::{SocketAddr, IpAddr};
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone)]
@@ -331,6 +333,7 @@ pub struct HttpClient {
     expect_100_continue_threshold: usize,
     cookie_jar: CookieJar,
     enable_cookies: bool,
+    dns_resolver: DnsResolver,
 }
 
 impl HttpClient {
@@ -352,6 +355,7 @@ impl HttpClient {
             expect_100_continue_threshold: 1024 * 1024,
             cookie_jar: CookieJar::new(),
             enable_cookies: true,
+            dns_resolver: DnsResolver::new(),
         }
     }
 
@@ -361,6 +365,11 @@ impl HttpClient {
 
     pub fn set_timeout(&mut self, timeout: Duration) {
         self.timeout = Some(timeout);
+    }
+
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = Some(timeout);
+        self
     }
 
     pub fn set_user_agent(&mut self, user_agent: String) {
@@ -399,6 +408,218 @@ impl HttpClient {
         self.cookie_jar.clear();
     }
 
+    pub fn with_follow_redirects(mut self, follow: bool) -> Self {
+        self.follow_redirects = follow;
+        self
+    }
+
+    pub fn with_max_redirects(mut self, max: usize) -> Self {
+        self.max_redirects = max;
+        self
+    }
+
+    pub fn with_dns_resolver(mut self, resolver: DnsResolver) -> Self {
+        self.dns_resolver = resolver;
+        self
+    }
+
+    pub fn with_dns_servers(self, servers: Vec<SocketAddr>) -> Self {
+        self.dns_resolver.set_servers(servers);
+        self
+    }
+
+    pub fn send(&self, request: &HttpRequest) -> Result<HttpResponse, io::Error> {
+        self.send_with_redirects(request, 0)
+    }
+
+    fn send_with_redirects(&self, request: &HttpRequest, redirect_count: usize) -> Result<HttpResponse, io::Error> {
+        if redirect_count >= self.max_redirects {
+            return Err(io::Error::new(io::ErrorKind::Other, "Too many redirects"));
+        }
+
+        let url = request.path();
+        let (host, port) = self.parse_host_port(url)?;
+
+        let ip_addresses = self.resolve_host(&host)?;
+
+        let mut last_error = None;
+        for ip in ip_addresses {
+            let addr = SocketAddr::new(ip, port);
+            match self.send_to_address(request, addr) {
+                Ok(response) => {
+                    if self.follow_redirects && response.is_redirect() {
+                        if let Some(location) = response.headers().get("Location") {
+                            let redirect_request = self.build_redirect_request(request, location)?;
+                            return self.send_with_redirects(&redirect_request, redirect_count + 1);
+                        }
+                    }
+                    return Ok(response);
+                }
+                Err(e) => {
+                    last_error = Some(e);
+                    continue;
+                }
+            }
+        }
+
+        Err(last_error.unwrap_or(io::Error::new(io::ErrorKind::Other, "Connection failed")))
+    }
+
+    fn send_to_address(&self, request: &HttpRequest, addr: SocketAddr) -> Result<HttpResponse, io::Error> {
+        let mut stream = TcpStream::connect(addr)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+
+        if let Some(timeout) = self.timeout {
+            stream.set_read_timeout(Some(timeout))
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            stream.set_write_timeout(Some(timeout))
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        }
+
+        let url = request.path();
+        let (_scheme, host, _port, path) = self.parse_host_port(url)
+            .and_then(|(h, p)| Ok(("http", h.clone(), p, url.trim_start_matches("http://").trim_start_matches("https://").split('/').skip(1).collect::<Vec<_>>().join("/"))))
+            .map(|(s, h, p, path)| (s, h, p, if path.is_empty() { "/".to_string() } else { format!("/{}", path) }))?;
+        
+        let request_line = format!("{} {} HTTP/1.1\r\n", request.method().as_str(), path);
+        stream.write_all(request_line.as_bytes())
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        
+        let host_header = format!("Host: {}\r\n", host);
+        stream.write_all(host_header.as_bytes())
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        
+        for (key, values) in request.headers().iter() {
+            if key.to_lowercase() != "host" {
+                let header = format!("{}: {}\r\n", key, values.join(", "));
+                stream.write_all(header.as_bytes())
+                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            }
+        }
+        
+        stream.write_all(b"\r\n")
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        
+        if !request.get_body().is_empty() {
+            stream.write_all(request.get_body())
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        }
+        
+        stream.flush()
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+
+        let mut reader = BufReader::new(&mut stream);
+        self.read_response(&mut reader)
+    }
+
+    fn read_response<R: BufRead>(&self, reader: &mut R) -> Result<HttpResponse, io::Error> {
+        let mut status_line = String::new();
+        reader.read_line(&mut status_line)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+
+        let parts: Vec<&str> = status_line.trim().split_whitespace().collect();
+        if parts.len() < 3 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Invalid status line",
+            ));
+        }
+
+        let version = match parts[0] {
+            "HTTP/1.0" => HttpVersion::Http10,
+            "HTTP/1.1" => HttpVersion::Http11,
+            "HTTP/2.0" => HttpVersion::Http2,
+            _ => HttpVersion::Http2,
+        };
+
+        let status_code: u16 = parts[1].parse().map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidData, "Invalid status code")
+        })?;
+
+        let reason_phrase = parts[2..].join(" ");
+
+        let mut headers = HashMap::new();
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line)?;
+            if line.trim().is_empty() {
+                break;
+            }
+
+            if let Some(pos) = line.find(':') {
+                let key = line[..pos].trim().to_string();
+                let value = line[pos + 1..].trim().to_string();
+                headers.insert(key, value);
+            }
+        }
+
+        let body = if let Some(content_length) = headers.get("Content-Length") {
+            let length: usize = content_length.parse().unwrap_or(0);
+            let mut body = vec![0u8; length];
+            reader.read_exact(&mut body)?;
+            body
+        } else if headers.get("Transfer-Encoding").map(|s| s.as_str()) == Some("chunked") {
+            read_chunked_body(reader)?
+        } else {
+            let mut body = Vec::new();
+            reader.read_to_end(&mut body)?;
+            body
+        };
+
+        Ok(HttpResponse::new(
+            status_code,
+            reason_phrase,
+            version,
+            headers,
+            body,
+        ))
+    }
+
+    fn parse_host_port(&self, url: &str) -> Result<(String, u16), io::Error> {
+        let url = url.trim_start_matches("http://").trim_start_matches("https://");
+        let host_part = url.split('/').next().unwrap_or(url);
+        if let Some(colon_pos) = host_part.rfind(':') {
+            let host = host_part[..colon_pos].to_string();
+            let port_str = &host_part[colon_pos + 1..];
+            let port = port_str.parse::<u16>()
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "Invalid port number"))?;
+            Ok((host, port))
+        } else {
+            let port = if url.starts_with("https://") { 443 } else { 80 };
+            Ok((host_part.to_string(), port))
+        }
+    }
+
+    fn resolve_host(&self, host: &str) -> Result<Vec<IpAddr>, io::Error> {
+        if let Ok(ip) = host.parse::<IpAddr>() {
+            return Ok(vec![ip]);
+        }
+
+        self.dns_resolver
+            .resolve_host(host)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("DNS resolution failed for {}: {}", host, e)))
+    }
+
+    fn build_redirect_request(&self, original: &HttpRequest, location: &str) -> Result<HttpRequest, io::Error> {
+        let mut new_request = HttpRequest::new(original.method().clone(), location.to_string());
+        if let Some(user_agent) = original.headers().get("User-Agent") {
+            new_request.headers_mut().insert("User-Agent".to_string(), user_agent.clone());
+        }
+        if let Some(accept) = original.headers().get("Accept") {
+            new_request.headers_mut().insert("Accept".to_string(), accept.clone());
+        }
+
+        Ok(new_request)
+    }
+
+    pub fn dns_resolver(&self) -> &DnsResolver {
+        &self.dns_resolver
+    }
+
+    pub fn clear_dns_cache(&self) {
+        self.dns_resolver.clear_cache();
+    }
+
     pub fn get(&mut self, url: &str) -> Result<HttpResponse, io::Error> {
         let request = HttpRequest::new(HttpMethod::GET, url);
         self.execute(request)
@@ -410,9 +631,31 @@ impl HttpClient {
         self.execute(request)
     }
 
+    pub fn head(&self, url: &str) -> Result<HttpResponse, io::Error> {
+        let request = HttpRequest::new(HttpMethod::HEAD, url);
+        self.send(&request)
+    }
+
+    pub fn put(&self, url: &str, body: Vec<u8>) -> Result<HttpResponse, io::Error> {
+        let mut request = HttpRequest::new(HttpMethod::PUT, url);
+        request.set_body(body);
+        self.send(&request)
+    }
+
+    pub fn delete(&self, url: &str) -> Result<HttpResponse, io::Error> {
+        let request = HttpRequest::new(HttpMethod::DELETE, url);
+        self.send(&request)
+    }
+
+    pub fn patch(&self, url: &str, body: Vec<u8>) -> Result<HttpResponse, io::Error> {
+        let mut request = HttpRequest::new(HttpMethod::PATCH, url);
+        request.set_body(body);
+        self.send(&request)
+    }
+
     fn add_cookies_to_request(&mut self, request: &mut HttpRequest) -> Result<(), io::Error> {
         let url = request.path();
-        let (scheme, host, port, path) = parse_url(url)?;
+        let (scheme, host, _port, path) = parse_url(url)?;
 
         self.cookie_jar.remove_expired();
         let secure = scheme == "https";
@@ -428,7 +671,7 @@ impl HttpClient {
             return Ok(());
         }
 
-        let (scheme, host, port, path) = parse_url(url)?;
+        let (_scheme, host, _port, path) = parse_url(url)?;
         for (key, value) in response.headers() {
             if key.to_lowercase() == "set-cookie" {
                 match parse_set_cookie(value) {
@@ -506,7 +749,7 @@ impl HttpClient {
 
     fn execute_http1(&mut self, mut request: HttpRequest) -> Result<HttpResponse, io::Error> {
         let url = request.path();
-        let (scheme, host, port, path) = parse_url(url)?;
+        let (_scheme, host, port, path) = parse_url(url)?;
         let connection_key = format!("{}:{}", host, port);
 
         let body_len = request.get_body().len();
@@ -522,7 +765,7 @@ impl HttpClient {
             .unwrap_or(true); // Default to keep-alive for HTTP/1.1
 
         let mut stream_option: Option<TcpStream> = None;
-        let mut reused_connection = false;
+        let mut _reused_connection = false;
 
         if use_keep_alive {
             self.cleanup_idle_connections();
@@ -534,7 +777,7 @@ impl HttpClient {
                     let mut entry = self.http1_connections.remove(&connection_key).unwrap();
                     entry.mark_used();
                     stream_option = Some(entry.stream);
-                    reused_connection = true;
+                    _reused_connection = true;
                 }
             }
         }
@@ -775,7 +1018,7 @@ impl HttpClient {
     }
 
     fn cleanup_idle_connections(&mut self) {
-        let now = Instant::now();
+        let _now = Instant::now();
         
         self.http1_connections.retain(|_, entry| {
             !entry.is_idle_timeout() && !entry.should_close() && entry.is_healthy()
@@ -917,7 +1160,7 @@ fn resolve_url(base: &str, relative: &str) -> String {
     }
 }
 
-fn read_chunked_body<R: Read>(reader: &mut BufReader<R>) -> Result<Vec<u8>, io::Error> {
+fn read_chunked_body<R: BufRead>(reader: &mut R) -> Result<Vec<u8>, io::Error> {
     let mut body = Vec::new();
     loop {
         let mut size_line = String::new();
