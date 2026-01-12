@@ -8,6 +8,7 @@ pub mod http2;
 pub mod status;
 pub mod parser;
 pub mod chunked;
+pub mod trailer;
 
 pub use status::StatusCode;
 pub use headers::Headers;
@@ -15,6 +16,7 @@ pub use method::HttpMethod;
 pub use version::HttpVersion;
 pub use client::{HttpClient, HttpClientBuilder};
 pub use request::HttpRequest;
+pub use trailer::TrailerHeaders;
 pub use response::HttpResponse;
 
 #[cfg(test)]

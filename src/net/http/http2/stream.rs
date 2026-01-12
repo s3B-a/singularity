@@ -20,7 +20,7 @@ pub struct Http2Stream {
     state: StreamState,
     flow_control: FlowControl,
     priority: Priority,
-    send_buffer: VecDeque<Vec<u8>>,
+    pub send_buffer: VecDeque<Vec<u8>>,
     recv_buffer: Vec<u8>,
     request_headers: Vec<(String, String)>,
     response_headers: Vec<(String, String)>,
@@ -28,7 +28,7 @@ pub struct Http2Stream {
     headers_received: bool,
     headers_sent: bool,
     end_stream_received: bool,
-    end_stream_sent: bool,
+    pub end_stream_sent: bool,
 }
 
 impl Http2Stream {

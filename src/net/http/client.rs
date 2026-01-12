@@ -876,6 +876,8 @@ impl HttpClient {
         let reason_phrase = parts[2..].join(" ");
 
         let mut headers = HashMap::new();
+        let mut has_trailer_header = false;
+        let mut expected_trailers: Vec<String> = Vec::new();
         loop {
             let mut line = String::new();
             reader.read_line(&mut line)?;
@@ -886,16 +888,28 @@ impl HttpClient {
             if let Some(pos) = line.find(':') {
                 let key = line[..pos].trim().to_string();
                 let value = line[pos + 1..].trim().to_string();
+                if key.to_lowercase() == "trailer" {
+                    has_trailer_header = true;
+                    expected_trailers = value
+                        .split(',')
+                        .map(|s| s.trim().to_lowercase())
+                        .collect();
+                }
+                
                 headers.insert(key, value);
             }
         }
+
+        let is_chunked = headers.get("Transfer-Encoding")
+            .map(|s| s.to_lowercase().contains("chunked"))
+            .unwrap_or(false);
 
         let body = if let Some(content_length) = headers.get("Content-Length") {
             let length: usize = content_length.parse().unwrap_or(0);
             let mut body = vec![0u8; length];
             reader.read_exact(&mut body)?;
             body
-        } else if headers.get("Transfer-Encoding").map(|s| s.as_str()) == Some("chunked") {
+        } else if is_chunked {
             read_chunked_body(&mut reader)?
         } else {
             let mut body = Vec::new();
@@ -904,24 +918,13 @@ impl HttpClient {
         };
 
         let mut trailer_headers = HashMap::new();
-        if headers.get("Transfer-Encoding").map(|s| s.as_str()) == Some("chunked") {
-            loop {
-                let mut line = String::new();
-                reader.read_line(&mut line)?;
-                if line.trim().is_empty() {
-                    break;
-                }
-
-                if let Some(pos) = line.find(':') {
-                    let key = line[..pos].trim().to_string();
-                    let value = line[pos + 1..].trim().to_string();
-                    trailer_headers.insert(key, value);
-                }
+        if is_chunked {
+            trailer_headers = self.read_trailing_headers(&mut reader, has_trailer_header, &expected_trailers)?;
+            
+            // Trailers should not override existing headers (RFC 7230 4.1.2)
+            for (key, value) in trailer_headers {
+                headers.entry(key).or_insert(value);
             }
-        }
-
-        for (key, value) in trailer_headers {
-            headers.insert(key, value);
         }
 
         let server_wants_close = headers.get("Connection")
@@ -975,7 +978,7 @@ impl HttpClient {
         );
 
         if !request.get_body().is_empty() {
-            entry.connection.send_data(stream_id, request.get_body().to_vec(), true);
+            entry.connection.send_data(stream_id, request.get_body(), true);
         }
 
         let response = Self::extract_http2_response(entry, stream_id)?;
@@ -1015,6 +1018,73 @@ impl HttpClient {
             response_headers,
             body,
         ))
+    }
+
+    fn read_trailing_headers(&self, reader: &mut BufReader<TcpStream>, has_trailer_header: bool, expected_trailers: &[String]) -> Result<HashMap<String, String>, io::Error> {
+        let mut trailers = HashMap::new();
+        let mut found_trailers: Vec<String> = Vec::new();
+        loop {
+            let mut line = String::new();
+            let bytes_read = reader.read_line(&mut line)?;
+            if line.trim().is_empty() || bytes_read == 0 {
+                break;
+            }
+
+            if let Some(pos) = line.find(':') {
+                let key = line[..pos].trim().to_string();
+                let value = line[pos + 1..].trim().to_string();
+                let key_lower = key.to_lowercase();
+                if self.is_forbidden_trailer(&key_lower) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("Forbidden trailer field: {}", key),
+                    ));
+                }
+
+                if has_trailer_header && !expected_trailers.contains(&key_lower) {
+                    eprintln!("Warning: Unexpected trailer header '{}' not listed in Trailer header", key);
+                }
+
+                found_trailers.push(key_lower.clone());
+                trailers.insert(key, value);
+            } else if !line.trim().is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("Malformed trailer line: {}", line.trim()),
+                ));
+            }
+        }
+
+        if has_trailer_header {
+            for expected in expected_trailers {
+                if !found_trailers.contains(expected) {
+                    eprintln!("Warning: Expected trailer '{}' was not received", expected);
+                }
+            }
+        }
+
+        Ok(trailers)
+    }
+
+    fn is_forbidden_trailer(&self, field_name: &str) -> bool {
+        // Forbidden fields in trailers:
+        matches!(
+            field_name,
+            // Control data
+            "transfer-encoding" | "content-length" | "host" |
+            // Routing
+            "cache-control" | "expect" | "max-forwards" | "pragma" | "range" | "te" |
+            // Authentication
+            "authorization" | "set-cookie" | "cookie" |
+            // Content negotiation
+            "content-encoding" | "content-type" | "content-range" | "trailer" |
+            // Connection management
+            "connection" | "keep-alive" | "proxy-authenticate" | "proxy-authorization" |
+            "upgrade" | "via" | "warning" |
+            // Request modifiers
+            "if-match" | "if-none-match" | "if-modified-since" | "if-unmodified-since" |
+            "if-range"
+        )
     }
 
     fn cleanup_idle_connections(&mut self) {

@@ -6,6 +6,7 @@ mod hpack;
 mod priority;
 mod settings;
 mod stream;
+mod scheduler;
 
 pub use connection::Http2Connection;
 pub use error::{ErrorCode, Http2Error, Result};
@@ -14,6 +15,7 @@ pub use frame::{Frame, FrameFlags, FrameHeader, FrameType};
 pub use hpack::HpackCodec;
 pub use priority::{Priority, PriorityTree};
 pub use settings::{Settings, SettingId};
+pub use scheduler::{PriorityScheduler, DependencyTreeStats, StreamScheduleState};
 pub use stream::{Http2Stream, StreamState};
 
 pub const CLIENT_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";

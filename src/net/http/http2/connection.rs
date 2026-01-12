@@ -2,8 +2,9 @@ use super::error::{ErrorCode, Http2Error, Result};
 use super::flow_control::FlowControl;
 use super::frame::{Frame, FrameFlags, FrameType};
 use super::hpack::HpackCodec;
-use super::priority::PriorityTree;
+use super::priority::{Priority, PriorityTree};
 use super::settings::{Settings, SettingId};
+use super::scheduler::{PriorityScheduler, DependencyTreeStats};
 use super::stream::Http2Stream;
 use crate::net::tcp::TcpStream;
 use std::collections::HashMap;
@@ -24,6 +25,8 @@ pub struct Http2Connection {
     goaway_sent: bool,
     goaway_received: bool,
     continuation_state: Option<ContinuationState>,
+    scheduler: PriorityScheduler,
+    max_frame_size: u32,
 }
 
 #[derive(Debug)]
@@ -68,6 +71,8 @@ impl Http2Connection {
             goaway_sent: false,
             goaway_received: false,
             continuation_state: None,
+            scheduler: PriorityScheduler::new(),
+            max_frame_size: 16384,
         })
     }
 
@@ -98,23 +103,37 @@ impl Http2Connection {
     }
 
     pub fn create_stream(&mut self) -> Result<u32> {
-        if self.goaway_received {
-            return Err(Http2Error::Protocol(
-                ErrorCode::RefusedStream,
-                "Connection is closing".to_string(),
-            ));
-        }
-
         let stream_id = self.next_stream_id;
         self.next_stream_id += 2;
-        let stream = Http2Stream::new(
-            stream_id,
-            self.remote_settings.initial_window_size(),
-        );
 
+        let priority = Priority::default();
+        let stream = Http2Stream::new(stream_id, self.local_settings.initial_window_size());
+        
         self.streams.insert(stream_id, stream);
-
+        self.scheduler.add_stream(stream_id, priority);
+        
         Ok(stream_id)
+    }
+
+    pub fn create_stream_with_priority(&mut self, priority: Priority) -> Result<u32> {
+        let stream_id = self.next_stream_id;
+        self.next_stream_id += 2;
+
+        let stream = Http2Stream::new(stream_id, self.local_settings.initial_window_size());        
+        self.streams.insert(stream_id, stream);
+        self.scheduler.add_stream(stream_id, priority);
+        
+        Ok(stream_id)
+    }
+
+    pub fn update_stream_priority(&mut self, stream_id: u32, priority: Priority) -> Result<()> {
+        if let Some(stream) = self.streams.get_mut(&stream_id) {
+            stream.set_priority(priority.clone());
+            self.scheduler.update_priority(stream_id, priority);
+            Ok(())
+        } else {
+            Err(Http2Error::StreamNotFound(stream_id))
+        }
     }
 
     pub fn send_request(&mut self, stream_id: u32, headers: Vec<(String, String)>, body: Option<Vec<u8>>) -> Result<()> {
@@ -135,45 +154,76 @@ impl Http2Connection {
         }
         
         if let Some(body_data) = body {
-            self.send_data(stream_id, body_data, true)?;
+            self.send_data(stream_id, &body_data, true)?;
         }
 
         self.stream.flush()?;
         Ok(())
     }
 
-    pub fn send_pending_data(&mut self) -> Result<()> {
-        loop {
-            let available_streams: Vec<u32> = self.streams.iter().filter(|(_, stream)| {
-                    stream.has_pending_data() && stream.flow_control().can_send(1) 
-                    && self.connection_flow_control.can_send(1)
-                }).map(|(&id, _)| id).collect();
-
-            if available_streams.is_empty() {
+    pub fn send_pending_data(&mut self) -> Result<usize> {
+        let mut total_sent = 0;
+        while self.scheduler.has_ready_streams() {
+            let stream_id = match self.scheduler.schedule_next() {
+                Some(id) => id,
+                None => break,
+            };
+            
+            if self.connection_flow_control.window_size() <= 0 {
                 break;
             }
-
-            let stream_id = self.priority_tree.next_stream(&available_streams).unwrap_or(available_streams[0]);
-            let chunk_size = self.remote_settings.max_frame_size() as usize;
-            if let Some(stream) = self.streams.get_mut(&stream_id) {
-                if let Some(chunk) = stream.next_data_chunk(chunk_size) {
-                    let chunk_len = chunk.len();
-                    if !self.connection_flow_control.can_send(chunk_len) {
-                        break;
-                    }
-                    
-                    self.connection_flow_control.consume(chunk_len)?;
-                    let is_last = stream.next_data_chunk(1).is_none();
-                    let frame = Frame::data(stream_id, chunk, is_last);
-                    frame.write(&mut self.stream)?;
-                    
-                    self.priority_tree.update_after_send(stream_id, chunk_len);
+            
+            let stream = match self.streams.get_mut(&stream_id) {
+                Some(s) => s,
+                None => {
+                    self.scheduler.remove_stream(stream_id);
+                    continue;
                 }
+            };
+            
+            if stream.send_buffer_len() == 0 {
+                self.scheduler.mark_blocked(stream_id);
+                continue;
+            }
+            
+            let stream_window = stream.flow_control().window_size();
+            if stream_window <= 0 {
+                self.scheduler.mark_blocked(stream_id);
+                continue;
+            }
+            
+            let conn_window = self.connection_flow_control.window_size() as usize;
+            let max_send = conn_window.min(stream_window as usize).min(self.max_frame_size as usize);
+            
+            let data = stream.get_send_data(max_send);
+            if data.is_empty() {
+                self.scheduler.mark_blocked(stream_id);
+                continue;
+            }
+            
+            let data_len = data.len();
+            let flags = if stream.is_send_complete() && stream.send_buffer_len() == 0 {
+                FrameFlags::END_STREAM
+            } else {
+                0
+            };
+            let frame = Frame::new(FrameType::Data, flags, stream_id, data);
+            
+            frame.write(&mut self.stream)?;
+            
+            self.connection_flow_control.consume(data_len)?;
+            stream.flow_control_mut().consume(data_len)?;
+            
+            self.scheduler.bytes_sent(stream_id, data_len);
+            total_sent += data_len;
+            if stream.send_buffer_len() > 0 {
+                self.scheduler.mark_ready(stream_id, stream.send_buffer_len());
+            } else {
+                self.scheduler.mark_blocked(stream_id);
             }
         }
-
-        self.stream.flush()?;
-        Ok(())
+        
+        Ok(total_sent)
     }
 
     fn send_headers_with_continuation(&mut self, stream_id: u32, mut headers_data: Vec<u8>, end_stream: bool) -> Result<()> {
@@ -198,28 +248,16 @@ impl Http2Connection {
         Ok(())
     }
 
-    pub fn send_data(&mut self, stream_id: u32, data: Vec<u8>, end_stream: bool) -> Result<()> {
-        let stream = self.streams.get_mut(&stream_id)
-            .ok_or(Http2Error::StreamNotFound(stream_id))?;
-
-        stream.queue_data(data)?;
-        while let Some(chunk) = stream.next_data_chunk(self.remote_settings.max_frame_size() as usize) {
-            if !self.connection_flow_control.can_send(chunk.len()) {
-                break;
-            }
-
-            self.connection_flow_control.consume(chunk.len())?;
-            
-            let is_last = stream.next_data_chunk(1).is_none();
-            let frame = Frame::data(stream_id, chunk, end_stream && is_last);
-            frame.write(&mut self.stream)?;
-        }
-
+    pub fn send_data(&mut self, stream_id: u32, data: &[u8], end_stream: bool) -> Result<()> {
+        let stream = self.streams.get_mut(&stream_id).ok_or(Http2Error::StreamNotFound(stream_id))?;
+        stream.queue_send_data(data.to_vec())?;
         if end_stream {
-            stream.send_end_stream()?;
+            stream.mark_send_complete();
         }
-
-        self.stream.flush()?;
+        
+        self.scheduler.mark_ready(stream_id, stream.send_buffer_len());
+        self.send_pending_data()?;
+        
         Ok(())
     }
 
@@ -235,6 +273,24 @@ impl Http2Connection {
         }
 
         Ok(())
+    }
+
+    pub fn close_stream(&mut self, stream_id: u32) -> Result<()> {
+        if let Some(stream) = self.streams.get_mut(&stream_id) {
+            stream.reset();
+        }
+        
+        self.scheduler.mark_closed(stream_id);
+        
+        Ok(())
+    }
+
+    pub fn get_scheduler_stats(&self) -> DependencyTreeStats {
+        self.scheduler.get_tree_stats()
+    }
+
+    pub fn get_stream_priority(&self, stream_id: u32) -> Option<Priority> {
+        self.scheduler.get_priority(stream_id)
     }
 
     fn handle_frame(&mut self, frame: Frame) -> Result<()> {
@@ -285,6 +341,28 @@ impl Http2Connection {
             FrameType::WindowUpdate => self.handle_window_update_frame(&frame),
             FrameType::Continuation => self.handle_continuation_frame(&frame),
         }
+    }
+
+    fn handle_window_update(&mut self, stream_id: u32, increment: u32) -> Result<()> {
+        if stream_id == 0 {
+            self.connection_flow_control.increase(increment)?;
+            for (&sid, stream) in &self.streams {
+                if stream.send_buffer_len() > 0 && stream.flow_control().window_size() > 0 {
+                    self.scheduler.mark_ready(sid, stream.send_buffer_len());
+                }
+            }
+        } else {
+            if let Some(stream) = self.streams.get_mut(&stream_id) {
+                stream.flow_control_mut().increase(increment)?;
+                
+                if stream.send_buffer_len() > 0 && stream.flow_control().window_size() > 0 {
+                    self.scheduler.mark_ready(stream_id, stream.send_buffer_len());
+                }
+            }
+        }
+        
+        self.send_pending_data()?;
+        Ok(())
     }
 
     fn handle_data_frame(&mut self, frame: &Frame) -> Result<()> {
@@ -690,6 +768,43 @@ impl Http2Connection {
 
     pub fn pending_continuation_stream(&self) -> Option<u32> {
         self.continuation_state.as_ref().map(|s| s.stream_id)
+    }
+}
+
+impl Http2Stream {
+    pub fn get_send_data(&mut self, max_len: usize) -> Vec<u8> {
+        let mut data = Vec::new();
+        let mut remaining = max_len;
+        while remaining > 0 && self.send_buffer_len() > 0 {
+            if let Some(chunk) = self.send_buffer.pop_front() {
+                let take = chunk.len().min(remaining);
+                data.extend_from_slice(&chunk[..take]);
+                remaining -= take;
+                if take < chunk.len() {
+                    self.send_buffer.push_front(chunk[take..].to_vec());
+                    break;
+                }
+            }
+        }
+        
+        data
+    }
+
+    pub fn queue_send_data(&mut self, data: Vec<u8>) -> Result<()> {
+        self.send_buffer.push_back(data);
+        Ok(())
+    }
+
+    pub fn send_buffer_len(&self) -> usize {
+        self.send_buffer.iter().map(|chunk| chunk.len()).sum()
+    }
+
+    pub fn mark_send_complete(&mut self) {
+        self.end_stream_sent = true;
+    }
+
+    pub fn is_send_complete(&self) -> bool {
+        self.end_stream_sent
     }
 }
 
