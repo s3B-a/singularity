@@ -311,6 +311,11 @@ impl HttpClientBuilder {
         self
     }
 
+    pub fn enable_version_negotiation(mut self, enable: bool) -> Self {
+        self.client.enable_version_negotiation = enable;
+        self
+    }
+
     pub fn build(self) -> HttpClient {
         self.client
     }
@@ -334,6 +339,9 @@ pub struct HttpClient {
     cookie_jar: CookieJar,
     enable_cookies: bool,
     dns_resolver: DnsResolver,
+    version_cache: HashMap<String, HttpVersion>,
+    alt_svc_cache: HashMap<String, Vec<(HttpVersion, String, u16)>>,
+    enable_version_negotiation: bool,
 }
 
 impl HttpClient {
@@ -356,6 +364,9 @@ impl HttpClient {
             cookie_jar: CookieJar::new(),
             enable_cookies: true,
             dns_resolver: DnsResolver::new(),
+            version_cache: HashMap::new(),
+            alt_svc_cache: HashMap::new(),
+            enable_version_negotiation: true,
         }
     }
 
@@ -737,14 +748,23 @@ impl HttpClient {
     }
 
     fn execute_internal(&mut self, request: HttpRequest) -> Result<HttpResponse, io::Error> {
-        let url = request.path();
-        let (scheme, _host, _port, _path) = parse_url(url)?;
-        let use_http2 = self.preferred_version == HttpVersion::Http2 && scheme == "https";
-        if use_http2 {
+        let url = request.path().to_string();
+        let (scheme, _host, _port, _path) = parse_url(&url)?;
+        
+        let negotiated_version = self.negotiate_version(&url, &scheme);
+        let use_http2 = negotiated_version == HttpVersion::Http2 && scheme == "https";
+        let response = if use_http2 {
             self.execute_http2(request)
         } else {
             self.execute_http1(request)
+        }?;
+
+        self.store_negotiated_version(&url, negotiated_version);
+        if let Some(alt_svc) = response.headers().get("Alt-Svc") {
+            self.process_alt_svc_header(&url, alt_svc);
         }
+
+        Ok(response)
     }
 
     fn execute_http1(&mut self, mut request: HttpRequest) -> Result<HttpResponse, io::Error> {
@@ -863,11 +883,7 @@ impl HttpClient {
             ));
         }
 
-        let version = match parts[0] {
-            "HTTP/1.0" => HttpVersion::Http10,
-            "HTTP/1.1" => HttpVersion::Http11,
-            _ => HttpVersion::Http11,
-        };
+        let version = HttpVersion::from_str(parts[0]).unwrap_or(HttpVersion::Http11);
 
         let status_code: u16 = parts[1].parse().map_err(|_| {
             io::Error::new(io::ErrorKind::InvalidData, "Invalid status code")
@@ -938,8 +954,15 @@ impl HttpClient {
 
         if should_keep_alive {
             let stream = reader.into_inner();
-            let entry = Http1ConnectionEntry::new(stream, host, port);
+            let entry = Http1ConnectionEntry::new(stream, host.clone(), port);
             self.http1_connections.insert(connection_key, entry);
+        }
+
+        if let Some(upgrade) = headers.get("Upgrade") {
+            if upgrade.to_lowercase().contains("h2c") {
+                let connection_key = format!("{}:{}", host, port);
+                self.version_cache.insert(connection_key, HttpVersion::Http2);
+            }
         }
 
         Ok(HttpResponse::new(
@@ -1087,6 +1110,70 @@ impl HttpClient {
         )
     }
 
+    fn negotiate_version(&self, url: &str, scheme: &str) -> HttpVersion {
+        if !self.enable_version_negotiation {
+            return self.preferred_version;
+        }
+
+        let (_, host, port, _) = match parse_url(url) {
+            Ok(parts) => parts,
+            Err(_) => return self.preferred_version,
+        };
+
+        let connection_key = format!("{}:{}", host, port);
+        if let Some(&cached_version) = self.version_cache.get(&connection_key) {
+            return cached_version;
+        }
+
+        if let Some(alt_svcs) = self.alt_svc_cache.get(&connection_key) {
+            for (version, _, _) in alt_svcs {
+                if *version == HttpVersion::Http2 && scheme == "https" {
+                    return HttpVersion::Http2;
+                }
+            }
+        }
+
+        if scheme == "https" && self.preferred_version == HttpVersion::Http2 {
+            return HttpVersion::Http2;
+        }
+
+        self.preferred_version
+    }
+
+    fn store_negotiated_version(&mut self, url: &str, version: HttpVersion) {
+        if let Ok((_, host, port, _)) = parse_url(url) {
+            let connection_key = format!("{}:{}", host, port);
+            self.version_cache.insert(connection_key, version);
+        }
+    }
+
+    fn process_alt_svc_header(&mut self, url: &str, alt_svc: &str) {
+        if let Ok((_, host, port, _)) = parse_url(url) {
+            let connection_key = format!("{}:{}", host, port);
+            let mut alternatives = Vec::new();
+            for entry in alt_svc.split(',') {
+                let entry = entry.trim();
+                if entry.contains("h2=") {
+                    if let Some(start) = entry.find('"') {
+                        if let Some(end) = entry[start + 1..].find('"') {
+                            let alt_host_port = &entry[start + 1..start + 1 + end];
+                            if let Some(colon_pos) = alt_host_port.rfind(':') {
+                                let alt_host = alt_host_port[..colon_pos].to_string();
+                                if let Ok(alt_port) = alt_host_port[colon_pos + 1..].parse::<u16>() {
+                                    alternatives.push((HttpVersion::Http2, alt_host, alt_port));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if !alternatives.is_empty() {
+                self.alt_svc_cache.insert(connection_key, alternatives);
+            }
+        }
+    }
+
     fn cleanup_idle_connections(&mut self) {
         let _now = Instant::now();
         
@@ -1128,6 +1215,8 @@ impl HttpClient {
             .unwrap_or(0);
         stats.insert("max_concurrent_streams".to_string(), max_streams);
         stats.insert("total_cookies".to_string(), self.cookie_jar.len());
+        stats.insert("cached_versions".to_string(), self.version_cache.len());
+        stats.insert("alt_svc_entries".to_string(), self.alt_svc_cache.len());
 
         stats
     }

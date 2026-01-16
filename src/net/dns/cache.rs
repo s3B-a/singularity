@@ -1,6 +1,6 @@
 use super::record::{RecordType, DnsRecord};
 use std::collections::HashMap;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use std::sync::{Arc, RwLock};
 
 #[derive(Clone)]
@@ -225,7 +225,7 @@ mod tests {
         
         assert!(cache.get("example.com", RecordType::A).is_some());
         
-        thread::sleep(Duration::from_secs(2));
+        thread::sleep(std::time::Duration::from_secs(2));
         
         assert!(cache.get("example.com", RecordType::A).is_none());
     }

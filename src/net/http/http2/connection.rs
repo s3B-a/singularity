@@ -3,6 +3,7 @@ use super::flow_control::FlowControl;
 use super::frame::{Frame, FrameFlags, FrameType};
 use super::hpack::HpackCodec;
 use super::priority::{Priority, PriorityTree};
+use super::push::{PushManager, PushConfig};
 use super::settings::{Settings, SettingId};
 use super::scheduler::{PriorityScheduler, DependencyTreeStats};
 use super::stream::Http2Stream;
@@ -27,6 +28,7 @@ pub struct Http2Connection {
     continuation_state: Option<ContinuationState>,
     scheduler: PriorityScheduler,
     max_frame_size: u32,
+    push_manager: PushManager,
 }
 
 #[derive(Debug)]
@@ -35,6 +37,7 @@ struct ContinuationState {
     header_block_fragments: Vec<u8>,
     end_stream: bool,
     is_push_promise: bool,
+    parent_stream_id: Option<u32>,
 }
 
 impl ContinuationState {
@@ -44,6 +47,7 @@ impl ContinuationState {
             header_block_fragments: Vec::new(),
             end_stream,
             is_push_promise,
+            parent_stream_id: None,
         }
     }
 }
@@ -73,6 +77,7 @@ impl Http2Connection {
             continuation_state: None,
             scheduler: PriorityScheduler::new(),
             max_frame_size: 16384,
+            push_manager: PushManager::with_defaults(),
         })
     }
 
@@ -367,12 +372,18 @@ impl Http2Connection {
 
     fn handle_data_frame(&mut self, frame: &Frame) -> Result<()> {
         let stream_id = frame.header.stream_id;
-        let stream = self.streams.get_mut(&stream_id)
-            .ok_or(Http2Error::StreamNotFound(stream_id))?;
+        let stream = self.streams.get_mut(&stream_id).ok_or(Http2Error::StreamNotFound(stream_id))?;
 
         stream.receive_data(frame.payload.clone())?;
+        if self.push_manager.get_push(stream_id).is_some() {
+            self.push_manager.add_push_data(stream_id, frame.payload.clone())?;
+        }
+
         if frame.header.flags.has(FrameFlags::END_STREAM) {
             stream.receive_end_stream()?;
+            if self.push_manager.get_push(stream_id).is_some() {
+                self.push_manager.complete_push(stream_id)?;
+            }
         }
 
         let data_len = frame.payload.len();
@@ -404,7 +415,8 @@ impl Http2Connection {
             let headers: Vec<(String, String)> = headers_map.into_iter().collect();
 
             if state.is_push_promise {
-                self.process_push_promise(state.stream_id, headers)?;
+                let parent_id = state.parent_stream_id.unwrap_or(0);
+                self.process_push_promise(parent_id, state.stream_id, headers)?;
             } else {
                 self.process_received_headers(state.stream_id, headers, state.end_stream)?;
             }
@@ -428,6 +440,9 @@ impl Http2Connection {
                     format!("HPACK decode error: {}", e),
                 ))?;
             let headers: Vec<(String, String)> = headers_map.into_iter().collect();
+            if self.push_manager.get_push(stream_id).is_some() {
+                self.push_manager.add_push_headers(stream_id, headers.clone())?;
+            }
 
             self.process_received_headers(stream_id, headers, end_stream)?;
         } else {
@@ -551,19 +566,37 @@ impl Http2Connection {
         Ok(())
     }
 
-    fn handle_push_promise_frame(&mut self, frame: &Frame) -> Result<()> {
-        if !self.local_settings.enable_push() {
-            return Err(Http2Error::Protocol(
-                ErrorCode::ProtocolError,
-                "Server push is disabled".to_string(),
-            ));
-        }
+    pub fn with_push_config(stream: TcpStream, push_config: PushConfig) -> Result<Self> {
+        let mut conn = Self::new(stream)?;
+        conn.push_manager = PushManager::new(push_config);
+        Ok(conn)
+    }
 
+    pub fn set_origin(&mut self, origin: String) {
+        self.push_manager.set_origin(origin);
+    }
+
+    pub fn set_push_enabled(&mut self, enabled: bool) {
+        self.push_manager.set_enabled(enabled);
+    }
+
+    pub fn push_manager(&self) -> &PushManager {
+        &self.push_manager
+    }
+
+    pub fn push_manager_mut(&mut self) -> &mut PushManager {
+        &mut self.push_manager
+    }
+
+    pub fn try_use_cached_push(&mut self, url: &str, method: &str) -> Option<Vec<u8>> {
+        self.push_manager
+            .find_cached_push(url, method)
+            .map(|resource| resource.body.clone())
+    }
+
+    fn handle_push_promise_frame(&mut self, frame: &Frame) -> Result<()> {
         if frame.payload.len() < 4 {
-            return Err(Http2Error::Protocol(
-                ErrorCode::FrameSizeError,
-                "Invalid PUSH_PROMISE frame size".to_string(),
-            ));
+            return Err(Http2Error::Protocol(ErrorCode::FrameSizeError, "Invalid PUSH_PROMISE frame size".to_string()));
         }
 
         let promised_stream_id = u32::from_be_bytes([
@@ -575,18 +608,14 @@ impl Http2Connection {
 
         let header_block = &frame.payload[4..];
         let end_headers = frame.header.flags.has(FrameFlags::END_HEADERS);
-
         if end_headers {
             let headers_map = self.decoder.decode(header_block)
-                .map_err(|e| Http2Error::Protocol(
-                    ErrorCode::CompressionError,
-                    format!("HPACK decode error: {}", e),
-                ))?;
+                .map_err(|e| Http2Error::Protocol(ErrorCode::CompressionError, format!("HPACK decode error: {}", e)))?;
             let headers: Vec<(String, String)> = headers_map.into_iter().collect();
-
-            self.process_push_promise(promised_stream_id, headers)?;
+            self.process_push_promise(frame.header.stream_id, promised_stream_id, headers)?;
         } else {
             let mut state = ContinuationState::new(promised_stream_id, false, true);
+            state.parent_stream_id = Some(frame.header.stream_id);
             state.header_block_fragments.extend_from_slice(header_block);
             self.continuation_state = Some(state);
         }
@@ -594,18 +623,27 @@ impl Http2Connection {
         Ok(())
     }
 
-    fn process_push_promise(&mut self, promised_stream_id: u32, headers: Vec<(String, String)>) -> Result<()> {
-        let stream = Http2Stream::new(
-            promised_stream_id,
-            self.local_settings.initial_window_size(),
-        );
-        self.streams.insert(promised_stream_id, stream);
-
-        if let Some(stream) = self.streams.get_mut(&promised_stream_id) {
-            stream.add_response_headers(headers);
+    fn process_push_promise(&mut self, parent_stream_id: u32, promised_stream_id: u32, headers: Vec<(String, String)>) -> Result<()> {
+        let accept = self.push_manager.handle_push_promise(parent_stream_id, promised_stream_id, headers.clone())?;
+        if !accept {
+            let frame = Frame::rst_stream(promised_stream_id, ErrorCode::Cancel as u32);
+            frame.write(&mut self.stream)?;
+            self.stream.flush()?;
+            return Ok(());
         }
 
+        let stream = Http2Stream::new(promised_stream_id,self.local_settings.initial_window_size());
+        self.streams.insert(promised_stream_id, stream);
+
         Ok(())
+    }
+
+    pub fn cleanup_pushes(&mut self) {
+        self.push_manager.cleanup();
+    }
+
+    pub fn push_stats(&self) -> super::push::PushStats {
+        self.push_manager.stats()
     }
 
     fn handle_ping_frame(&mut self, frame: &Frame) -> Result<()> {
@@ -704,7 +742,7 @@ impl Http2Connection {
         Ok(())
     }
 
-    fn handle_continuation_update_frame(&mut self, frame: &Frame) -> Result<()> {
+    fn handle_window_update_frame_with_validation(&mut self, frame: &Frame) -> Result<()> {
         if frame.payload.len() != 4 {
             return Err(Http2Error::Protocol(
                 ErrorCode::FrameSizeError,

@@ -67,7 +67,7 @@ const STATIC_TABLE: &[(&str, &str)] = &[
 
 #[derive(Debug, Clone)]
 struct HuffmanNode {
-    symbol: Option<u8>,
+    symbol: Option<u16>,
     left: Option<Box<HuffmanNode>>,
     right: Option<Box<HuffmanNode>>,
 }
@@ -81,7 +81,7 @@ impl HuffmanNode {
         }
     }
 
-    fn leaf(symbol: u8) -> Self {
+    fn leaf(symbol: u16) -> Self {
         Self {
             symbol: Some(symbol),
             left: None,
@@ -121,6 +121,7 @@ impl HpackCodec {
         // Format: (symbol, code_bits, code_length)
         let mut root = HuffmanNode::new();
         for &(symbol, code, code_len) in codes {
+            let symbol = symbol as u16;
             let mut node = &mut root;
             for i in 0..code_len {
                 let bit = (code >> (code_len - 1 - i)) & 1;
@@ -674,7 +675,7 @@ impl HpackCodec {
 
                 if let Some(symbol) = node.symbol {
                     if symbol != 256 {
-                        output.push(symbol);
+                        output.push(symbol as u8);
                     }
                     node = &self.huffman_root;
                 }
