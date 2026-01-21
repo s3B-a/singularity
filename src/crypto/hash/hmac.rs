@@ -1,4 +1,3 @@
-use crate::crypto::{Error, Result};
 use super::sha2::{Sha256, Sha512};
 
 #[derive(Clone)]
