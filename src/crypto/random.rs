@@ -92,11 +92,28 @@ fn sys_fill_bytes(dest: &mut [u8]) -> Result<()> {
     // getrandom syscall first (Linux 3.17+ / Modern BSDs)
     #[cfg(any(target_os = "linux", target_os = "android"))]
     {
-        extern "C" {
-            fn syscall(num: libc::c_long, ...) -> libc::c_long;
+        #[cfg(target_pointer_width = "64")]
+        type CLong = i64;
+        #[cfg(target_pointer_width = "32")]
+        type CLong = i32;
+
+        unsafe extern "C" {
+            fn syscall(num: CLong, ...) -> CLong;
         }
 
-        const SYS_GETRANDOM: libc::c_long = 318; // x86_64 syscall number
+        #[cfg(target_arch = "x86_64")]
+        const SYS_GETRANDOM: CLong = 318;
+        #[cfg(target_arch = "x86")]
+        const SYS_GETRANDOM: CLong = 355;
+        #[cfg(target_arch = "aarch64")]
+        const SYS_GETRANDOM: CLong = 278;
+        #[cfg(target_arch = "arm")]
+        const SYS_GETRANDOM: CLong = 384;
+        #[cfg(target_arch = "riscv64")]
+        const SYS_GETRANDOM: CLong = 278;
+        #[cfg(target_arch = "s390x")]
+        const SYS_GETRANDOM: CLong = 349;
+
         let mut filled = 0;
         while filled < dest.len() {
             let ret = unsafe {
@@ -163,18 +180,21 @@ pub fn fill_random(dest: &mut [u8]) -> Result<()> {
 pub fn generate_random(len: usize) -> Result<Vec<u8>> {
     let mut buffer = vec![0u8; len];
     fill_random(&mut buffer)?;
+
     Ok(buffer)
 }
 
 pub fn generate_random_u32() -> Result<u32> {
     let mut buffer = [0u8; 4];
     fill_random(&mut buffer)?;
+
     Ok(u32::from_le_bytes(buffer))
 }
 
 pub fn generate_random_u64() -> Result<u64> {
     let mut buffer = [0u8; 8];
     fill_random(&mut buffer)?;
+    
     Ok(u64::from_le_bytes(buffer))
 }
 

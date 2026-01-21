@@ -8,6 +8,17 @@ pub struct Hmac<H> {
 }
 
 impl<H: Clone> Hmac<H> {
+    pub fn new(key: &[u8]) -> Self where H: HashFunction + Default {
+        let hasher = H::default();
+        let block_size = match std::any::type_name::<H>() {
+            name if name.contains("Sha256") => 64,
+            name if name.contains("Sha512") => 128,
+            _ => 64,
+        };
+
+        Self::new_with_hasher(hasher, key, block_size)
+    }
+
     fn new_with_hasher(mut hasher: H, key: &[u8], block_size: usize) -> Self where H: HashFunction {
         let mut key_buffer = vec![0u8; block_size];
         if key.len() > block_size {
