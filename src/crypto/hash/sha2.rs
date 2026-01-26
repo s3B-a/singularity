@@ -1,6 +1,5 @@
+// crypto/hash/sha2.rs
 // Implementations of SHA-224, SHA-256, SHA-384, SHA-512, SHA-512/224, and SHA-512/256
-
-use crate::crypto::{Error, Result};
 
 // SHA-256 round constants
 const K256: [u32; 64] = [
@@ -48,6 +47,15 @@ pub struct Sha256 {
 }
 
 impl Sha256 {
+
+    /**
+     * Create a new SHA-256 instance
+     * Args:
+     *    (): No arguments
+     * 
+     * Returns:
+     *    self: New SHA-256 instance
+     */
     pub fn new() -> Self {
         Sha256 {
             state: [
@@ -66,6 +74,15 @@ impl Sha256 {
         }
     }
 
+    /**
+     * Update the SHA-256 state with input data
+     * Args:
+     *    &mut self: Mutable reference to SHA-256 instance
+     *    data: &[u8]: Input data to hash
+     * 
+     * Returns:
+     *    (): Nothing   
+     */
     pub fn update(&mut self, data: &[u8]) {
         let mut pos = 0;
         while pos < data.len() {
@@ -85,6 +102,14 @@ impl Sha256 {
         self.total_len += data.len() as u64;
     }
 
+    /**
+     * Finalize the SHA-256 hash and return the digest
+     * Args:
+     *    mut self: Mutable SHA-256 instance
+     * 
+     * Returns:
+     *    [u8; 32]: The resulting SHA-256 hash digest
+     */
     pub fn finalize(mut self) -> [u8; 32] {
         let bit_len = self.total_len * 8;
 
@@ -117,6 +142,15 @@ impl Sha256 {
         output
     }
 
+    /**
+     * Process a single 512-bit block
+     * Args:
+     *    &mut self: Mutable reference to SHA-256 instance
+     *    block: &[u8; 64]: 512-bit block to process
+     * 
+     * Returns:
+     *    (): Nothing
+     */
     fn process_block(&mut self, block: &[u8; 64]) {
         let mut w = [0u32; 64];
         for i in 0..16 {
@@ -173,6 +207,11 @@ impl Sha256 {
     }
 }
 
+/**
+ * Hash data using SHA-256
+ * Args:
+ *    data: &[u8]: Input data to hash
+ */
 pub fn sha256(data: &[u8]) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(data);

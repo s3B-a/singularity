@@ -1,14 +1,30 @@
+// crypto/bignum.rs - Arbitrary-Precision Integer Implementation
+// Provides basic arithmetic, modular operations, and primality testing for large integers.
+// This uses a Vec<u64> to store the limbs of the big integer in little-endian order (least significant limb first)
+// and implements various operations including addition, subtraction, multiplication, division, modular exponentiation,
+// modular inverse, GCD, and Miller-Rabin primality testing.
+
 use crate::crypto::{Error, Result};
 use std::cmp::Ordering;
 use std::fmt;
 use std::ops::{Add, Sub, Mul, Div, Rem, Shl, Shr, BitAnd, BitOr, BitXor};
 
+// BigNum - Arbitrary-Precision Integer Implementation
 #[derive(Clone, PartialEq, Eq)]
 pub struct BigNum {
     limbs: Vec<u64>,
 }
 
 impl BigNum {
+
+    /**
+     * Create a BigNum from a u64 integer
+     * Args:
+     *    value - u64: The u64 integer to convert
+     * 
+     * Returns:
+     *    Self: The corresponding BigNum instance
+     */
     pub fn from_u64(value: u64) -> Self {
         if value == 0 {
             BigNum { limbs: vec![0] }
@@ -17,6 +33,14 @@ impl BigNum {
         }
     }
 
+    /**
+     * Create a BigNum from a big-endian byte slice
+     * Args:
+     *    bytes - &[u8]: The big-endian byte slice to convert
+     * 
+     * Returns:
+     *    Self: The corresponding BigNum instance
+     */
     pub fn from_bytes_be(bytes: &[u8]) -> Self {
         if bytes.is_empty() {
             return BigNum::zero();
@@ -45,6 +69,14 @@ impl BigNum {
         BigNum { limbs }
     }
 
+    /**
+     * Create a BigNum from a little-endian byte slice
+     * Args:
+     *    bytes - &[u8]: The little-endian byte slice to convert
+     * 
+     * Returns:
+     *    Self: The corresponding BigNum instance
+     */
     pub fn from_bytes_le(bytes: &[u8]) -> Self {
         if bytes.is_empty() {
             return BigNum::zero();
@@ -72,6 +104,14 @@ impl BigNum {
         BigNum { limbs }
     }
 
+    /**
+     * Convert the BigNum to a big-endian byte vector
+     * Args:
+     *    &self: The BigNum instance
+     * 
+     * Returns:
+     *    Vec<u8>: The big-endian byte representation of the BigNum
+     */
     pub fn to_bytes_be(&self) -> Vec<u8> {
         if self.is_zero() {
             return vec![0];
@@ -103,6 +143,14 @@ impl BigNum {
         }
     }
 
+    /**
+     * Convert the BigNum to a little-endian byte vector
+     * Args:
+     *    &self: The BigNum instance
+     * 
+     * Returns:
+     *    Vec<u8>: The little-endian byte representation of the BigNum
+     */
     pub fn to_bytes_le(&self) -> Vec<u8> {
         let mut bytes = Vec::new();
         for &limb in &self.limbs {
@@ -116,30 +164,86 @@ impl BigNum {
         bytes
     }
 
+    /**
+     * Create a BigNum representing zero
+     * Args:
+     *    (): Nothing
+     * 
+     * Returns:
+     *    Self: BigNum instance set to 0
+     */
     pub fn zero() -> Self {
         BigNum { limbs: vec![0] }
     }
 
+    /**
+     * Create a BigNum representing one
+     * Args:
+     *    (): Nothing
+     * 
+     * Returns:
+     *    Self: BigNum instance set to 1
+     */
     pub fn one() -> Self {
         BigNum { limbs: vec![1] }
     }
 
+    /**
+     * Check if the BigNum is zero
+     * Args:
+     *    &self: The BigNum instance
+     * 
+     * Returns:
+     *    bool: true if BigNum is zero, false otherwise
+     */
     pub fn is_zero(&self) -> bool {
         self.limbs.iter().all(|&limb| limb == 0)
     }
 
+    /**
+     * Check if the BigNum is one
+     * Args:
+     *    &self: The BigNum instance
+     * 
+     * Returns:
+     *    bool: true if BigNum is one, false otherwise
+     */
     pub fn is_one(&self) -> bool {
         self.limbs.len() == 1 && self.limbs[0] == 1
     }
 
+    /**
+     * Check if the BigNum is even
+     * Args:
+     *    &self: The BigNum instance
+     * 
+     * Returns:
+     *    bool: true if BigNum is even, false otherwise
+     */
     pub fn is_even(&self) -> bool {
         self.limbs[0] & 1 == 0
     }
 
+    /**
+     * Check if the BigNum is odd
+     * Args:
+     *    &self: The BigNum instance
+     * 
+     * Returns:
+     *    bool: true if BigNum is odd, false otherwise
+     */
     pub fn is_odd(&self) -> bool {
         self.limbs[0] & 1 == 1
     }
 
+    /**
+     * Get the bit length of the BigNum
+     * Args:
+     *    &self: The BigNum instance
+     * 
+     * Returns:
+     *    usize: The number of bits required to represent the BigNum
+     */
     pub fn bit_length(&self) -> usize {
         if self.is_zero() {
             return 0;
@@ -150,6 +254,15 @@ impl BigNum {
         (self.limbs.len() - 1) * 64 + last_limb_bits
     }
 
+    /**
+     * Get the value of a specific bit in the BigNum
+     * Args:
+     *    &self: The BigNum instance
+     *    pos - usize: The bit position to check
+     * 
+     * Returns:
+     *    bool: true if the bit at position pos is set, false otherwise
+     */
     pub fn bit(&self, pos: usize) -> bool {
         let limb_idx = pos / 64;
         let bit_idx = pos % 64;
@@ -160,6 +273,16 @@ impl BigNum {
         }
     }
 
+    /**
+     * Set or clear a specific bit in the BigNum
+     * Args:
+     *    &mut self: The BigNum instance
+     *    pos - usize: The bit position to set or clear
+     *    value - bool: true to set the bit, false to clear it (1 or 0)
+     * 
+     * Returns:
+     *    (): Nothing
+     */
     pub fn set_bit(&mut self, pos: usize, value: bool) {
         let limb_idx = pos / 64;
         let bit_idx = pos % 64;
@@ -176,6 +299,17 @@ impl BigNum {
         self.normalize();
     }
 
+    /**
+     * Modulo exponentiation: (self ^ exponent) mod modulus
+     * This uses the method of exponentiation by squaring for efficiency, resulting in O(log(exponent) × M(n)) time complexity
+     * Args:
+     *    &self: The base BigNum
+     *    exponent - &BigNum: The exponent BigNum used to raise the base
+     *    modulus - &BigNum: The modulus BigNum to reduce the result
+     * 
+     * Returns:
+     *    Result<BigNum>: The result of (self ^ exponent) mod modulus or an error if modulus is zero
+     */
     pub fn mod_exp(&self, exponent: &BigNum, modulus: &BigNum) -> Result<BigNum> {
         if modulus.is_zero() {
             return Err(Error::CryptoError("Division by zero in mod_exp".to_string()));
@@ -196,6 +330,16 @@ impl BigNum {
         Ok(result)
     }
 
+    /**
+     * Modular inverse: Find x such that (self * x) mod modulus = 1
+     * This uses the Extended Euclidean Algorithm (EEA) to compute the modular inverse
+     * Args:
+     *    &self: The BigNum instance for which to find the modular inverse
+     *    modulus - &BigNum: The modulus BigNum
+     * 
+     * Returns:
+     *    Result<BigNum>: The modular inverse of self mod modulus or an error if no inverse exists
+     */
     pub fn mod_inverse(&self, modulus: &BigNum) -> Result<BigNum> {
         let (gcd, x, _) = Self::extended_gcd(self, modulus);
         if !gcd.is_one() {
@@ -205,6 +349,15 @@ impl BigNum {
         Ok(x.modulo(modulus))
     }
 
+    /**
+     * Modulo operation that always returns a non-negative result
+     * Args:
+     *    &self: The BigNum instance
+     *    modulus - &BigNum: The modulus BigNum
+     * 
+     * Returns:
+     *    BigNum: The result of self mod modulus, guaranteed to be non-negative
+     */
     pub fn modulo(&self, modulus: &BigNum) -> BigNum {
         let rem = self.clone() % modulus.clone();
         if rem.limbs[0] & (1u64 << 63) != 0 {
@@ -214,7 +367,15 @@ impl BigNum {
         }
     }
 
-    // Greatest Common Divisor using Euclidean Algorithm
+    /**
+     * Compute the greatest common divisor (GCD) of two BigNums using the Euclidean algorithm
+     * Args:
+     *    &self: The first BigNum instance
+     *    other - &BigNum: The second BigNum instance
+     * 
+     * Returns:
+     *    BigNum: The GCD of self and other
+     */
     pub fn gcd(&self, other: &BigNum) -> BigNum {
         let mut a = self.clone();
         let mut b = other.clone();
@@ -227,6 +388,15 @@ impl BigNum {
         a
     }
 
+    /**
+     * Perform a probabilistic primality test using the Miller-Rabin algorithm
+     * Args:
+     *    &self: The BigNum instance to test for primality
+     *    rounds - usize: The number of testing rounds to perform (higher means more accuracy)
+     * 
+     * Returns:
+     *    Result<bool>: Ok(true) if probably prime, Ok(false) if composite, or an error if random generation fails
+     */
     pub fn is_probably_prime(&self, rounds: usize) -> Result<bool> {
         use crate::crypto::random::generate_random;
 
@@ -274,6 +444,15 @@ impl BigNum {
         Ok(true)
     }
 
+    /**
+     * Generate a probable prime BigNum of specified bit length using the Miller-Rabin test
+     * Args:
+     *    bits - usize: The desired bit length of the prime
+     *    rounds - usize: The number of Miller-Rabin rounds for primality testing
+     * 
+     * Returns:
+     *    Result<BigNum>: A probable prime BigNum of the specified bit length
+     */
     pub fn generate_prime(bits: usize, rounds: usize) -> Result<BigNum> {
         use crate::crypto::random::generate_random;
         if bits < 2 {
@@ -293,7 +472,15 @@ impl BigNum {
         }
     }
 
-    // Euclidian Algorithm -- returns (gcd, x, y) where gcd = ax + by
+    /**
+     * EEA to compute GCD and coefficients x, y such that ax + by = gcd(a, b)
+     * Args:
+     *    &self: The first BigNum instance
+     *    other - &BigNum: The second BigNum instance
+     * 
+     * Returns:
+     *    (BigNum, BigNum, BigNum): A tuple containing (gcd, x, y) satisfying the equation 
+     */
     fn extended_gcd(&self, other: &BigNum) -> (BigNum, BigNum, BigNum) {
         if other.is_zero() {
             return (self.clone(), BigNum::one(), BigNum::zero());
@@ -306,6 +493,14 @@ impl BigNum {
         (gcd, x, y)
     }
 
+    /**
+     * Normalize the BigNum by removing leading zero limbs
+     * Args:
+     *    &mut self: The BigNum instance
+     * 
+     * Returns:
+     *    (): Nothing
+     */
     fn normalize(&mut self) {
         while self.limbs.len() > 1 && self.limbs.last() == Some(&0) {
             self.limbs.pop();
@@ -313,24 +508,28 @@ impl BigNum {
     }
 }
 
+// Debug implementation for BigNum
 impl fmt::Debug for BigNum {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "BigNum(0x{})", hex::encode(&self.to_bytes_be()))
     }
 }
 
+// Display implementation for BigNum
 impl fmt::Display for BigNum {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "{}", hex::encode(&self.to_bytes_be()))
     }
 }
 
+// PartialOrd implementation for BigNum
 impl PartialOrd for BigNum {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
 }
 
+// Ord implementation for BigNum
 impl Ord for BigNum {
     fn cmp(&self, other: &Self) -> Ordering {
         if self.limbs.len() != other.limbs.len() {
@@ -348,6 +547,7 @@ impl Ord for BigNum {
     }
 }
 
+// Addition implementation for BigNum
 impl Add for BigNum {
     type Output = BigNum;
 
@@ -377,6 +577,7 @@ impl Add for BigNum {
     }
 }
 
+// Subtraction implementation for BigNum
 impl Sub for BigNum {
     type Output = BigNum;
 
@@ -404,6 +605,7 @@ impl Sub for BigNum {
     }
 }
 
+// Multiplication implementation for BigNum
 impl Mul for BigNum {
     type Output = BigNum;
 
@@ -433,6 +635,7 @@ impl Mul for BigNum {
     }
 }
 
+// Division implementation for BigNum
 impl Div for BigNum {
     type Output = BigNum;
 
@@ -441,6 +644,7 @@ impl Div for BigNum {
     }
 }
 
+// Remainder implementation for BigNum
 impl Rem for BigNum {
     type Output = BigNum;
 
@@ -449,6 +653,7 @@ impl Rem for BigNum {
     }
 }
 
+// Division with remainder implementation for BigNum
 impl BigNum {
 
     // Division with remainder
@@ -483,6 +688,7 @@ impl BigNum {
     }
 }
 
+// Left shift implementation for BigNum
 impl Shl<usize> for BigNum {
     type Output = BigNum;
 
@@ -514,6 +720,7 @@ impl Shl<usize> for BigNum {
     }
 }
 
+// Right shift implementation for BigNum
 impl Shr<usize> for BigNum {
     type Output = BigNum;
 
@@ -545,6 +752,7 @@ impl Shr<usize> for BigNum {
     }
 }
 
+// Bitwise AND implementation for BigNum
 impl BitAnd for BigNum {
     type Output = BigNum;
 
@@ -561,6 +769,7 @@ impl BitAnd for BigNum {
     }
 }
 
+// Bitwise OR implementation for BigNum
 impl BitOr for BigNum {
     type Output = BigNum;
 
@@ -577,6 +786,7 @@ impl BitOr for BigNum {
     }
 }
 
+// Bitwise XOR implementation for BigNum
 impl BitXor for BigNum {
     type Output = BigNum;
 

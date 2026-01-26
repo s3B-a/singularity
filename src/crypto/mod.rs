@@ -1,3 +1,7 @@
+// crypto/mod.rs - Cryptographic Export Module
+// This module re-exports all cryptographic functionalities provided
+// by the Singularity library for easy access.
+
 pub mod random;
 pub mod bignum;
 pub mod hash;
@@ -8,21 +12,39 @@ pub mod encoding;
 
 pub use random::{CryptoRng, SystemRng};
 
+// Common error type for cryptographic operations
 pub type Result<T> = std::result::Result<T, Error>;
 
+// Common error enumeration for cryptographic operations
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Error {
+    // Used for invalid key sizes
     InvalidKeySize,
+    // Used for invalid input lengths
     InvalidLength,
+    // Used for invalid padding in asymmetric and symmetric operations
     InvalidPadding,
+    // Used when verification of signatures or MACs fails
     VerificationFailed,
+    // Used for invalid signatures
     InvalidSignature,
+    // Used for invalid certificates
     InvalidCertificate,
+    // Used when there is insufficient entropy for random number generation
     InsufficientEntropy,
+    // Generic cryptographic error with a message
     CryptoError(String),
 }
 
-// Constant-time equality check
+/**
+ * Constant-time comparison of two byte slices to prevent timing attacks
+ * Args:
+ *    a - &[u8]: First byte slice
+ *    b - &[u8]: Second byte slice
+ * 
+ * Returns:
+ *    bool: true if slices are equal, false otherwise
+ */
 pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
@@ -36,7 +58,14 @@ pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     result == 0
 }
 
-// Zero out memory
+/**
+ * Securely zero out a byte slice to prevent sensitive data from lingering in memory
+ * Args:
+ *    data - &mut [u8]: The byte slice to zero out
+ * 
+ * Returns:
+ *    (): Nothing
+ */
 pub fn secure_zero(data: &mut [u8]) {
     for byte in data.iter_mut() {
         unsafe {
