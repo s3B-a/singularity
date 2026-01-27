@@ -1,29 +1,45 @@
+// crypto/asymmetric/ecdh.rs - Elliptic Curve Diffie-Hellman (ECDH) key exchange
+// https://datatracker.ietf.org/doc/html/rfc7748#section-6
+
 use crate::crypto::{Error, Result};
 use super::{x25519, p256};
 
+// ECDH Key trait for key exchange operations
 pub trait EcdhKey {
     fn exchange(&self, their_public: &[u8]) -> Result<Vec<u8>>;
 
     fn public_bytes(&self) -> Vec<u8>;
 }
 
+// Supported ECDH curves
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EcdhCurve {
     X25519,
     P256,
 }
 
+// ECDH Private Key enum supporting multiple curves
 pub enum EcdhPrivateKey {
     X25519(x25519::X25519PrivateKey),
     P256(p256::P256PrivateKey),
 }
 
+// ECDH Public Key enum supporting multiple curves
 pub enum EcdhPublicKey {
     X25519(x25519::X25519PublicKey),
     P256(p256::P256PublicKey)
 }
 
 impl EcdhPrivateKey {
+
+    /**
+     * Generates a new ECDH private key for the specified curve
+     * Args:
+     *    curve - EcdhCurve: The elliptic curve to use
+     * 
+     * Returns:
+     *    Result<Self>: The generated ECDH private key
+     */
     pub fn generate(curve: EcdhCurve) -> Result<Self> {
         match curve {
             EcdhCurve::X25519 => Ok(EcdhPrivateKey::X25519(x25519::X25519PrivateKey::generate()?)),
@@ -31,6 +47,15 @@ impl EcdhPrivateKey {
         }
     }
     
+    /**
+     * Creates an ECDH private key from raw bytes for the specified curve
+     * Args:
+     *    curve - EcdhCurve: The elliptic curve to use
+     *    bytes - &[u8]: The byte slice representing the private key
+     * 
+     * Returns:
+     *    Result<Self>: The created ECDH private key
+     */
     pub fn from_bytes(curve: EcdhCurve, bytes: &[u8]) -> Result<Self> {
         match curve {
             EcdhCurve::X25519 => {
@@ -48,6 +73,14 @@ impl EcdhPrivateKey {
         }
     }
     
+    /**
+     * Serializes the ECDH private key to raw bytes
+     * Args:
+     *    &self: The ECDH private key instance
+     * 
+     * Returns:
+     *    Vec<u8>: The serialized byte vector of the private key
+     */
     pub fn to_bytes(&self) -> Vec<u8> {
         match self {
             EcdhPrivateKey::X25519(key) => key.to_bytes().to_vec(),
@@ -55,6 +88,14 @@ impl EcdhPrivateKey {
         }
     }
     
+    /**
+     * Derives the corresponding ECDH public key from the private key
+     * Args:
+     *    &self: The ECDH private key instance
+     * 
+     * Returns:
+     *    EcdhPublicKey: The derived ECDH public key
+     */
     pub fn public_key(&self) -> EcdhPublicKey {
         match self {
             EcdhPrivateKey::X25519(key) => EcdhPublicKey::X25519(key.public_key()),
@@ -62,6 +103,14 @@ impl EcdhPrivateKey {
         }
     }
     
+    /**
+     * Gets the curve type of the ECDH private key
+     * Args:
+     *    &self: The ECDH private key instance
+     * 
+     * Returns:
+     *    EcdhCurve: The curve type of the private key
+     */
     pub fn curve(&self) -> EcdhCurve {
         match self {
             EcdhPrivateKey::X25519(_) => EcdhCurve::X25519,
@@ -69,6 +118,15 @@ impl EcdhPrivateKey {
         }
     }
     
+    /**
+     * Performs ECDH key exchange with a given public key
+     * Args:
+     *    &self: The ECDH private key instance
+     *    their_public - &EcdhPublicKey: The peer's ECDH public key
+     * 
+     * Returns:
+     *    Result<Vec<u8>>: The derived shared secret or an error if the exchange fails
+     */
     pub fn exchange(&self, their_public: &EcdhPublicKey) -> Result<Vec<u8>> {
         if self.curve() != their_public.curve() {
             return Err(Error::CryptoError("Curve mismatch in ECDH exchange".to_string()));
@@ -87,6 +145,16 @@ impl EcdhPrivateKey {
 }
 
 impl EcdhPublicKey {
+
+    /**
+     * Creates an ECDH public key from raw bytes for the specified curve
+     * Args:
+     *    curve - EcdhCurve: The elliptic curve to use
+     *    bytes - &[u8]: The byte slice representing the public key
+     * 
+     * Returns:
+     *    Result<Self>: The created ECDH public key
+     */
     pub fn from_bytes(curve: EcdhCurve, bytes: &[u8]) -> Result<Self> {
         match curve {
             EcdhCurve::X25519 => {
@@ -110,6 +178,14 @@ impl EcdhPublicKey {
         }
     }
     
+    /**
+     * Serializes the ECDH public key to raw bytes
+     * Args:
+     *    &self: The ECDH public key instance
+     * 
+     * Returns:
+     *    Vec<u8>: The serialized byte vector of the public key
+     */
     pub fn to_bytes(&self) -> Vec<u8> {
         match self {
             EcdhPublicKey::X25519(key) => key.to_bytes().to_vec(),
@@ -117,6 +193,14 @@ impl EcdhPublicKey {
         }
     }
     
+    /**
+     * Serializes the ECDH public key to compressed raw bytes
+     * Args:
+     *    &self: The ECDH public key instance
+     * 
+     * Returns:
+     *    Result<Vec<u8>>: The serialized compressed byte vector of the public key
+     */
     pub fn to_compressed(&self) -> Result<Vec<u8>> {
         match self {
             EcdhPublicKey::X25519(key) => Ok(key.to_bytes().to_vec()),
@@ -124,6 +208,14 @@ impl EcdhPublicKey {
         }
     }
     
+    /**
+     * Returns the curve type of the ECDH public key
+     * Args:
+     *    &self: The ECDH public key instance
+     * 
+     * Returns:
+     *    EcdhCurve: The curve type of the public key
+     */
     pub fn curve(&self) -> EcdhCurve {
         match self {
             EcdhPublicKey::X25519(_) => EcdhCurve::X25519,
@@ -133,17 +225,45 @@ impl EcdhPublicKey {
 }
 
 impl EcdhKey for EcdhPrivateKey {
+
+    /**
+     * Performs ECDH key exchange with a given public key in raw bytes
+     * Args:
+     *    &self: The ECDH private key instance
+     *    their_public - &[u8]: The peer's ECDH public key in raw bytes
+     * 
+     * Returns:
+     *    Result<Vec<u8>>: The derived shared secret or an error if the exchange fails
+     */
     fn exchange(&self, their_public: &[u8]) -> Result<Vec<u8>> {
         let pub_key = EcdhPublicKey::from_bytes(self.curve(), their_public)?;
 
         self.exchange(&pub_key)
     }
     
+    /**
+     * Gets the public key bytes corresponding to the private key
+     * Args:
+     *    &self: The ECDH private key instance
+     * 
+     * Returns:
+     *    Vec<u8>: The serialized byte vector of the public key
+     */
     fn public_bytes(&self) -> Vec<u8> {
         self.public_key().to_bytes()
     }
 }
 
+/**
+ * Performs ECDH key exchange given raw private and public key bytes
+ * Args:
+ *    curve - EcdhCurve: The elliptic curve to use
+ *    our_private - &[u8]: Our ECDH private key in raw bytes
+ *    their_public - &[u8]: The peer's ECDH public key in raw bytes
+ * 
+ * Returns:
+ *    Result<Vec<u8>>: The derived shared secret or an error if the exchange fails
+ */
 pub fn ecdh_exchange(curve: EcdhCurve, our_private: &[u8], their_public: &[u8]) -> Result<Vec<u8>> {
     let priv_key = EcdhPrivateKey::from_bytes(curve, our_private)?;
     let pub_key = EcdhPublicKey::from_bytes(curve, their_public)?;
@@ -151,6 +271,14 @@ pub fn ecdh_exchange(curve: EcdhCurve, our_private: &[u8], their_public: &[u8]) 
     priv_key.exchange(&pub_key)
 }
 
+/**
+ * Generates a new ECDH keypair for the specified curve
+ * Args:
+ *    curve - EcdhCurve: The elliptic curve to use
+ * 
+ * Returns:
+ *    Result<(EcdhPrivateKey, EcdhPublicKey)>: The generated ECDH private and public keypair
+ */
 pub fn generate_keypair(curve: EcdhCurve) -> Result<(EcdhPrivateKey, EcdhPublicKey)> {
     let private = EcdhPrivateKey::generate(curve)?;
     let public = private.public_key();

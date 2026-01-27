@@ -1,3 +1,6 @@
+// ECDSA (Edwards Curve Digital Signature Algorithm) implementation supporting Ed25519 and P-256 curves
+// https://www.rfc-editor.org/rfc/rfc8032
+
 use crate::crypto::{Error, Result};
 use crate::crypto::bignum::BigNum;
 use super::{ed25519, p256};
@@ -6,16 +9,19 @@ use crate::crypto::hash::hmac::Hmac;
 use std::ops::{Add, Sub, Mul, Div};
 use std::cmp::Ordering;
 
+// SignatureScheme trait for signing messages
 pub trait SignatureScheme {
     fn sign(&self, message: &[u8]) -> Result<Vec<u8>>;
     fn public_bytes(&self) -> Vec<u8>;
 }
 
+// VerificationScheme trait for verifying signatures
 pub trait VerificationScheme {
     fn verify(&self, message: &[u8], signature: &[u8]) -> Result<bool>;
     fn to_bytes(&self) -> Vec<u8>;
 }
 
+// P-256 curve order in bytes
 const P256_ORDER_BYTES: [u8; 32] = [
     0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00,
     0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
@@ -23,35 +29,42 @@ const P256_ORDER_BYTES: [u8; 32] = [
     0xF3, 0xB9, 0xCA, 0xC2, 0xFC, 0x63, 0x25, 0x51,
 ];
 
+// Supported signature curves
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SignatureCurve {
     Ed25519,
     P256,
 }
 
+// SigningKey enum encapsulating different private key types
 pub enum SigningKey {
     Ed25519(ed25519::Ed25519PrivateKey),
     P256Ecdsa(P256EcdsaPrivateKey),
 }
 
+// VerifyingKey enum encapsulating different public key types
 pub enum VerifyingKey {
     Ed25519(ed25519::Ed25519PublicKey),
     P256Ecdsa(P256EcdsaPublicKey),
 }
 
+// Signature enum encapsulating different signature types
 pub enum Signature {
     Ed25519(ed25519::Ed25519Signature),
     P256Ecdsa(p256::P256Signature),
 }
 
+// P-256 ECDSA Private Key structure
 pub struct P256EcdsaPrivateKey {
     inner: p256::P256PrivateKey,
 }
 
+// P-256 ECDSA Public Key structure
 pub struct P256EcdsaPublicKey {
     inner: p256::P256PublicKey,
 }
 
+// P-256 Point structure for elliptic curve point operations
 #[derive(Clone, Debug)]
 struct P256Point {
     x: BigNum,
@@ -60,6 +73,15 @@ struct P256Point {
 }
 
 impl SigningKey {
+
+    /**
+     * Generates a new SigningKey for the specified curve
+     * Args:
+     *    curve - SignatureCurve: The signature curve to use
+     * 
+     * Returns:
+     *    Result<Self>: The generated SigningKey or an error if generation fails
+     */
     pub fn generate(curve: SignatureCurve) -> Result<Self> {
         match curve {
             SignatureCurve::Ed25519 => {
@@ -73,6 +95,15 @@ impl SigningKey {
         }
     }
     
+    /**
+     * Creates a SigningKey from bytes for the specified curve
+     * Args:
+     *    curve - SignatureCurve: The signature curve to use
+     *    bytes - &[u8]: The byte representation of the private key
+     * 
+     * Returns:
+     *    Result<Self>: The created SigningKey or an error if creation fails
+     */
     pub fn from_bytes(curve: SignatureCurve, bytes: &[u8]) -> Result<Self> {
         match curve {
             SignatureCurve::Ed25519 => {
@@ -92,6 +123,14 @@ impl SigningKey {
         }
     }
     
+    /**
+     * Converts the SigningKey to its byte representation
+     * Args:
+     *    &self: The SigningKey instance
+     * 
+     * Returns:
+     *    Vec<u8>: The byte representation of the SigningKey
+     */
     pub fn to_bytes(&self) -> Vec<u8> {
         match self {
             SigningKey::Ed25519(key) => key.to_bytes().to_vec(),
@@ -99,6 +138,14 @@ impl SigningKey {
         }
     }
     
+    /**
+     * Retrieves the corresponding VerifyingKey for the SigningKey
+     * Args:
+     *    &self: The SigningKey instance
+     * 
+     * Returns:
+     *    VerifyingKey: The corresponding VerifyingKey
+     */
     pub fn verifying_key(&self) -> VerifyingKey {
         match self {
             SigningKey::Ed25519(key) => {
@@ -112,6 +159,14 @@ impl SigningKey {
         }
     }
     
+    /**
+     * Retrieves the signature curve of the SigningKey
+     * Args:
+     *    &self: The SigningKey instance
+     * 
+     * Returns:
+     *    SignatureCurve: The signature curve used by the SigningKey
+     */
     pub fn curve(&self) -> SignatureCurve {
         match self {
             SigningKey::Ed25519(_) => SignatureCurve::Ed25519,
@@ -119,6 +174,15 @@ impl SigningKey {
         }
     }
     
+    /**
+     * Signs a message using the SigningKey
+     * Args:
+     *    &self: The SigningKey instance
+     *    message - &[u8]: The message to be signed
+     * 
+     * Returns:
+     *    Result<Signature>: The generated Signature or an error if signing fails
+     */
     pub fn sign(&self, message: &[u8]) -> Result<Signature> {
         match self {
             SigningKey::Ed25519(key) => {
@@ -134,6 +198,16 @@ impl SigningKey {
 }
 
 impl VerifyingKey {
+
+    /**
+     * Creates a VerifyingKey from bytes for the specified curve
+     * Args:
+     *    curve - SignatureCurve: The signature curve to use
+     *    bytes - &[u8]: The byte representation of the public key
+     * 
+     * Returns:
+     *    Result<Self>: The created VerifyingKey or an error if creation fails
+     */
     pub fn from_bytes(curve: SignatureCurve, bytes: &[u8]) -> Result<Self> {
         match curve {
             SignatureCurve::Ed25519 => {
@@ -157,6 +231,14 @@ impl VerifyingKey {
         }
     }
     
+    /**
+     * Converts the VerifyingKey to its byte representation
+     * Args:
+     *    &self: The VerifyingKey instance
+     * 
+     * Returns:
+     *    Vec<u8>: The byte representation of the VerifyingKey
+     */
     pub fn to_bytes(&self) -> Vec<u8> {
         match self {
             VerifyingKey::Ed25519(key) => key.to_bytes().to_vec(),
@@ -164,6 +246,15 @@ impl VerifyingKey {
         }
     }
     
+    /**
+     * Converts the VerifyingKey to its compressed byte representation
+     * Args:
+     *    &self: The VerifyingKey instance
+     * 
+     * Returns:
+     *    Result<Vec<u8>>: The compressed byte representation of the VerifyingKey
+     *    or an error if conversion fails
+     */
     pub fn to_compressed(&self) -> Result<Vec<u8>> {
         match self {
             VerifyingKey::Ed25519(key) => Ok(key.to_bytes().to_vec()),
@@ -171,6 +262,14 @@ impl VerifyingKey {
         }
     }
     
+    /**
+     * Retrieves the signature curve of the VerifyingKey
+     * Args:
+     *    &self: The VerifyingKey instance
+     * 
+     * Returns:
+     *    SignatureCurve: The signature curve used by the VerifyingKey
+     */
     pub fn curve(&self) -> SignatureCurve {
         match self {
             VerifyingKey::Ed25519(_) => SignatureCurve::Ed25519,
@@ -178,6 +277,16 @@ impl VerifyingKey {
         }
     }
     
+    /**
+     * Verifies a signature for a given message using the VerifyingKey
+     * Args:
+     *    &self: The VerifyingKey instance
+     *    message - &[u8]: The message to verify
+     *    signature - &Signature: The signature to verify
+     * 
+     * Returns:
+     *    Result<bool>: True if the signature is valid, false otherwise or an error if verification fails
+     */
     pub fn verify(&self, message: &[u8], signature: &Signature) -> Result<bool> {
         if self.curve() != signature.curve() {
             return Err(Error::CryptoError("Signature curve mismatch".to_string()));
@@ -196,6 +305,16 @@ impl VerifyingKey {
 }
 
 impl Signature {
+
+    /**
+     * Creates a Signature from its byte representation
+     * Args:
+     *    curve - SignatureCurve: The signature curve type
+     *    bytes - &[u8]: The byte representation of the signature
+     * 
+     * Returns:
+     *    Result<Self>: The Signature instance or an error if creation fails
+     */
     pub fn from_bytes(curve: SignatureCurve, bytes: &[u8]) -> Result<Self> {
         match curve {
             SignatureCurve::Ed25519 => {
@@ -215,6 +334,14 @@ impl Signature {
         }
     }
     
+    /**
+     * Converts the Signature to its byte representation
+     * Args:
+     *    &self: The Signature instance
+     * 
+     * Returns:
+     *    Vec<u8>: The byte representation of the Signature
+     */
     pub fn to_bytes(&self) -> Vec<u8> {
         match self {
             Signature::Ed25519(sig) => sig.to_bytes().to_vec(),
@@ -222,6 +349,14 @@ impl Signature {
         }
     }
     
+    /**
+     * Retrieves the signature curve of the Signature
+     * Args:
+     *    &self: The Signature instance
+     * 
+     * Returns:
+     *    SignatureCurve: The signature curve used by the Signature
+     */
     pub fn curve(&self) -> SignatureCurve {
         match self {
             Signature::Ed25519(_) => SignatureCurve::Ed25519,
@@ -231,6 +366,16 @@ impl Signature {
 }
 
 impl P256EcdsaPrivateKey {
+
+    /**
+     * Signs a message using the P256 ECDSA private key
+     * Args:
+     *    &self: The P256EcdsaPrivateKey instance
+     *    message - &[u8]: The message to sign
+     * 
+     * Returns:
+     *    Result<p256::P256Signature>: The generated signature or an error if signing fails
+     */
     fn sign_ecdsa(&self, message: &[u8]) -> Result<p256::P256Signature> {
         let mut hasher = Sha256::new();
         hasher.update(message);
@@ -282,6 +427,17 @@ impl P256EcdsaPrivateKey {
 }
 
 impl P256EcdsaPublicKey {
+
+    /**
+     * Verifies a P256 ECDSA signature for a given message
+     * Args:
+     *    &self: The P256EcdsaPublicKey instance
+     *    message - &[u8]: The message to verify
+     *    signature - &p256::P256Signature: The signature to verify
+     * 
+     * Returns:
+     *    Result<bool>: True if the signature is valid, false otherwise or an error if verification fails
+     */
     fn verify_ecdsa(&self, message: &[u8], signature: &p256::P256Signature) -> Result<bool> {
         let mut hasher = Sha256::new();
         hasher.update(message);
@@ -313,21 +469,58 @@ impl P256EcdsaPublicKey {
 }
 
 impl SignatureScheme for SigningKey {
+    
+    /**
+     * Signs a message using the SigningKey
+     * Args:
+     *    &self: The SigningKey instance
+     *    message - &[u8]: The message to be signed
+     * 
+     * Returns:
+     *    Result<Vec<u8>>: The generated signature bytes or an error if signing fails
+     */
     fn sign(&self, message: &[u8]) -> Result<Vec<u8>> {
         Ok(self.sign(message)?.to_bytes())
     }
     
+    /**
+     * Retrieves the public key bytes corresponding to the SigningKey
+     * Args:
+     *    &self: The SigningKey instance
+     * 
+     * Returns:
+     *    Vec<u8>: The byte representation of the public key
+     */
     fn public_bytes(&self) -> Vec<u8> {
         self.verifying_key().to_bytes()
     }
 }
 
 impl VerificationScheme for VerifyingKey {
+
+    /**
+     * Verifies a signature for a given message using the VerifyingKey
+     * Args:
+     *    &self: The VerifyingKey instance
+     *    message - &[u8]: The message to verify
+     *    signature - &[u8]: The signature bytes to verify
+     * 
+     * Returns:
+     *    Result<bool>: True if the signature is valid, false otherwise or an error if verification fails
+     */
     fn verify(&self, message: &[u8], signature: &[u8]) -> Result<bool> {
         let sig = Signature::from_bytes(self.curve(), signature)?;
         self.verify(message, &sig)
     }
     
+    /**
+     * Converts the VerifyingKey to its byte representation
+     * Args:
+     *    &self: The VerifyingKey instance
+     * 
+     * Returns:
+     *    Vec<u8>: The byte representation of the VerifyingKey
+     */
     fn to_bytes(&self) -> Vec<u8> {
         match self {
             VerifyingKey::Ed25519(key) => key.to_bytes().to_vec(),
@@ -336,23 +529,63 @@ impl VerificationScheme for VerifyingKey {
     }
 }
 
+/**
+ * Signs a message using the specified signature curve and private key bytes
+ * Args:
+ *    curve - SignatureCurve: The signature curve to use
+ *    private_key - &[u8]: The private key bytes
+ *    message - &[u8]: The message to be signed
+ * 
+ * Returns:
+ *    Result<Vec<u8>>: The generated signature bytes or an error if signing fails
+ */
 pub fn sign(curve: SignatureCurve, private_key: &[u8], message: &[u8]) -> Result<Vec<u8>> {
     let key = SigningKey::from_bytes(curve, private_key)?;
     Ok(key.sign(message)?.to_bytes())
 }
 
+/**
+ * Verifies a signature for a given message using the specified signature curve and public key bytes
+ * Args:
+ *    curve - SignatureCurve: The signature curve to use
+ *    public_key - &[u8]: The public key bytes
+ *    message - &[u8]: The message to verify
+ *    signature - &[u8]: The signature bytes to verify
+ * 
+ * Returns:
+ *    Result<bool>: True if the signature is valid, false otherwise or an error if verification fails
+ */
 pub fn verify(curve: SignatureCurve, public_key: &[u8], message: &[u8], signature: &[u8]) -> Result<bool> {
     let key = VerifyingKey::from_bytes(curve, public_key)?;
     let sig = Signature::from_bytes(curve, signature)?;
     key.verify(message, &sig)
 }
 
+/**
+ * Generates a new keypair for the specified signature curve
+ * Args:
+ *    curve - SignatureCurve: The signature curve to use
+ * 
+ * Returns:
+ *    Result<(SigningKey, VerifyingKey)>: The generated SigningKey and VerifyingKey
+ *    or an error if generation fails
+ */
 pub fn generate_keypair(curve: SignatureCurve) -> Result<(SigningKey, VerifyingKey)> {
     let signing = SigningKey::generate(curve)?;
     let verifying = signing.verifying_key();
     Ok((signing, verifying))
 }
 
+/**
+ * Generates a deterministic nonce 'k' for ECDSA signing using RFC 6979
+ * Args:
+ *    private_key - &[u8; 32]: The private key bytes
+ *    hash - &[u8; 32]: The hash of the message to be signed
+ *    order - &[u8; 32]: The order of the elliptic curve
+ * 
+ * Returns:
+ *    Result<BigNum>: The generated nonce 'k' or an error if generation fails
+ */
 fn generate_k_rfc6979(private_key: &[u8; 32], hash: &[u8; 32], order: &[u8; 32]) -> Result<BigNum> {
     let mut v = [0x01u8; 32];
     let mut k_hmac = [0x00u8; 32];
@@ -406,15 +639,40 @@ fn generate_k_rfc6979(private_key: &[u8; 32], hash: &[u8; 32], order: &[u8; 32])
 }
 
 impl P256Point {
+
+    /**
+     * Retrieves the x-coordinate of the P256Point
+     * Args:
+     *    &self: The P256Point instance
+     * 
+     * Returns:
+     *    BigNum: The x-coordinate of the point
+     */
     fn x_coordinate(&self) -> BigNum {
         self.x.clone()
     }
     
+    /**
+     * Checks if the P256Point is the point at infinity
+     * Args:
+     *    &self: The P256Point instance
+     * 
+     * Returns:
+     *    bool: True if the point is at infinity, false otherwise
+     */
     fn is_infinity(&self) -> bool {
         self.infinity
     }
 }
 
+/**
+ * Performs scalar multiplication of the base point G by a scalar k
+ * Args:
+ *    k - &BigNum: The scalar multiplier
+ * 
+ * Returns:
+ *    Result<P256Point>: The resulting P256Point after multiplication, or an error if the operation fails
+ */
 fn scalar_mult_base(k: &BigNum) -> Result<P256Point> {
     let gx_bytes = [
         0x6B, 0x17, 0xD1, 0xF2, 0xE1, 0x2C, 0x42, 0x47,
@@ -438,6 +696,15 @@ fn scalar_mult_base(k: &BigNum) -> Result<P256Point> {
     scalar_mult(k, &g)
 }
 
+/**
+ * Performs scalar multiplication of a point by a scalar k
+ * Args:
+ *    k - &BigNum: The scalar multiplier
+ *    point - &P256Point: The point to be multiplied
+ * 
+ * Returns:
+ *    Result<P256Point>: The resulting P256Point after multiplication, or an error if the operation fails
+ */
 fn scalar_mult(k: &BigNum, point: &P256Point) -> Result<P256Point> {
     if k.is_zero() || point.is_infinity() {
         return Ok(P256Point {
@@ -467,6 +734,15 @@ fn scalar_mult(k: &BigNum, point: &P256Point) -> Result<P256Point> {
     Ok(result)
 }
 
+/**
+ * Adds two P256Points together
+ * Args:
+ *    p - &P256Point: The first point
+ *    q - &P256Point: The second point
+ * 
+ * Returns:
+ *    Result<P256Point>: The resulting P256Point after addition, or an error if the operation fails
+ */
 fn point_add(p: &P256Point, q: &P256Point) -> Result<P256Point> {
     if p.is_infinity() {
         return Ok(q.clone());
@@ -512,6 +788,14 @@ fn point_add(p: &P256Point, q: &P256Point) -> Result<P256Point> {
     })
 }
 
+/**
+ * Doubles a P256Point
+ * Args:
+ *    p - &P256Point: The point to be doubled
+ * 
+ * Returns:
+ *    Result<P256Point>: The resulting P256Point after doubling, or an error if the operation fails
+ */
 fn point_double(p: &P256Point) -> Result<P256Point> {
     if p.is_infinity() {
         return Ok(p.clone());
@@ -548,6 +832,16 @@ fn point_double(p: &P256Point) -> Result<P256Point> {
     })
 }
 
+/**
+ * Computes the verification point for ECDSA signature verification
+ * Args:
+ *    u1 - &BigNum: The first scalar
+ *    u2 - &BigNum: The second scalar
+ *    public_key - &p256::P256PublicKey: The public key point
+ * 
+ * Returns:
+ *    Result<P256Point>: The resulting verification point, or an error if the operation fails
+ */
 fn compute_verification_point(u1: &BigNum, u2: &BigNum, public_key: &p256::P256PublicKey) -> Result<P256Point> {
     let p1 = scalar_mult_base(u1)?;
     

@@ -1,12 +1,17 @@
+// crypto/encoding/x509.rs - X.509 Certificate parsing and encoding
+// https://tools.ietf.org/html/rfc5280
+
 use crate::crypto::Result;
 use crate::crypto::encoding::asn1::DerDecoder;
 use crate::crypto::encoding::pem;
 
+// X.509 Name and Certificate structures
 #[derive(Clone, Debug)]
 pub struct Name {
     pub common_name: Option<String>,
 }
 
+// Subject Public Key Info structure
 #[derive(Clone, Debug)]
 pub struct SubjectPublicKeyInfo {
     pub algorithm: Vec<u64>,
@@ -14,6 +19,7 @@ pub struct SubjectPublicKeyInfo {
     pub public_key: Vec<u8>,
 }
 
+// X.509 Certificate structure
 #[derive(Clone, Debug)]
 pub struct Certificate {
     pub tbs: Vec<u8>,
@@ -25,6 +31,15 @@ pub struct Certificate {
 }
 
 impl Certificate {
+
+    /**
+     * Parses a DER-encoded X.509 certificate using ASN.1 DerDecoder
+     * Args:
+     *    der - &[u8]: The DER-encoded certificate bytes
+     * 
+     * Returns:
+     *    Result<Self>: The parsed Certificate or an error if parsing fails
+     */
     pub fn from_der(der: &[u8]) -> Result<Self> {
         let mut decoder = DerDecoder::new(der);
         decoder.sequence(|cert| {
@@ -82,17 +97,41 @@ impl Certificate {
         })
     }
 
+    /**
+     * Parses a PEM-encoded X.509 certificate
+     * Args:
+     *    pem_str - &str: The PEM-encoded certificate string
+     * 
+     * Returns
+     *    Result<Self>: The parsed Certificate or an error if parsing fails
+     */
     pub fn from_pem(pem_str: &str) -> Result<Self> {
         let pem = pem::decode(pem_str)?;
 
         Self::from_der(&pem)
     }
 
+    /**
+     * Encodes the certificate to PEM format
+     * Args:
+     *    &self: The Certificate instance
+     * 
+     * Returns:
+     *    String: The PEM-encoded certificate string
+     */
     pub fn to_pem(&self) -> String {
         pem::encode(&self.tbs)
     }
 }
 
+/**
+ * Parses an X.509 Name from a DerDecoder
+ * Args:
+ *    decoder - &mut DerDecoder: The DerDecoder positioned at the Name
+ * 
+ * Returns:
+ *    Result<Name>: The parsed Name or an error if parsing fails
+ */
 fn parse_name(decoder: &mut DerDecoder) -> Result<Name> {
     let mut common_name = None;
     decoder.set(|set| {
@@ -109,6 +148,14 @@ fn parse_name(decoder: &mut DerDecoder) -> Result<Name> {
     Ok(Name { common_name })
 }
 
+/**
+ * Parses a SubjectPublicKeyInfo from a DerDecoder
+ * Args:
+ *    decoder - &mut DerDecoder: The DerDecoder positioned at the SubjectPublicKeyInfo
+ * 
+ * Returns:
+ *    Result<SubjectPublicKeyInfo>: The parsed SubjectPublicKeyInfo or an error if parsing fails
+ */
 fn parse_spki(decoder: &mut DerDecoder) -> Result<SubjectPublicKeyInfo> {
     let algorithm = decoder.sequence(|alg| alg.object_identifier())?;
     let param = decoder.optional_context_specific(0, |p| p.octet_string()).ok().flatten();

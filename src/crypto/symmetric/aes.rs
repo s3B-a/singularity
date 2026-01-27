@@ -1,5 +1,9 @@
+// crypto/symmetric/aes.rs - Advanced Encryption Standard (AES) implementation
+// https://nvlpubs.nist.gov/nistpubs/FIPS/NIST.FIPS.197.pdf
+
 use crate::crypto::{Error, Result};
 
+// AES S-box
 const SBOX: [u8; 256] = [
     0x63, 0x7c, 0x77, 0x7b, 0xf2, 0x6b, 0x6f, 0xc5, 0x30, 0x01, 0x67, 0x2b, 0xfe, 0xd7, 0xab, 0x76,
     0xca, 0x82, 0xc9, 0x7d, 0xfa, 0x59, 0x47, 0xf0, 0xad, 0xd4, 0xa2, 0xaf, 0x9c, 0xa4, 0x72, 0xc0,
@@ -19,6 +23,7 @@ const SBOX: [u8; 256] = [
     0x8c, 0xa1, 0x89, 0x0d, 0xbf, 0xe6, 0x42, 0x68, 0x41, 0x99, 0x2d, 0x0f, 0xb0, 0x54, 0xbb, 0x16,
 ];
 
+// AES Inverse S-box
 const INVERSE_SBOX: [u8; 256] = [
     0x52, 0x09, 0x6a, 0xd5, 0x30, 0x36, 0xa5, 0x38, 0xbf, 0x40, 0xa3, 0x9e, 0x81, 0xf3, 0xd7, 0xfb,
     0x7c, 0xe3, 0x39, 0x82, 0x9b, 0x2f, 0xff, 0x87, 0x34, 0x8e, 0x43, 0x44, 0xc4, 0xde, 0xe9, 0xcb,
@@ -38,10 +43,12 @@ const INVERSE_SBOX: [u8; 256] = [
     0x17, 0x2b, 0x04, 0x7e, 0xba, 0x77, 0xd6, 0x26, 0xe1, 0x69, 0x14, 0x63, 0x55, 0x21, 0x0c, 0x7d,
 ];
 
+// AES Round Constants
 const RCON: [u8; 11] = [
     0x00, 0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x1b, 0x36
 ];
 
+// Key expansion for AES-128
 #[derive(Clone)]
 pub struct Aes {
     round_keys: Vec<[u8; 16]>,
@@ -49,6 +56,15 @@ pub struct Aes {
 }
 
 impl Aes {
+
+    /**
+     * Creates a new AES instance with the given key
+     * Args:
+     *    key - &[u8]: The encryption key (16, 24, or 32 bytes for AES 128, 192, or 256)
+     * 
+     * Returns:
+     *    Result<Self>: The AES instance or an error if the key size is invalid
+     */
     pub fn new(key: &[u8]) -> Result<Self> {
         match key.len() {
             16 => Ok(Self::new_128(key)),
@@ -58,6 +74,15 @@ impl Aes {
         }
     }
 
+    /**
+     * Encrypts a single 16-byte block
+     * Args:
+     *    &self: The AES instance
+     *    block - &[u8]: The 16-byte block to encrypt
+     * 
+     * Returns:
+     *    [u8; 16]: The encrypted block
+     */
     pub fn encrypt_block(&self, block: &[u8]) -> [u8; 16] {
         assert_eq!(block.len(), 16);
         let mut state = [0u8; 16];
@@ -78,6 +103,15 @@ impl Aes {
         state
     }
 
+    /**
+     * Decrypts a single 16-byte block
+     * Args:
+     *    &self: The AES instance
+     *    block - &[u8]: The 16-byte block to decrypt
+     * 
+     * Returns:
+     *    [u8; 16]: The decrypted block
+     */
     pub fn decrypt_block(&self, block: &[u8]) -> [u8; 16] {
         assert_eq!(block.len(), 16);
         let mut state = [0u8; 16];
@@ -98,6 +132,14 @@ impl Aes {
         state
     }
 
+    /**
+     * Creates a new AES-128 instance
+     * Args:
+     *    key - &[u8]: The 16-byte encryption key
+     * 
+     * Returns:
+     *    Self: The AES-128 instance
+     */
     pub fn new_128(key: &[u8]) -> Self {
         assert_eq!(key.len(), 16);
         let round_keys = key_expansion_128(key);
@@ -107,6 +149,14 @@ impl Aes {
         }
     }
 
+    /**
+     * Creates a new AES-192 instance
+     * Args:
+     *    key - &[u8]: The 24-byte encryption key
+     * 
+     * Returns:
+     *    Self: The AES-192 instance
+     */
     pub fn new_192(key: &[u8]) -> Self {
         assert_eq!(key.len(), 24);
         let round_keys = key_expansion_192(key);
@@ -116,6 +166,14 @@ impl Aes {
         }
     }
 
+    /**
+     * Creates a new AES-256 instance
+     * Args:
+     *    key - &[u8]: The 32-byte encryption key
+     * 
+     * Returns:
+     *    Self: The AES-256 instance
+     */
     pub fn new_256(key: &[u8]) -> Self {
         assert_eq!(key.len(), 32);
         let round_keys = key_expansion_256(key);
@@ -126,18 +184,42 @@ impl Aes {
     }
 }
 
+/**
+ * Byte substitution using the AES S-box
+ * Args:
+ *    state - &mut [u8; 16]: The state array to transform
+ * 
+ * Returns:
+ *    (): Nothing
+ */
 fn sub_bytes(state: &mut [u8; 16]) {
     for byte in state.iter_mut() {
         *byte = SBOX[*byte as usize];
     }
 }
 
+/**
+ * Inverse byte substitution using the AES Inverse S-box
+ * Args:
+ *    state - &mut [u8; 16]: The state array to transform
+ * 
+ * Returns:
+ *    (): Nothing
+ */
 fn inverse_sub_bytes(state: &mut [u8; 16]) {
     for byte in state.iter_mut() {
         *byte = INVERSE_SBOX[*byte as usize];
     }
 }
 
+/**
+ * Shift the rows of the state array to the left
+ * Args:
+ *    state - &mut [u8; 16]: The state array to transform
+ * 
+ * Returns:
+ *    (): Nothing
+ */
 fn shift_rows(state: &mut [u8; 16]) {
     state.swap(1, 5);
     state.swap(5, 9);
@@ -151,6 +233,14 @@ fn shift_rows(state: &mut [u8; 16]) {
     state.swap(11, 7);
 }
 
+/**
+ * Inverse shift the rows of the state array to the right
+ * Args:
+ *    state - &mut [u8; 16]: The state array to transform
+ * 
+ * Returns:
+ *    (): Nothing
+ */
 fn inverse_shift_rows(state: &mut [u8; 16]) {
     state.swap(13, 9);
     state.swap(9, 5);
@@ -164,6 +254,15 @@ fn inverse_shift_rows(state: &mut [u8; 16]) {
     state.swap(15, 3);
 }
 
+/**
+ * Galois field multiplication
+ * Args:
+ *    a - u8: First byte
+ *    b - u8: Second byte
+ * 
+ * Returns:
+ *    u8: The result of the multiplication
+ */
 fn gmul(a: u8, b: u8) -> u8 {
     let mut p = 0u8;
     let mut a = a;
@@ -185,6 +284,14 @@ fn gmul(a: u8, b: u8) -> u8 {
     p
 }
 
+/**
+ * Mixes the columns of the state array
+ * Args:
+ *    state - &mut [u8; 16]: The state array to transform
+ * 
+ * Returns:
+ *    (): Nothing
+ */
 fn mix_columns(state: &mut [u8; 16]) {
     for i in 0..4 {
         let s0 = state[i * 4];
@@ -199,6 +306,14 @@ fn mix_columns(state: &mut [u8; 16]) {
     }
 }
 
+/**
+ * Inverse mixes the columns of the state array
+ * Args:
+ *    state - &mut [u8; 16]: The state array to transform
+ * 
+ * Returns:
+ *    (): Nothing
+ */
 fn inverse_mix_columns(state: &mut [u8; 16]) {
     for i in 0..4 {
         let s0 = state[i * 4];
@@ -213,12 +328,29 @@ fn inverse_mix_columns(state: &mut [u8; 16]) {
     }
 }
 
+/**
+ * Adds the round key to the state array
+ * Args:
+ *    state - &mut [u8; 16]: The state array to transform
+ *    round_key - &[u8; 16]: The round key to add
+ * 
+ * Returns:
+ *    (): Nothing
+ */
 fn add_round_key(state: &mut [u8; 16], round_key: &[u8; 16]) {
     for i in 0..16 {
         state[i] ^= round_key[i];
     }
 }
 
+/**
+ * Key expansion for AES-128
+ * Args:
+ *    key - &[u8]: The 16-byte encryption key
+ * 
+ * Returns:
+ *    Vec<[u8; 16]>: The expanded round keys
+ */
 fn key_expansion_128(key: &[u8]) -> Vec<[u8; 16]> {
     let mut round_keys = vec![[0u8; 16]; 11];
     round_keys[0].copy_from_slice(key);
@@ -243,6 +375,14 @@ fn key_expansion_128(key: &[u8]) -> Vec<[u8; 16]> {
     round_keys
 }
 
+/**
+ * Key expansion for AES-192
+ * Args:
+ *    key - &[u8]: The 24-byte encryption key
+ * 
+ * Returns:
+ *    Vec<[u8; 16]>: The expanded round keys
+ */
 fn key_expansion_192(key: &[u8]) -> Vec<[u8; 16]> {
     let mut round_keys = vec![[0u8; 16]; 13];
     let mut temp = [0u8; 24];
@@ -279,6 +419,14 @@ fn key_expansion_192(key: &[u8]) -> Vec<[u8; 16]> {
     round_keys
 }
 
+/**
+ * Key expansion for AES-256
+ * Args:
+ *    key - &[u8]: The 32-byte encryption key
+ * 
+ * Returns:
+ *    Vec<[u8; 16]>: The expanded round keys
+ */
 fn key_expansion_256(key: &[u8]) -> Vec<[u8; 16]> {
     let mut round_keys = vec![[0u8; 16]; 15];
     round_keys[0].copy_from_slice(&key[0..16]);

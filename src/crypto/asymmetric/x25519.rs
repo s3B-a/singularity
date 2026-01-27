@@ -1,7 +1,12 @@
+// crypto/asymmetric/x25519.rs - X25519 Key Exchange Implementation
+// https://datatracker.ietf.org/doc/html/rfc7748#section-5
+
 use crate::crypto::{Error, Result};
 
+// Field Element type for X25519
 type Fe = [i64; 10];
 
+// Base point for X25519 key exchange
 const BASE_POINT: [u8; 32] = [
     9, 0, 0, 0, 0, 0, 0, 0,
     0, 0, 0, 0, 0, 0, 0, 0,
@@ -9,17 +14,28 @@ const BASE_POINT: [u8; 32] = [
     0, 0, 0, 0, 0, 0, 0, 0
 ];
 
+// X25519 Private Key structure
 #[derive(Clone)]
 pub struct X25519PrivateKey {
     scalar: [u8; 32],
 }
 
+// X25519 Public Key structure
 #[derive(Clone, Debug, PartialEq)]
 pub struct X25519PublicKey {
     point: [u8; 32],
 }
 
 impl X25519PrivateKey {
+
+    /**
+     * Generates a new X25519 private key
+     * Args:
+     *    (): No arguments
+     * 
+     * Returns:
+     *    Result<Self>: The generated X25519PrivateKey or an error if generation fails
+     */
     pub fn generate() -> Result<Self> {
         let mut scalar = [0u8; 32];
         crate::crypto::random::fill_random(&mut scalar)?;
@@ -33,6 +49,14 @@ impl X25519PrivateKey {
         })
     }
 
+    /**
+     * Creates an X25519 private key from raw bytes
+     * Args:
+     *    bytes - &[u8]: The byte slice representing the private key
+     * 
+     * Returns:
+     *    Result<Self>: The created X25519PrivateKey or an error if the byte slice is invalid
+     */
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
         if bytes.len() != 32 {
             return Err(Error::InvalidKeySize);
@@ -50,15 +74,40 @@ impl X25519PrivateKey {
         })
     }
 
+    /**
+     * Returns the raw bytes of the X25519 private key
+     * Args:
+     *    &self: The X25519PrivateKey instance
+     * 
+     * Returns:
+     *    [u8; 32]: The byte array representing the private key
+     */
     pub fn to_bytes(&self) -> [u8; 32] {
         self.scalar
     }
 
+    /**
+     * Derives the corresponding X25519 public key from the private key
+     * Args:
+     *    &self: The X25519PrivateKey instance
+     * 
+     * Returns:
+     *    X25519PublicKey: The derived X25519 public key
+     */
     pub fn public_key(&self) -> X25519PublicKey {
         let point = x25519_base(&self.scalar);
         X25519PublicKey { point }
     }
 
+    /**
+     * Performs the Diffie-Hellman key exchange to compute the shared secret
+     * Args:
+     *    &self: The X25519PrivateKey instance
+     *    their_public - &X25519PublicKey: The other party's X25519 public key
+     * 
+     * Returns:
+     *    Result<[u8; 32]>: The computed shared secret or an error if the computation fails
+     */
     pub fn diffie_hellman(&self, their_public: &X25519PublicKey) -> Result<[u8; 32]> {
         let shared = x25519_scalar_mult(&self.scalar, &their_public.point);
         if shared.iter().all(|&b| b == 0) {
@@ -70,6 +119,15 @@ impl X25519PrivateKey {
 }
 
 impl X25519PublicKey {
+
+    /**
+     * Creates an X25519 public key from raw bytes
+     * Args:
+     *    bytes - &[u8]: The byte slice representing the public key
+     * 
+     * Returns:
+     *    Result<Self>: The created X25519PublicKey or an error if the byte slice is invalid
+     */
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
         if bytes.len() != 32 {
             return Err(Error::InvalidKeySize);
@@ -81,15 +139,40 @@ impl X25519PublicKey {
         Ok(Self { point })
     }
 
+    /**
+     * Returns the raw bytes of the X25519 public key
+     * Args:
+     *    &self: The X25519PublicKey instance
+     * 
+     * Returns:
+     *    [u8; 32]: The byte array representing the public key
+     */
     pub fn to_bytes(&self) -> [u8; 32] {
         self.point
     }
 }
 
+/**
+ * Computes the X25519 public key point from a given scalar
+ * Args:
+ *    scalar - &[u8; 32]: The private key scalar
+ * 
+ * Returns:
+ *    [u8; 32]: The resulting public key point
+ */
 fn x25519_base(scalar: &[u8; 32]) -> [u8; 32] {
     x25519_scalar_mult(scalar, &BASE_POINT)
 }
 
+/**
+ * Performs X25519 scalar multiplication
+ * Args:
+ *    scalar - &[u8; 32]: The private key scalar
+ *    point - &[u8; 32]: The public key point
+ * 
+ * Returns:
+ *    [u8; 32]: The resulting shared secret point
+ */
 fn x25519_scalar_mult(scalar: &[u8; 32], point: &[u8; 32]) -> [u8; 32] {
     let x1 = fe_from_bytes(point);
     let mut x2 = fe_one();
@@ -127,14 +210,38 @@ fn x25519_scalar_mult(scalar: &[u8; 32], point: &[u8; 32]) -> [u8; 32] {
     fe_to_bytes(&result)
 }
 
+/**
+ * Creates a field element representing zero
+ * Args:
+ *    (): No arguments
+ * 
+ * Returns:
+ *    Fe: The field element representing zero
+ */
 fn fe_zero() -> Fe {
     [0; 10]
 }
 
+/**
+ * Creates a field element representing one
+ * Args:
+ *    (): No arguments
+ * 
+ * Returns:
+ *    Fe: The field element representing one
+ */
 fn fe_one() -> Fe {
     [1, 0, 0, 0, 0, 0, 0, 0, 0, 0]
 }
 
+/**
+ * Converts a byte array to a field element (never make me type this again)
+ * Args:
+ *    bytes - &[u8; 32]: The byte array to convert
+ * 
+ * Returns:
+ *    Fe: The resulting field element
+ */
 pub fn fe_from_bytes(bytes: &[u8; 32]) -> Fe {
     let mut h = [0i64; 10];
     h[0] = (bytes[0] as i64) | ((bytes[1] as i64) << 8) | ((bytes[2] as i64) << 16) | ((bytes[3] as i64 & 3) << 24);
@@ -151,6 +258,14 @@ pub fn fe_from_bytes(bytes: &[u8; 32]) -> Fe {
     h
 }
 
+/**
+ * Converts a field element to a byte array (i hate this)
+ * Args:
+ *    h - &Fe: The field element to convert
+ * 
+ * Returns:
+ *    [u8; 32]: The resulting byte array
+ */
 pub fn fe_to_bytes(h: &Fe) -> [u8; 32] {
     let mut s = [0u8; 32];
     let mut h = *h;
@@ -193,6 +308,15 @@ pub fn fe_to_bytes(h: &Fe) -> [u8; 32] {
     s
 }
 
+/**
+ * Adds two field elements
+ * Args:
+ *    a - &Fe: The first field element
+ *    b - &Fe: The second field element
+ * 
+ * Returns:
+ *    Fe: The resulting field element after addition
+ */
 pub fn fe_add(a: &Fe, b: &Fe) -> Fe {
     let mut h = [0i64; 10];
     for i in 0..10 {
@@ -202,6 +326,15 @@ pub fn fe_add(a: &Fe, b: &Fe) -> Fe {
     h
 }
 
+/**
+ * Subtracts two field elements
+ * Args:
+ *    a - &Fe: The first field element
+ *    b - &Fe: The second field element
+ * 
+ * Returns:
+ *    Fe: the resulting field element after subtraction
+ */
 pub fn fe_sub(a: &Fe, b: &Fe) -> Fe {
     let mut h = [0i64; 10];
     for i in 0..10 {
@@ -211,6 +344,15 @@ pub fn fe_sub(a: &Fe, b: &Fe) -> Fe {
     h
 }
 
+/**
+ * Multiplies two field elements (writing this made me want to explode)
+ * Args:
+ *    a - &Fe: The first field element
+ *    b - &Fe: The second field element
+ * 
+ * Returns:
+ *    Fe: The resulting field element after multiplication
+ */
 pub fn fe_mul(a: &Fe, b: &Fe) -> Fe {
     let a0 = a[0];
     let a1 = a[1];
@@ -251,10 +393,26 @@ pub fn fe_mul(a: &Fe, b: &Fe) -> Fe {
     h
 }
 
+/**
+ * Squares a field element
+ * Args:
+ *    a - &Fe: The field element to square
+ * 
+ * Returns:
+ *    Fe: The resulting field element after squaring
+ */
 pub fn fe_square(a: &Fe) -> Fe {
     fe_mul(a, a)
 }
 
+/**
+ * Multiplies a field element by 121666
+ * Args:
+ *    a - &Fe: The field element to multiply
+ * 
+ * Returns:
+ *    Fe: The resulting field element after multiplication
+ */
 pub fn fe_mul_121666(a: &Fe) -> Fe {
     let mut h = [0i64; 10];
     for i in 0..10 {
@@ -266,6 +424,14 @@ pub fn fe_mul_121666(a: &Fe) -> Fe {
     h
 }
 
+/**
+ * Computes the multiplicative inverse of a field element
+ * Args:
+ *    z - &Fe: The field element to invert
+ * 
+ * Returns:
+ *    Fe: The resulting field element after inversion
+ */
 pub fn fe_invert(z: &Fe) -> Fe {
     let mut t0 = fe_square(z);
     let mut t1 = fe_square(&t0);
@@ -325,6 +491,14 @@ pub fn fe_invert(z: &Fe) -> Fe {
     fe_mul(&t1, &t0)
 }
 
+/**
+ * Reduces a field element modulo the prime
+ * Args:
+ *    h - &mut Fe: The field element to reduce
+ * 
+ * Returns:
+ *    (): Nothing
+ */
 pub fn fe_reduce(h: &mut Fe) {
     let mut carry: i64;
     
@@ -341,6 +515,16 @@ pub fn fe_reduce(h: &mut Fe) {
     carry = (h[8] + (1 << 25)) >> 26; h[9] += carry; h[8] -= carry << 26;
 }
 
+/**
+ * Conditionally swaps two field elements
+ * Args:
+ *    a - &mut Fe: The first field element
+ *    b - &mut Fe: The second field element
+ *    swap - u8: The swap condition (0 or 1)
+ * 
+ * Returns:
+ *    (): Nothing
+ */
 pub fn fe_cswap(a: &mut Fe, b: &mut Fe, swap: u8) {
     let mask = -(swap as i64);
     for i in 0..10 {

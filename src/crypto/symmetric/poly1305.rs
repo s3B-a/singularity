@@ -1,5 +1,9 @@
+// crypto/symmetric/poly1305.rs - Poly1305 Message Authentication Code Implementation
+// https://tools.ietf.org/html/rfc8439
+
 use crate::crypto::{Error, Result};
 
+// Clamping mask for the r portion of the key
 const CLAMP_MASK: [u8; 16] = [
     0xff, 0xff, 0xff, 0x0f, // r[0]
     0xfc, 0xff, 0xff, 0x0f, // r[1]
@@ -7,6 +11,7 @@ const CLAMP_MASK: [u8; 16] = [
     0xfc, 0xff, 0xff, 0x0f, // r[3]
 ];
 
+// Poly1305 MAC structure
 #[derive(Clone)]
 pub struct Poly1305 {
     r: [u32; 5],
@@ -17,6 +22,15 @@ pub struct Poly1305 {
 }
 
 impl Poly1305 {
+
+    /**
+     * Creates a new Poly1305 instance with the given key
+     * Args:
+     *    key - &[u8]: The 32-byte key for Poly1305
+     * 
+     * Returns:
+     *    Result<Self>: The Poly1305 instance or an error if the key size is invalid
+     */
     pub fn new(key: &[u8]) -> Result<Self> {
         if key.len() != 32 {
             return Err(Error::InvalidKeySize);
@@ -52,6 +66,15 @@ impl Poly1305 {
         })
     }
 
+    /**
+     * Updates the Poly1305 state with the given data
+     * Args:
+     *    &mut self: The Poly1305 instance
+     *    data - &[u8]: The data to process
+     * 
+     * Returns:
+     *    (): Nothing
+     */
     pub fn update(&mut self, data: &[u8]) {
         let mut offset = 0;
         if self.buffer_len > 0 {
@@ -80,6 +103,14 @@ impl Poly1305 {
         }
     }
 
+    /**
+     * Finalizes the Poly1305 computation and returns the MAC tag
+     * Args:
+     *    mut self: The Poly1305 instance
+     * 
+     * Returns:
+     *    Result<[u8; 16]>: The computed MAC tag
+     */
     pub fn finalize(mut self) -> Result<[u8; 16]> {
         if self.buffer_len > 0 {
             let mut final_block = [0u8; 16];
@@ -107,6 +138,15 @@ impl Poly1305 {
         Ok(tag)
     }
 
+    /**
+     * Verifies the computed MAC tag against the expected tag
+     * Args:
+     *    self: The Poly1305 instance
+     *    expected - &[u8]: The expected MAC tag
+     * 
+     * Returns:
+     *    Result<()>: Ok(()) if verification succeeds, or an error if it fails
+     */
     pub fn verify(self, expected: &[u8]) -> Result<()> {
         if expected.len() != 16 {
             return Err(Error::InvalidLength);
@@ -120,9 +160,21 @@ impl Poly1305 {
         Ok(())
     }
 
+    /**
+     * Processes a 16-byte block and updates the internal state, optionally marking it as the final block
+     * which affects the hibit used in the calculation.
+     * Args:
+     *    &mut self: The Poly1305 instance
+     *    block - &[u8; 16]: The 16-byte block to process
+     *    is_final - bool: Whether this is the final block or not
+     * 
+     * Returns:
+     *    (): Nothing
+     */
     fn process_block(&mut self, block: &[u8; 16], is_final: bool) {
         let hibit = if is_final { 0 } else { 1u32 << 24 };
 
+        // Add block to h
         let mut c = self.h[0] as u64 + (u32::from_le_bytes([block[0], block[1], block[2], block[3]]) & 0x3ffffff) as u64;
         self.h[0] = c as u32;
         c >>= 32;
@@ -150,29 +202,34 @@ impl Poly1305 {
                 as u64;
         self.h[4] = c as u32;
 
+        // Multiply h by r by schoolbook method (modulo 2^130 - 5)
         let r0 = self.r[0] as u64;
         let r1 = self.r[1] as u64;
         let r2 = self.r[2] as u64;
         let r3 = self.r[3] as u64;
         let r4 = self.r[4] as u64;
 
+        // Precompute s values by multiplying r by 5
         let s1 = r1 * 5;
         let s2 = r2 * 5;
         let s3 = r3 * 5;
         let s4 = r4 * 5;
 
+        // Perform multiplication and reduction of h
         let h0 = self.h[0] as u64;
         let h1 = self.h[1] as u64;
         let h2 = self.h[2] as u64;
         let h3 = self.h[3] as u64;
         let h4 = self.h[4] as u64;
 
+        // Multiply and accumulate for each term
         let d0 = h0 * r0 + h1 * s4 + h2 * s3 + h3 * s2 + h4 * s1;
         let mut d1 = h0 * r1 + h1 * r0 + h2 * s4 + h3 * s3 + h4 * s2;
         let mut d2 = h0 * r2 + h1 * r1 + h2 * r0 + h3 * s4 + h4 * s3;
         let mut d3 = h0 * r3 + h1 * r2 + h2 * r1 + h3 * r0 + h4 * s4;
         let mut d4 = h0 * r4 + h1 * r3 + h2 * r2 + h3 * r1 + h4 * r0;
 
+        // Propagate carries and reduce modulo 2^130 - 5
         let mut c = d0 >> 26;
         self.h[0] = (d0 & 0x3ffffff) as u32;
         d1 += c;
@@ -198,6 +255,14 @@ impl Poly1305 {
         self.h[1] += c as u32;
     }
 
+    /**
+     * Reduces the internal state h modulo 2^130 - 5
+     * Args:
+     *    &mut self: The Poly1305 instance
+     * 
+     * Returns:
+     *    (): Nothing
+     */
     fn reduce_h(&mut self) {
         let mut c = (self.h[1] >> 26) as u64;
         self.h[1] &= 0x3ffffff;
@@ -238,6 +303,15 @@ impl Poly1305 {
     }
 }
 
+/**
+ * Convenience function to compute Poly1305 MAC tag for given key and data
+ * Args:
+ *    key - &[u8]: The 32-byte key for Poly1305
+ *    data - &[u8]: The data to authenticate
+ * 
+ * Returns:
+ *    Result<[u8; 16]>: The computed MAC tag
+ */
 pub fn poly1305(key: &[u8], data: &[u8]) -> Result<[u8; 16]> {
     let mut mac = Poly1305::new(key)?;
     mac.update(data);

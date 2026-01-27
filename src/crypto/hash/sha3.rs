@@ -1,7 +1,8 @@
+// crypto/hash/sha3.rs
 // Implementations for SHA3-224, SHA3-256, SHA3-384, SHA3-512, SHAKE128 and SHAKE256
+// https://nvlpubs.nist.gov/nistpubs/FIPS/NIST.FIPS.202.pdf
 
-use crate::crypto::{Error, Result};
-
+// Keccak-f[1600] constants
 const RC: [u64; 24] = [
     0x0000000000000001, 0x0000000000008082, 0x800000000000808a, 0x8000000080008000,
     0x000000000000808b, 0x0000000080000001, 0x8000000080008081, 0x8000000000008009,
@@ -11,20 +12,47 @@ const RC: [u64; 24] = [
     0x8000000080008081, 0x8000000000008080, 0x0000000080000001, 0x8000000080008008,
 ];
 
+// Rho offsets
 const ROTATIONS: [u32; 24] = [
     1, 3, 6, 10, 15, 21, 28, 36, 45, 55, 2, 14, 27, 41, 56, 8, 25, 43, 62, 18, 39, 61, 20, 44,
 ];
 
+// Keccak state
 #[derive(Clone)]
 struct KeccakState {
     state: [u64; 25],
 }
 
 impl KeccakState {
+
+    /**
+     * Create a new Keccak state initialized to zero
+     * Args:
+     *    (): No arguments
+     * 
+     * Returns:
+     *    Self: New KeccakState instance
+     */
     fn new() -> Self {
         KeccakState { state: [0u64; 25] }
     }
 
+    /**
+     * Perform the Keccak-f[1600] permutation on the state by applying 24 rounds of transformations
+     * These transformations include the Theta, Rho, Pi, Chi, and Iota steps
+     * 
+     * Theta step: Mixes columns of the state
+     * Rho step: Rotates bits within lanes
+     * Pi step: Permutes the positions of the lanes
+     * Chi step: Non-linear mixing of bits within rows
+     * Iota step: Adds round constants to the state
+     * 
+     * Args:
+     *    &mut self: Mutable reference to KeccakState instance
+     * 
+     * Returns:
+     *    (): Nothing
+     */
     fn permute(&mut self) {
         for round in 0..24 {
             // Theta step
@@ -74,6 +102,16 @@ impl KeccakState {
         }
     }
 
+    /**
+     * Absorb input data into the Keccak state
+     * Args:
+     *    &mut self: Mutable reference to KeccakState instance
+     *    rate_bytes - usize: Rate in bytes
+     *    data - &[u8]: Input data to absorb
+     * 
+     * Returns:
+     *    (): Nothing
+     */
     fn absorb(&mut self, rate_bytes: usize, data: &[u8]) {
         let rate_words = rate_bytes / 8;
         for chunk in data.chunks(rate_bytes) {
@@ -91,6 +129,16 @@ impl KeccakState {
         }
     }
 
+    /**
+     * Squeeze output data from the Keccak State
+     * Args:
+     *    &mut self: Mutable reference to KeccakState instance
+     *    rate_bytes - usize: Rate in bytes
+     *    output - &mut [u8]: Output buffer to fill with squeezed data
+     * 
+     * Returns:
+     *    (): Nothing
+     */
     fn squeeze(&mut self, rate_bytes: usize, output: &mut [u8]) {
         let rate_words = rate_bytes / 8;
         let mut output_pos = 0;
@@ -113,6 +161,7 @@ impl KeccakState {
     }
 }
 
+// Keccak sponge construction
 #[derive(Clone)]
 struct Keccak {
     state: KeccakState,
@@ -123,6 +172,17 @@ struct Keccak {
 }
 
 impl Keccak {
+
+    /**
+     * Create a new Keccak sponge instance
+     * Args:
+     *    rate - usize: Rate in bytes
+     *    output_len - usize: Desired output length in bytes
+     *    delim - u8: Delimiter byte for padding
+     * 
+     * Returns:
+     *    Self: New Keccak instance
+     */
     fn new(rate: usize, output_len: usize, delim: u8) -> Self {
         Keccak {
             state: KeccakState::new(),
@@ -133,6 +193,15 @@ impl Keccak {
         }
     }
 
+    /**
+     * Update the Keccak state with input data
+     * Args:
+     *    &mut self: Mutable reference to Keccak instance
+     *    data - &[u8]: Input data to hash
+     * 
+     * Returns:
+     *    (): Nothing
+     */
     fn update(&mut self, data: &[u8]) {
         self.buffer.extend_from_slice(data);
         while self.buffer.len() >= self.rate {
@@ -141,6 +210,14 @@ impl Keccak {
         }
     }
 
+    /**
+     * Finalize the Keccak hash and return the digest
+     * Args:
+     *    &mut self: Mutable reference to Keccak instance
+     * 
+     * Returns:
+     *    Vec<u8>: The resulting hash digest
+     */
     fn finalize(&mut self) -> Vec<u8> {
         self.buffer.push(self.delim);
         while self.buffer.len() < self.rate {
@@ -165,16 +242,42 @@ pub struct Sha3_256 {
 }
 
 impl Sha3_256 {
+
+    /**
+     * Create a new SHA3_256 instance
+     * Args:
+     *    (): No arguments
+     * 
+     * Returns:
+     *    Self: New Sha3_256 instance
+     */
     pub fn new() -> Self {
         Sha3_256 {
             inner: Keccak::new(136, 32, 0x06),
         }
     }
 
+    /**
+     * Update the SHA3_256 state with input data
+     * Args:
+     *    &mut self: Mutable reference to SHA3_256 instance
+     *    data - &[u8]: Input data to hash
+     * 
+     * Returns:
+     *    (): Nothing
+     */
     pub fn update(&mut self, data: &[u8]) {
         self.inner.update(data);
     }
 
+    /**
+     * Finalize the SHA3_256 hash and return the digest
+     * Args:
+     *    mut self: Mutable reference to SHA3_256 instance
+     * 
+     * Returns:
+     *    [u8; 32]: The resulting SHA3-256 hash digest
+     */
     pub fn finalize(mut self) -> [u8; 32] {
         let result = self.inner.finalize();
         let mut output = [0u8; 32];
@@ -183,12 +286,21 @@ impl Sha3_256 {
     }
 }
 
+/**
+ * Hash data using SHA3-256
+ * Args:
+ *    data - &[u8]: Input data to hash
+ * 
+ * Returns:
+ *    [u8; 32]: The resulting SHA3-256 hash digest
+ */
 pub fn sha3_256(data: &[u8]) -> [u8; 32] {
     let mut hasher = Sha3_256::new();
     hasher.update(data);
     hasher.finalize()
 }
 
+// Implement Default trait for Sha3_256
 impl Default for Sha3_256 {
     fn default() -> Self {
         Self::new()
@@ -202,16 +314,42 @@ pub struct Sha3_224 {
 }
 
 impl Sha3_224 {
+    
+    /**
+     * Create a new SHA3_224 instance
+     * Args:
+     *    (): No arguments
+     * 
+     * Returns:
+     *    Self: New Sha3_224 instance
+     */
     pub fn new() -> Self {
         Sha3_224 {
             inner: Keccak::new(144, 28, 0x06),
         }
     }
 
+    /**
+     * Update the SHA3_224 state with input data
+     * Args:
+     *    &mut self: Mutable reference to SHA3_224 instance
+     *    data - &[u8]: Input data to hash
+     * 
+     * Returns:
+     *    (): Nothing
+     */
     pub fn update(&mut self, data: &[u8]) {
         self.inner.update(data);
     }
 
+    /**
+     * Finalize the SHA3_224 hash and return the digest
+     * Args:
+     *    mut self: Mutable reference to SHA3_224 instance
+     * 
+     * Returns:
+     *    [u8; 28]: The resulting SHA3-224 hash digest
+     */
     pub fn finalize(mut self) -> [u8; 28] {
         let result = self.inner.finalize();
         let mut output = [0u8; 28];
@@ -220,12 +358,21 @@ impl Sha3_224 {
     }
 }
 
+/**
+ * Hash data using SHA3-224
+ * Args:
+ *    data - &[u8]: Input data to hash
+ * 
+ * Returns:
+ *    [u8; 28]: The resulting SHA3-224 hash digest
+ */
 pub fn sha3_224(data: &[u8]) -> [u8; 28] {
     let mut hasher = Sha3_224::new();
     hasher.update(data);
     hasher.finalize()
 }
 
+// Implement Default trait for Sha3_224
 impl Default for Sha3_224 {
     fn default() -> Self {
         Self::new()
@@ -239,16 +386,42 @@ pub struct Sha3_384 {
 }
 
 impl Sha3_384 {
+
+    /**
+     * Create a new SHA3_384 instance
+     * Args:
+     *    (): No arguments
+     * 
+     * Returns:
+     *    Self: New Sha3_384 instance
+     */
     pub fn new() -> Self {
         Sha3_384 {
             inner: Keccak::new(104, 48, 0x06),
         }
     }
 
+    /**
+     * Update the SHA3_384 state with input data
+     * Args:
+     *    &mut self: Mutable reference to SHA3_384 instance
+     *    data - &[u8]: Input data to hash
+     * 
+     * Returns:
+     *    (): Nothing
+     */
     pub fn update(&mut self, data: &[u8]) {
         self.inner.update(data);
     }
 
+    /**
+     * Finalize the SHA3_384 hash and return the digest
+     * Args:
+     *    mut self: Mutable reference to SHA3_384 instance
+     * 
+     * Returns:
+     *    [u8; 48]: The resulting SHA3-384 hash digest
+     */
     pub fn finalize(mut self) -> [u8; 48] {
         let result = self.inner.finalize();
         let mut output = [0u8; 48];
@@ -257,12 +430,21 @@ impl Sha3_384 {
     }
 }
 
+/**
+ * Hash data using SHA3-384
+ * Args:
+ *    data - &[u8]: Input data to hash
+ * 
+ * Returns:
+ *    [u8; 48]: The resulting SHA3-384 hash digest
+ */
 pub fn sha3_384(data: &[u8]) -> [u8; 48] {
     let mut hasher = Sha3_384::new();
     hasher.update(data);
     hasher.finalize()
 }
 
+// Implement Default trait for Sha3_384
 impl Default for Sha3_384 {
     fn default() -> Self {
         Self::new()
@@ -276,16 +458,42 @@ pub struct Sha3_512 {
 }
 
 impl Sha3_512 {
+
+    /**
+     * Create a new Sha3_512 instance
+     * Args:
+     *    (): No arguments
+     * 
+     * Returns:
+     *    Self: New Sha3_512 instance
+     */
     pub fn new() -> Self {
         Sha3_512 {
             inner: Keccak::new(72, 64, 0x06),
         }
     }
 
+    /**
+     * Update the SHA3_512 state with input data
+     * Args:
+     *    &mut self: Mutable reference to SHA3_512 instance
+     *    data - &[u8]: Input data to hash
+     * 
+     * Returns:
+     *    (): Nothing
+     */
     pub fn update(&mut self, data: &[u8]) {
         self.inner.update(data);
     }
 
+    /**
+     * Finalize the SHA3_512 hash and return the digest
+     * Args:
+     *    mut self: Mutable reference to SHA3_512 instance
+     * 
+     * Returns:
+     *    [u8; 64]: The resulting SHA3-512 hash digest
+     */
     pub fn finalize(mut self) -> [u8; 64] {
         let result = self.inner.finalize();
         let mut output = [0u8; 64];
@@ -294,12 +502,21 @@ impl Sha3_512 {
     }
 }
 
+/**
+ * Hash data using SHA3-512
+ * Args:
+ *    data - &[u8]: Input data to hash
+ * 
+ * Returns:
+ *    [u8; 64]: The resulting SHA3-512 hash digest
+ */
 pub fn sha3_512(data: &[u8]) -> [u8; 64] {
     let mut hasher = Sha3_512::new();
     hasher.update(data);
     hasher.finalize()
 }
 
+// Implement Default trait for Sha3_512
 impl Default for Sha3_512 {
     fn default() -> Self {
         Self::new()
@@ -313,16 +530,42 @@ pub struct Keccak256 {
 }
 
 impl Keccak256 {
+    
+    /**
+     * Create a new Keccak256 instance
+     * Args:
+     *    (): No arguments
+     * 
+     * Returns:
+     *    Self: New Keccak256 instance
+     */
     pub fn new() -> Self {
         Keccak256 {
             inner: Keccak::new(136, 32, 0x01),
         }
     }
 
+    /**
+     * Update the Keccak256 state with input data
+     * Args:
+     *    &mut self: Mutable reference to Keccak256 instance
+     *    data - &[u8]: Input data to hash
+     * 
+     * Returns:
+     *    (): Nothing
+     */
     pub fn update(&mut self, data: &[u8]) {
         self.inner.update(data);
     }
 
+    /**
+     * Finalize the Keccak256 hash and return the digest
+     * Args:
+     *    mut self: Mutable reference to Keccak256 instance
+     * 
+     * Returns:
+     *    [u8; 32]: The resulting Keccak256 hash digest
+     */
     pub fn finalize(mut self) -> [u8; 32] {
         let result = self.inner.finalize();
         let mut output = [0u8; 32];
@@ -331,12 +574,21 @@ impl Keccak256 {
     }
 }
 
+/**
+ * Hash data using Keccak256
+ * Args:
+ *    data - &[u8]: Input data to hash
+ * 
+ * Returns:
+ *    [u8; 32]: The resulting Keccak256 hash digest
+ */
 pub fn keccak256(data: &[u8]) -> [u8; 32] {
     let mut hasher = Keccak256::new();
     hasher.update(data);
     hasher.finalize()
 }
 
+// Implement Default trait for Keccak256
 impl Default for Keccak256 {
     fn default() -> Self {
         Self::new()
@@ -350,28 +602,65 @@ pub struct Shake128 {
 }
 
 impl Shake128 {
+
+    /**
+     * Create a new Shake128 instance
+     * Args:
+     *    (): No arguments
+     * 
+     * Returns:
+     *    Self: New Shake128 instance
+     */
     pub fn new() -> Self {
         Shake128 {
             inner: Keccak::new(168, 0, 0x1f),
         }
     }
 
+    /**
+     * Update the Shake128 state with input data
+     * Args:
+     *    &mut self: Mutable reference to Shake128 instance
+     *    data - &[u8]: Input data to hash
+     * 
+     * Returns:
+     *    (): Nothing
+     */
     pub fn update(&mut self, data: &[u8]) {
         self.inner.update(data);
     }
 
+    /**
+     * Finalize the Shake128 hash and return the digest
+     * Args:
+     *    mut self: Mutable reference to Shake128 instance
+     *    output_len - usize: Desired output length in bytes
+     * 
+     * Returns:
+     *    Vec<u8>: The resulting hash digest
+     */
     pub fn finalize(mut self, output_len: usize) -> Vec<u8> {
         self.inner.output_len = output_len;
         self.inner.finalize()
     }
 }
 
+/**
+ * Hash data using SHAKE128
+ * Args:
+ *    data - &[u8]: Input data to hash
+ *    output_len - usize: Desired output length in bytes
+ * 
+ * Returns:
+ *    Vec<u8>: The resulting hash digest
+ */
 pub fn shake128(data: &[u8], output_len: usize) -> Vec<u8> {
     let mut hasher = Shake128::new();
     hasher.update(data);
     hasher.finalize(output_len)
 }
 
+// Implement Default trait for Shake128
 impl Default for Shake128 {
     fn default() -> Self {
         Self::new()
@@ -385,28 +674,65 @@ pub struct Shake256 {
 }
 
 impl Shake256 {
+
+    /**
+     * Create a new Shake256 instance
+     * Args:
+     *    (): No arguments
+     * 
+     * Returns:
+     *    Self: New Shake256 instance
+     */
     pub fn new() -> Self {
         Shake256 {
             inner: Keccak::new(136, 0, 0x1f),
         }
     }
 
+    /**
+     * Update the Shake256 state with input data
+     * Args:
+     *    &mut self: Mutable reference to Shake256 instance
+     *    data - &[u8]: Input data to hash
+     * 
+     * Returns:
+     *    (): Nothing
+     */
     pub fn update(&mut self, data: &[u8]) {
         self.inner.update(data);
     }
 
+    /**
+     * Finalize the Shake256 hash and return the digest
+     * Args:
+     *    mut self: Mutable reference to Shake256 instance
+     *    output_len - usize: Desired output length in bytes
+     * 
+     * Returns:
+     *    Vec<u8>: The resulting hash digest
+     */
     pub fn finalize(mut self, output_len: usize) -> Vec<u8> {
         self.inner.output_len = output_len;
         self.inner.finalize()
     }
 }
 
+/**
+ * Hash data using SHAKE256
+ * Args:
+ *    data - &[u8]: Input data to hash
+ *    output_len - usize: Desired output length in bytes
+ * 
+ * Returns:
+ *    Vec<u8>: The resulting hash digest
+ */
 pub fn shake256(data: &[u8], output_len: usize) -> Vec<u8> {
     let mut hasher = Shake256::new();
     hasher.update(data);
     hasher.finalize(output_len)
 }
 
+// Implement Default trait for Shake256
 impl Default for Shake256 {
     fn default() -> Self {
         Self::new()

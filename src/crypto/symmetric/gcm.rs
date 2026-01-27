@@ -1,6 +1,10 @@
+// crypto/symmetric/gcm.rs - Galois/Counter Mode (GCM) implementation
+// https://nvlpubs.nist.gov/nistpubs/Legacy/SP/nistspecialpublication800-38d.pdf
+
 use crate::crypto::{Error, Result};
 use super::aes::Aes;
 
+// GCM structure
 #[derive(Clone)]
 pub struct Gcm {
     cipher: Aes,
@@ -8,6 +12,15 @@ pub struct Gcm {
 }
 
 impl Gcm {
+
+    /**
+     * Creates a new Gcm instance with the given AES key
+     * Args:
+     *    key - &[u8]: The AES encryption key (16, 24, or 32 bytes)
+     * 
+     * Returns:
+     *    Result<Self>: The Gcm instance or an error if the key size is invalid
+     */
     pub fn new(key: &[u8]) -> Result<Self> {
         let cipher = Aes::new(key)?;
         let h_block = cipher.encrypt_block(&[0u8; 16]);
@@ -25,6 +38,18 @@ impl Gcm {
         Ok(Gcm { cipher, h })
     }
 
+    /**
+     * Encrypts plaintext using GCM mode with the given nonce and additional authenticated data (AAD)
+     * Args:
+     *    &self: The Gcm instance
+     *    nonce - &[u8]: The nonce (IV) for encryption
+     *    plaintext - &[u8]: The plaintext to encrypt
+     *    aad - &[u8]: Additional authenticated data
+     * 
+     * Returns:
+     *    Result<Vec<u8>>: The resulting ciphertext with authentication tag or an error
+     *    if parameters are invalid
+     */
     pub fn encrypt(&self, nonce: &[u8], plaintext: &[u8], aad: &[u8]) -> Result<Vec<u8>> {
         if nonce.is_empty() {
             return Err(Error::InvalidLength);
@@ -80,6 +105,18 @@ impl Gcm {
         Ok(ciphertext)
     }
 
+    /**
+     * Decrypts ciphertext using GCM mode with the given nonce and additional authenticated data (AAD)
+     * Args:
+     *    &self: The Gcm instance
+     *    nonce - &[u8]: The nonce (IV) for decryption
+     *    ciphertext_and_tag - &[u8]: The ciphertext with authentication tag
+     *    aad - &[u8]: Additional authenticated data
+     * 
+     * Returns:
+     *    Result<Vec<u8>>: The resulting plaintext or an error if authentication fails
+     *    or parameters are invalid
+     */
     pub fn decrypt(&self, nonce: &[u8], ciphertext_and_tag: &[u8], aad: &[u8]) -> Result<Vec<u8>> {
         if nonce.is_empty() {
             return Err(Error::InvalidLength);
@@ -144,6 +181,15 @@ impl Gcm {
         Ok(plaintext)
     }
 
+    /**
+     * Computes the initial counter block J0 based on the nonce
+     * Args:
+     *    &self: The Gcm instance
+     *    nonce - &[u8]: The nonce (IV) for which to compute the initial counter block
+     * 
+     * Returns:
+     *    [u8; 16]: The computed J0 block
+     */
     fn compute_j0(&self, nonce: &[u8]) -> [u8; 16] {
         if nonce.len() == 12 {
             let mut j0 = [0u8; 16];
@@ -183,6 +229,16 @@ impl Gcm {
         }
     }
 
+    /**
+     * Updates the GHASH state with the given data
+     * Args:
+     *    &self: The Gcm instance
+     *    state - &mut [u64; 2]: The current GHASH state to update
+     *    data - &[u8]: The data to process
+     * 
+     * Returns:
+     *    (): Nothing
+     */
     fn ghash_update(&self, state: &mut [u64; 2], data: &[u8]) {
         for chunk in data.chunks(16) {
             let mut block = [0u8; 16];
@@ -204,6 +260,16 @@ impl Gcm {
         }
     }
 
+    /**
+     * Performs GHASH multiplication in GF(2^128)
+     * Args:
+     *    &self: The Gcm instance
+     *    x - [u64; 2]: The first operand
+     *    y - [u64; 2]: The second operand
+     * 
+     * Returns:
+     *    [u64; 2]: The result of the multiplication
+     */
     fn ghash_mul(&self, x: [u64; 2], y: [u64; 2]) -> [u64; 2] {
         let mut z = [0u64; 2];
         let mut v = y;
@@ -227,6 +293,14 @@ impl Gcm {
     }
 }
 
+/**
+ * Increments the rightmost 32 bits of the counter block
+ * Args:
+ *    counter - &mut [u8; 16]: The counter block to increment
+ * 
+ * Returns:
+ *    (): Nothing
+ */
 fn increment_counter(counter: &mut [u8; 16]) {
     let mut val = u32::from_be_bytes([
         counter[12],
@@ -244,12 +318,36 @@ fn increment_counter(counter: &mut [u8; 16]) {
     counter[15] = bytes[3];
 }
 
+/**
+ * Convenience function to encrypt data using AES-GCM
+ * Args:
+ *    key - &[u8]: The AES encryption key (16, 24, or 32 bytes)
+ *    nonce - &[u8]: The nonce (IV) for encryption
+ *    plaintext - &[u8]: The plaintext to encrypt
+ *    aad - &[u8]: Additional authenticated data
+ * 
+ * Returns:
+ *    Result<Vec<u8>>: The resulting ciphertext with authentication tag or an error
+ *    if parameters are invalid
+ */
 pub fn aes_gcm_encrypt(key: &[u8], nonce: &[u8], plaintext: &[u8], aad: &[u8]) -> Result<Vec<u8>> {
     let gcm = Gcm::new(key)?;
 
     gcm.encrypt(nonce, plaintext, aad)
 }
 
+/**
+ * Convenience function to decrypt data using AES-GCM
+ * Args:
+ *    key - &[u8]: The AES encryption key (16, 24, or 32 bytes)
+ *    nonce - &[u8]: The nonce (IV) for decryption
+ *    ciphertext_and_tag - &[u8]: The ciphertext with authentication tag
+ *    aad - &[u8]: Additional authenticated data
+ * 
+ * Returns:
+ *    Result<Vec<u8>>: The resulting plaintext or an error if authentication fails
+ *    or parameters are invalid
+ */
 pub fn aes_gcm_decrypt(key: &[u8], nonce: &[u8], ciphertext_and_tag: &[u8], aad: &[u8]) -> Result<Vec<u8>> {
     let gcm = Gcm::new(key)?;
 

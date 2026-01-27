@@ -3,6 +3,7 @@
 // This uses a Vec<u64> to store the limbs of the big integer in little-endian order (least significant limb first)
 // and implements various operations including addition, subtraction, multiplication, division, modular exponentiation,
 // modular inverse, GCD, and Miller-Rabin primality testing.
+// https://en.wikipedia.org/wiki/Arbitrary-precision_arithmetic
 
 use crate::crypto::{Error, Result};
 use std::cmp::Ordering;

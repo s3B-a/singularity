@@ -1,10 +1,17 @@
+// crypto/asymmetric/ed25519.rs - Ed25519 Digital Signature Algorithm
+// https://datatracker.ietf.org/doc/html/rfc8032#section-5.1
+
 use crate::crypto::{Error, Result};
 use super::x25519::{fe_from_bytes, fe_to_bytes, fe_add, fe_sub, fe_mul, fe_square, fe_invert, fe_reduce};
 use crate::crypto::hash::sha2::Sha512;
 
+// Extended coordinates representation
 type ExtendedPoint = ([i64; 10], [i64; 10], [i64; 10], [i64; 10]);
+
+// Field element representation
 type Fe = [i64; 10];
 
+// Order of the Ed25519 curve
 const L: [u8; 32] = [
     0xed, 0xd3, 0xf5, 0x5c, 0x1a, 0x63, 0x12, 0x58,
     0xd6, 0x9c, 0xf7, 0xa2, 0xde, 0xf9, 0xde, 0x14,
@@ -12,29 +19,49 @@ const L: [u8; 32] = [
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10,
 ];
 
+// Ed25519 Private Key structure
 #[derive(Clone)]
 pub struct Ed25519PrivateKey {
     seed: [u8; 32],
     public_key: Ed25519PublicKey,
 }
 
+// Ed25519 Public Key structure
 #[derive(Clone, Debug, PartialEq)]
 pub struct Ed25519PublicKey {
     point: [u8; 32],
 }
 
+// Ed25519 Signature structure
 #[derive(Clone, Debug, PartialEq)]
 pub struct Ed25519Signature {
     bytes: [u8; 64],
 }
 
 impl Ed25519PrivateKey {
+
+    /**
+     * Generates a new Ed25519 private key with a random seed
+     * Args:
+     *    (): No arguments
+     * 
+     * Returns:
+     *    Result<Self>: The generated Ed25519PrivateKey or an error if generation fails
+     */
     pub fn generate() -> Result<Self> {
         let mut seed = [0u8; 32];
         crate::crypto::random::fill_random(&mut seed)?;
         Self::from_seed(&seed)
     }
 
+    /**
+     * Creates an Ed25519 private key from a given seed
+     * Args:
+     *    seed - &[u8; 32]: The seed bytes
+     * 
+     * Returns:
+     *    Result<Self>: The created Ed25519PrivateKey or an error if creation fails
+     */
     pub fn from_seed(seed: &[u8; 32]) -> Result<Self> {
         let mut hasher = Sha512::new();
         hasher.update(seed);
@@ -55,14 +82,39 @@ impl Ed25519PrivateKey {
         })
     }
 
+    /**
+     * Retrieves the private key seed bytes
+     * Args:
+     *    &self: The Ed25519PrivateKey instance
+     * 
+     * Returns:
+     *    [u8; 32]: The seed bytes
+     */
     pub fn to_bytes(&self) -> [u8; 32] {
         self.seed
     }
 
+    /**
+     * Retrieves the associated public key
+     * Args:
+     *    &self: The Ed25519PrivateKey instance
+     * 
+     * Returns:
+     *    &Ed25519PublicKey: The associated public key
+     */
     pub fn public_key(&self) -> &Ed25519PublicKey {
         &self.public_key
     }
 
+    /**
+     * Signs a message using the Ed25519 private key
+     * Args:
+     *    &self: The Ed25519PrivateKey instance
+     *    message - &[u8]: The message bytes to sign
+     * 
+     * Returns:
+     *    Ed25519Signature: The generated signature
+     */
     pub fn sign(&self, message: &[u8]) -> Ed25519Signature {
         let mut hasher = Sha512::new();
         hasher.update(&self.seed);
@@ -102,6 +154,15 @@ impl Ed25519PrivateKey {
 }
 
 impl Ed25519PublicKey {
+
+    /**
+     * Creates an Ed25519 public key from given bytes
+     * Args:
+     *    bytes - &[u8]: The public key bytes
+     * 
+     * Returns:
+     *    Result<Self>: The created Ed25519PublicKey or an error if creation fails
+     */
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
         if bytes.len() != 32 {
             return Err(Error::InvalidKeySize);
@@ -113,10 +174,28 @@ impl Ed25519PublicKey {
         Ok(Self { point })
     }
 
+    /**
+     * Retrieves the public key bytes
+     * Args:
+     *    &self: The Ed25519PublicKey instance
+     * 
+     * Returns:
+     *    [u8; 32]: The public key bytes
+     */
     pub fn to_bytes(&self) -> [u8; 32] {
         self.point
     }
 
+    /**
+     * Verifies a signature for a given message using the Ed25519 public key
+     * Args:
+     *    &self: The Ed25519PublicKey instance
+     *    message - &[u8]: The message bytes to verify
+     *    signature - &Ed25519Signature: The signature to verify
+     * 
+     * Returns:
+     *    bool: True if the signature is valid, false otherwise
+     */
     pub fn verify(&self, message: &[u8], signature: &Ed25519Signature) -> bool {
         let capital_r: &[u8; 32] = signature.bytes[..32].try_into().unwrap();
         let s: &[u8; 32] = signature.bytes[32..64].try_into().unwrap();
@@ -140,6 +219,15 @@ impl Ed25519PublicKey {
 }
 
 impl Ed25519Signature {
+
+    /**
+     * Creates an Ed25519 signature from given bytes
+     * Args:
+     *    bytes - &[u8]: The signature bytes
+     * 
+     * Returns
+     *    Result<Self>: The created Ed25519Signature or an error if creation fails
+     */
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
         if bytes.len() != 64 {
             return Err(Error::InvalidSignature);
@@ -151,11 +239,27 @@ impl Ed25519Signature {
         Ok(Self { bytes: sig_bytes })
     }
 
+    /**
+     * Retrieves the signature bytes
+     * Args:
+     *    &self: The Ed25519Signature instance
+     * 
+     * Returns:
+     *    [u8; 64]: The signature bytes
+     */
     pub fn to_bytes(&self) -> [u8; 64] {
         self.bytes
     }
 }
 
+/**
+ * Returns the Ed25519 base point in extended coordinates
+ * Args:
+ *    (): No arguments
+ * 
+ * Returns:
+ *    ExtendedPoint: The base point in extended coordinates
+ */
 fn ed25519_base_point() -> ExtendedPoint {
     // Base point in extended coordinates
     // x = 15112221349535400772501151409588531511454012693041857206046113283949847762202
@@ -180,6 +284,14 @@ fn ed25519_base_point() -> ExtendedPoint {
     (x, y, z, t)
 }
 
+/**
+ * Performs scalar multiplication of the base point G by a scalar k
+ * Args:
+ *    scalar - &[u8; 32]: The scalar multiplier
+ * 
+ * Returns:
+ *    [u8; 32]: The resulting point in byte representation after multiplication
+ */
 fn ed25519_scalar_mult_base(scalar: &[u8; 32]) -> [u8; 32] {
     let mut result = extended_identity();
     let base = ed25519_base_point();
@@ -206,6 +318,15 @@ fn ed25519_scalar_mult_base(scalar: &[u8; 32]) -> [u8; 32] {
     extended_to_bytes(&result)
 }
 
+/**
+ * Performs scalar multiplication of a point by a scalar k
+ * Args:
+ *    scalar - &[u8; 32]: The scalar multiplier
+ *    point - &[u8; 32]: The point to be multiplied
+ * 
+ * Returns:
+ *    [u8; 32]: The resulting point in byte representation after multiplication
+ */
 fn ed25519_scalar_mult(scalar: &[u8; 32], point: &[u8; 32]) -> [u8; 32] {
     let p = extended_from_bytes(point);
     let mut result = extended_identity();
@@ -221,6 +342,15 @@ fn ed25519_scalar_mult(scalar: &[u8; 32], point: &[u8; 32]) -> [u8; 32] {
     extended_to_bytes(&result)
 }
 
+/**
+ * Adds two points in byte representation
+ * Args:
+ *    a - &[u8; 32]: The first point in byte representation
+ *    b - &[u8; 32]: The second point in byte representation
+ * 
+ * Returns:
+ *    [u8; 32]: The resulting point in byte representation after addition
+ */
 fn ed25519_point_add(a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
     let pa = extended_from_bytes(a);
     let pb = extended_from_bytes(b);
@@ -229,10 +359,26 @@ fn ed25519_point_add(a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
     extended_to_bytes(&pc)
 }
 
+/**
+ * Returns the identity point in extended coordinates
+ * Args:
+ *    (): No arguments
+ * 
+ * Returns:
+ *    ExtendedPoint: The identity point in extended coordinates
+ */
 fn extended_identity() -> ExtendedPoint {
     (fe_zero(), fe_one(), fe_one(), fe_zero())
 }
 
+/**
+ * Converts bytes to an ExtendedPoint
+ * Args:
+ *    bytes - &[u8; 32]: The point in byte representation
+ * 
+ * Returns:
+ *    ExtendedPoint: The point in extended coordinates
+ */
 fn extended_from_bytes(bytes: &[u8; 32]) -> ExtendedPoint {
     let y = fe_from_bytes(bytes);
     let z = fe_one();
@@ -246,6 +392,14 @@ fn extended_from_bytes(bytes: &[u8; 32]) -> ExtendedPoint {
     (x, y, z, t)
 }
 
+/**
+ * Converts an ExtendedPoint to bytes
+ * Args:
+ *    p - &ExtendedPoint: The point in extended coordinates
+ * 
+ * Returns:
+ *    [u8; 32]: The point in byte representation
+ */
 fn extended_to_bytes(p: &ExtendedPoint) -> [u8; 32] {
     let (x, y, z, _t) = p;
     let zinv = fe_invert(z);
@@ -258,6 +412,15 @@ fn extended_to_bytes(p: &ExtendedPoint) -> [u8; 32] {
     bytes
 }
 
+/**
+ * Adds two points in extended coordinates
+ * Args:
+ *    p - &ExtendedPoint: The first point
+ *    q - &ExtendedPoint: The second point
+ * 
+ * Returns:
+ *    ExtendedPoint: The resulting point after addition
+ */
 fn extended_add(p: &ExtendedPoint, q: &ExtendedPoint) -> ExtendedPoint {
     let (x1, y1, z1, t1) = p;
     let (x2, y2, z2, t2) = q;
@@ -279,6 +442,14 @@ fn extended_add(p: &ExtendedPoint, q: &ExtendedPoint) -> ExtendedPoint {
     (x3, y3, z3, t3)
 }
 
+/**
+ * Doubles a point in extended coordinates
+ * Args:
+ *    p - &ExtendedPoint: The point to be doubled
+ * 
+ * Returns:
+ *    ExtendedPoint: The resulting point after doubling
+ */
 fn extended_double(p: &ExtendedPoint) -> ExtendedPoint {
     let (x1, y1, z1, _t1) = p;
     
@@ -299,10 +470,44 @@ fn extended_double(p: &ExtendedPoint) -> ExtendedPoint {
     (x3, y3, z3, t3)
 }
 
+/**
+ * constant 0
+ * Args:
+ *    (): No arguments
+ * 
+ * Returns:
+ *    Fe: The field element representing 0
+ */
 fn fe_zero() -> Fe { [0; 10] }
+
+/**
+ * constant 1
+ * Args:
+ *    (): No arguments
+ * 
+ * Returns:
+ *    Fe: The field element representing 1
+ */
 fn fe_one() -> Fe { [1, 0, 0, 0, 0, 0, 0, 0, 0, 0] }
+
+/**
+ * constant 2
+ * Args:
+ *    (): No arguments
+ * 
+ * Returns:
+ *    Fe: The field element representing 2
+ */
 fn fe_two() -> Fe { [2, 0, 0, 0, 0, 0, 0, 0, 0, 0] }
 
+/**
+ * constant d
+ * Args:
+ *    (): No arguments
+ * 
+ * Returns:
+ *    Fe: The field element representing d
+ */
 fn fe_d() -> Fe {
     [
         -10913610, 13857413, -15372611, 6949391, 114729,
@@ -310,6 +515,14 @@ fn fe_d() -> Fe {
     ]
 }
 
+/**
+ * constant 2*d
+ * Args:
+ *    (): No arguments
+ * 
+ * Returns:
+ *    Fe: The field element representing 2*d
+ */
 fn fe_d2() -> Fe {
     [
         -21827239, -5839606, -30745221, 13898782, 229458,
@@ -317,6 +530,14 @@ fn fe_d2() -> Fe {
     ]
 }
 
+/**
+ * Computes the negation of a field element
+ * Args:
+ *    a - &Fe: The field element
+ * 
+ * Returns:
+ *    Fe: The negated field element
+ */
 fn fe_neg(a: &Fe) -> Fe {
     let mut h = [0i64; 10];
     for i in 0..10 {
@@ -326,6 +547,14 @@ fn fe_neg(a: &Fe) -> Fe {
     h
 }
 
+/**
+ * Computes the square root of a field element
+ * Args:
+ *    a - &Fe: The field element
+ * 
+ * Returns:
+ *    Fe: The square root of the field element
+ */
 fn fe_sqrt(a: &Fe) -> Fe {
     let mut t0 = fe_square(a);
     let mut t1 = fe_square(&t0);
@@ -340,6 +569,14 @@ fn fe_sqrt(a: &Fe) -> Fe {
     t0
 }
 
+/**
+ * Reduces a 64-byte scalar to a 32-byte scalar modulo the Ed25519 curve order
+ * Args:
+ *    s - &[u8; 64]: The 64-byte scalar
+ * 
+ * Returns:
+ *    [u8; 32]: The reduced 32-byte scalar
+ */
 fn sc_reduce(s: &[u8; 64]) -> [u8; 32] {
     let mut result = [0u8; 32];
     let mut s64 = [0i64; 64];
@@ -363,6 +600,16 @@ fn sc_reduce(s: &[u8; 64]) -> [u8; 32] {
     result
 }
 
+/**
+ * Computes (a * b + c) mod L
+ * Args:
+ *    a - &[u8; 32]: The first scalar
+ *    b - &[u8; 32]: The second scalar
+ *    c - &[u8; 32]: The third scalar
+ * 
+ * Returns:
+ *    [u8; 32]: The resulting scalar after computation
+ */
 fn sc_muladd(a: &[u8; 32], b: &[u8; 32], c: &[u8; 32]) -> [u8; 32] {
     let mut s = [0i64; 64];
     for i in 0..32 {
@@ -383,6 +630,14 @@ fn sc_muladd(a: &[u8; 32], b: &[u8; 32], c: &[u8; 32]) -> [u8; 32] {
     sc_reduce(&result)
 }
 
+/**
+ * Checks if a scalar is in canonical form
+ * Args:
+ *    s - &[u8; 32]: The scalar to check
+ * 
+ * Returns:
+ *    bool: True if the scalar is canonical, false otherwise
+ */
 fn sc_is_conanical(s: &[u8; 32]) -> bool {
     for i in (0..32).rev() {
         if s[i] < L[i] {

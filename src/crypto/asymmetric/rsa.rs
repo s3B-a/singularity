@@ -1,3 +1,6 @@
+// crypto/asymmetric/rsa.rs - RSA Asymmetric Cryptography Implemenetation
+// https://tools.ietf.org/html/rfc8017
+
 use crate::crypto::{Error, Result};
 use crate::crypto::bignum::BigNum;
 use crate::crypto::hash::sha2::Sha256;
@@ -5,6 +8,7 @@ use crate::crypto::random;
 use std::cmp::Ordering;
 use std::ops::{Add, Sub, Mul, Div};
 
+// RSA Key Sizes
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RsaKeySize {
     Rsa2048,
@@ -12,6 +16,7 @@ pub enum RsaKeySize {
     Rsa4096,
 }
 
+// RSA Padding Schemes
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RsaPadding {
     Pkcs1v15,
@@ -20,6 +25,7 @@ pub enum RsaPadding {
     NoPadding,
 }
 
+// RSA Private Key Structure
 #[derive(Clone)]
 pub struct RsaPrivateKey {
     n: BigNum,
@@ -33,6 +39,7 @@ pub struct RsaPrivateKey {
     size: RsaKeySize,
 }
 
+// RSA Public Key Structure
 #[derive(Clone, Debug)]
 pub struct RsaPublicKey {
     n: BigNum,
@@ -42,6 +49,7 @@ pub struct RsaPublicKey {
 
 }
 
+// RSA Private Key Components for serialization and deserialization
 #[derive(Clone, Debug)]
 pub struct RsaPrivateKeyComponents {
     pub n: Vec<u8>,
@@ -54,6 +62,7 @@ pub struct RsaPrivateKeyComponents {
     pub qinv: Vec<u8>,
 }
 
+// RSA Public Key Components for serialization and deserialization
 #[derive(Clone, Debug)]
 pub struct RsaPublicKeyComponents {
     pub n: Vec<u8>,
@@ -61,6 +70,15 @@ pub struct RsaPublicKeyComponents {
 }
 
 impl RsaKeySize {
+
+    /**
+     * Returns the bit length of the RSA key size
+     * Args:
+     *    &self: The RsaKeySize instance
+     * 
+     * Returns:
+     *    usize: The bit length of the RSA key size
+     */
     pub fn bits(&self) -> usize {
         match self {
             RsaKeySize::Rsa2048 => 2048,
@@ -69,12 +87,29 @@ impl RsaKeySize {
         }
     }
 
+    /**
+     * Returns the byte length of the RSA key size
+     * Args:
+     *    &self: The RsaKeySize instance
+     * 
+     * Returns:
+     *    usize: The byte length of the RSA key size
+     */
     pub fn bytes(&self) -> usize {
         self.bits() / 8
     }
 }
 
 impl RsaPrivateKey {
+
+    /**
+     * Generates a new RSA private key with the specified key size
+     * Args:
+     *    size - RsaKeySize: The desired RSA key size
+     * 
+     * Returns:
+     *    Result<Self>: The generated RsaPrivateKey or an error if generation fails
+     */
     pub fn generate(size: RsaKeySize) -> Result<Self> {
         let bits = size.bits();
         let e = BigNum::from_u64(65537);
@@ -105,6 +140,14 @@ impl RsaPrivateKey {
         })
     }
     
+    /**
+     * Returns the corresponding RSA public key
+     * Args:
+     *    &self: The RsaPrivateKey instance
+     * 
+     * Returns:
+     *    RsaPublicKey: The corresponding RSA public key
+     */
     pub fn public_key(&self) -> RsaPublicKey {
         RsaPublicKey {
             n: self.n.clone(),
@@ -113,6 +156,16 @@ impl RsaPrivateKey {
         }
     }
     
+    /**
+     * Decrypts ciphertext using the RSA private key and specified padding
+     * Args:
+     *    &self: The RsaPrivateKey instance
+     *    ciphertext - &[u8]: The ciphertext to decrypt
+     *    padding - RsaPadding: The padding scheme to use
+     * 
+     * Returns:
+     *    Result<Vec<u8>>: The decrypted plaintext or an error if decryption fails
+     */
     pub fn decrypt(&self, ciphertext: &[u8], padding: RsaPadding) -> Result<Vec<u8>> {
         let c = BigNum::from_bytes_be(ciphertext);
         if c.cmp(&self.n) != Ordering::Less {
@@ -136,6 +189,16 @@ impl RsaPrivateKey {
         }
     }
     
+    /**
+     * Signs a message using the RSA private key and specified padding
+     * Args:
+     *    &self: The RsaPrivateKey instance
+     *    message - &[u8]: The message to sign
+     *    padding - RsaPadding: The padding scheme to use
+     * 
+     * Returns:
+     *    Result<Vec<u8>>: The signature or an error if signing fails
+     */
     pub fn sign(&self, message: &[u8], padding: RsaPadding) -> Result<Vec<u8>> {
         let message_hash = match padding {
             RsaPadding::Pkcs1v15 | RsaPadding::PssSha256 => {
@@ -176,6 +239,14 @@ impl RsaPrivateKey {
         Ok(s_bytes)
     }
     
+    /**
+     * Converts the RSA private key to its components for serialization
+     * Args:
+     *    &self: The RsaPrivateKey instance
+     * 
+     * Returns:
+     *    RsaPrivateKeyComponents: The RSA private key components
+     */
     pub fn to_components(&self) -> RsaPrivateKeyComponents {
         RsaPrivateKeyComponents {
             n: self.n.to_bytes_be(),
@@ -189,6 +260,15 @@ impl RsaPrivateKey {
         }
     }
     
+    /**
+     * Constructs an RSA private key from its components
+     * Args:
+     *    components - &RsaPrivateKeyComponents: The RSA private key components
+     *    size - RsaKeySize: The RSA key size
+     * 
+     * Returns:
+     *    Result<Self>: The constructed RsaPrivateKey or an error if construction fails
+     */
     pub fn from_components(components: &RsaPrivateKeyComponents, size: RsaKeySize) -> Result<Self> {
         Ok(Self {
             n: BigNum::from_bytes_be(&components.n),
@@ -205,6 +285,17 @@ impl RsaPrivateKey {
 }
 
 impl RsaPublicKey {
+
+    /**
+     * Encrypts plaintext using the RSA public key and specified padding
+     * Args:
+     *    &self: The RsaPublicKey instance
+     *    plaintext - &[u8]: The plaintext to encrypt
+     *    padding - RsaPadding: The padding scheme to use
+     * 
+     * Returns:
+     *    Result<Vec<u8>>: The encrypted ciphertext or an error if encryption fails
+     */
     pub fn encrypt(&self, plaintext: &[u8], padding: RsaPadding) -> Result<Vec<u8>> {
         let padded = match padding {
             RsaPadding::Pkcs1v15 => {
@@ -239,6 +330,17 @@ impl RsaPublicKey {
         Ok(c_bytes)
     }
     
+    /**
+     * Verifies a signature using the RSA public key and specified padding
+     * Args:
+     *    &self: The RsaPublicKey instance
+     *    message - &[u8]: The original message
+     *    signature - &[u8]: The signature to verify
+     *    padding - RsaPadding: The padding scheme to use
+     * 
+     * Returns:
+     *    Result<bool>: True if the signature is valid, false otherwise
+     */
     pub fn verify(&self, message: &[u8], signature: &[u8], padding: RsaPadding) -> Result<bool> {
         if signature.len() != self.size.bytes() {
             return Ok(false);
@@ -281,6 +383,14 @@ impl RsaPublicKey {
         }
     }
     
+    /**
+     * Converts the RSA public key to its components for serialization
+     * Args:
+     *    &self: The RsaPublicKey instance
+     * 
+     * Returns:
+     *    RsaPublicKeyComponents: The RSA public key components
+     */
     pub fn to_components(&self) -> RsaPublicKeyComponents {
         RsaPublicKeyComponents {
             n: self.n.to_bytes_be(),
@@ -288,6 +398,15 @@ impl RsaPublicKey {
         }
     }
     
+    /**
+     * Constructs an RSA public key from its components
+     * Args:
+     *    components - &RsaPublicKeyComponents: The RSA public key components
+     *    size - RsaKeySize: The RSA key size
+     * 
+     * Returns:
+     *    Result<Self>: The constructed RsaPublicKey or an error if construction fails
+     */
     pub fn from_components(components: &RsaPublicKeyComponents, size: RsaKeySize) -> Result<Self> {
         Ok(Self {
             n: BigNum::from_bytes_be(&components.n),
@@ -297,6 +416,15 @@ impl RsaPublicKey {
     }
 }
 
+/**
+ * Computes the greatest common divisor (GCD) of two BigNums
+ * Args:
+ *    a - &BigNum: The first BigNum
+ *    b - &BigNum: The second BigNum
+ * 
+ * Returns:
+ *    BigNum: The GCD of a and b
+ */
 fn generate_rsa_primes(bits: usize, e: &BigNum) -> Result<(BigNum, BigNum)> {
     let p = generate_prime(bits, e)?;
     let q = loop {
@@ -309,6 +437,15 @@ fn generate_rsa_primes(bits: usize, e: &BigNum) -> Result<(BigNum, BigNum)> {
     Ok((p, q))
 }
 
+/**
+ * Generates a prime number of specified bit length
+ * Args:
+ *    bits - usize: The bit length of the prime to generate
+ *    e - &BigNum: The public exponent
+ * 
+ * Returns:
+ *    Result<BigNum>: The generated prime number or an error if generation fails
+ */
 fn generate_prime(bits: usize, e: &BigNum) -> Result<BigNum> {
     let bytes = (bits + 7) / 8;
     loop {
@@ -330,6 +467,15 @@ fn generate_prime(bits: usize, e: &BigNum) -> Result<BigNum> {
     }
 }
 
+/**
+ * Computes the greatest common divisor (GCD) of two BigNums
+ * Args:
+ *    a - &BigNum: The first BigNum
+ *    b - &BigNum: The second BigNum
+ * 
+ * Returns:
+ *    BigNum: The GCD of a and b
+ */
 fn is_probably_prime(n: &BigNum, rounds: usize) -> bool {
     let small_primes = [2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47];
     for &p in &small_primes {
@@ -346,6 +492,15 @@ fn is_probably_prime(n: &BigNum, rounds: usize) -> bool {
     miller_rabin(n, rounds)
 }
 
+/**
+ * Performs the Miller-Rabin primality test, this is done by checking whether n is probably prime
+ * Args:
+ *    n - &BigNum: The number to test for primality
+ *    rounds - usize: The number of rounds to perform
+ * 
+ * Returns:
+ *    bool: True if n is probably prime, false if composite
+ */
 fn miller_rabin(n: &BigNum, rounds: usize) -> bool {
     if n.is_zero() || n.cmp(&BigNum::from_u64(1)) == Ordering::Equal {
         return false;
@@ -380,6 +535,14 @@ fn miller_rabin(n: &BigNum, rounds: usize) -> bool {
     true
 }
 
+/**
+ * Factors out powers of two from a BigNum
+ * Args:
+ *    n - &BigNum: The BigNum to factor
+ * 
+ * Returns:
+ *    (usize, BigNum): A tuple containing the exponent of the power of two and the odd component
+ */
 fn factor_power_of_two(n: &BigNum) -> (usize, BigNum) {
     let mut d = n.clone();
     let mut r = 0;
@@ -391,6 +554,15 @@ fn factor_power_of_two(n: &BigNum) -> (usize, BigNum) {
     (r, d)
 }
 
+/**
+ * Generates a random BigNum in the range [min, max)
+ * Args:
+ *    min - &BigNum: The minimum value (inclusive)
+ *    max - &BigNum: The maximum value (exclusive)
+ * 
+ * Returns:
+ *    Result<BigNum>: A random BigNum in the specified range or an error if generation fails
+ */
 fn random_range(min: &BigNum, max: &BigNum) -> Result<BigNum> {
     let range = max.clone().sub(min.clone());
     let range_bytes = range.to_bytes_be();
@@ -405,6 +577,20 @@ fn random_range(min: &BigNum, max: &BigNum) -> Result<BigNum> {
     }
 }
 
+/**
+ * Decrypts ciphertext using RSA CRT optimization
+ * Args:
+ *    c - &BigNum: The ciphertext
+ *    p - &BigNum: The prime p
+ *    q - &BigNum: The prime q
+ *    dp - &BigNum: d mod (p-1)
+ *    dq - &BigNum: d mod (q-1)
+ *    qinv - &BigNum: q^(-1) mod p
+ *    n - &BigNum: The modulus n
+ * 
+ * Returns:
+ *    Result<BigNum>: The decrypted plaintext or an error if decryption fails
+ */
 fn rsa_decrypt_crt(c: &BigNum, p: &BigNum, q: &BigNum, dp: &BigNum, dq: &BigNum, qinv: &BigNum, n: &BigNum) -> Result<BigNum> {
     let m1 = c.mod_exp(dp, p)?;
     let m2 = c.mod_exp(dq, q)?;
@@ -420,6 +606,15 @@ fn rsa_decrypt_crt(c: &BigNum, p: &BigNum, q: &BigNum, dp: &BigNum, dq: &BigNum,
     Ok(m)
 }
 
+/**
+ * Pads data using PKCS#1 v1.5 for encryption
+ * Args:
+ *    data - &[u8]: The data to pad
+ *    key_size - usize: The RSA key size in bytes
+ * 
+ * Returns:
+ *    Result<Vec<u8>>: The padded data or an error if padding fails
+ */
 fn pad_pkcs1v15_encrypt(data: &[u8], key_size: usize) -> Result<Vec<u8>> {
     if data.len() > key_size - 11 {
         return Err(Error::CryptoError("Data too long for PKCS#1 v1.5 padding".to_string()));
@@ -445,6 +640,15 @@ fn pad_pkcs1v15_encrypt(data: &[u8], key_size: usize) -> Result<Vec<u8>> {
     Ok(padded)
 }
 
+/**
+ * Unpads data using PKCS#1 v1.5
+ * Args:
+ *    data - &[u8]: The padded data
+ *    is_sign - bool: True if unpadding for signature, false for encryption
+ * 
+ * Returns:
+ *    Result<Vec<u8>>: The unpadded data or an error if unpadding fails
+ */
 fn unpad_pkcs1v15(data: &[u8], is_sign: bool) -> Result<Vec<u8>> {
     if data.len() < 11 {
         return Err(Error::CryptoError("Invalid PKCS#1 v1.5 padding".to_string()));
@@ -477,6 +681,15 @@ fn unpad_pkcs1v15(data: &[u8], is_sign: bool) -> Result<Vec<u8>> {
     Ok(data[separator_idx + 1..].to_vec())
 }
 
+/**
+ * Pads a hash using PKCS#1 v1.5 for signing
+ * Args:
+ *    hash - &[u8]: The hash to pad
+ *    key_size - usize: The RSA key size in bytes
+ * 
+ * Returns:
+ *    Result<Vec<u8>>: The padded hash or an error if padding fails
+ */
 fn pad_pkcs1v15_sign(hash: &[u8], key_size: usize) -> Result<Vec<u8>> {
     let digest_info = [
         0x30, 0x31, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86,
@@ -504,6 +717,15 @@ fn pad_pkcs1v15_sign(hash: &[u8], key_size: usize) -> Result<Vec<u8>> {
     Ok(padded)
 }
 
+/**
+ * Verifies a PKCS#1 v1.5 signed hash
+ * Args:
+ *    padded - &[u8]: The padded signature
+ *    hash - &[u8]: The original hash
+ * 
+ * Returns:
+ *    Result<bool>: True if the signature is valid, false otherwise
+ */
 fn verify_pkcs1v15_sign(padded: &[u8], hash: &[u8]) -> Result<bool> {
     let digest_info = [
         0x30, 0x31, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86,
@@ -547,6 +769,15 @@ fn verify_pkcs1v15_sign(padded: &[u8], hash: &[u8]) -> Result<bool> {
         && &padded[start + digest_info.len()..] == hash)
 }
 
+/**
+ * Mask Generation Function 1 (MGF1) using SHA-256
+ * Args:
+ *    seed - &[u8]: The seed for MGF1
+ *    mask_len - usize: The desired length of the mask
+ * 
+ * Returns:
+ *    Vec<u8>: The generated mask
+ */
 fn pad_oaep_sha256(data: &[u8], key_size: usize) -> Result<Vec<u8>> {
     let hash_len = 32;
     if data.len() > key_size - 2 * hash_len - 2 {
@@ -579,6 +810,15 @@ fn pad_oaep_sha256(data: &[u8], key_size: usize) -> Result<Vec<u8>> {
     Ok(em)
 }
 
+/**
+ * Mask Generation Function 1 (MGF1) using SHA-256
+ * Args:
+ *    seed - &[u8]: The seed for MGF1
+ *    mask_len - usize: The desired length of the mask
+ * 
+ * Returns:
+ *    Vec<u8>: The generated mask
+ */
 fn unpad_oaep_sha256(data: &[u8]) -> Result<Vec<u8>> {
     let hash_len = 32;
     if data.len() < 2 * hash_len + 2 || data[0] != 0x00 {
@@ -614,6 +854,15 @@ fn unpad_oaep_sha256(data: &[u8]) -> Result<Vec<u8>> {
     Ok(db[separator_idx + 1..].to_vec())
 }
 
+/**
+ * Pads a hash using PSS with SHA-256
+ * Args:
+ *    hash - &[u8]: The hash to pad
+ *    key_size - usize: The RSA key size in bytes
+ * 
+ * Returns:
+ *    Result<Vec<u8>>: The padded hash or an error if padding fails
+ */
 fn pad_pss_sha256(hash: &[u8], key_size: usize) -> Result<Vec<u8>> {
     let hash_len = 32;
     let s_len = hash_len;
@@ -654,6 +903,15 @@ fn pad_pss_sha256(hash: &[u8], key_size: usize) -> Result<Vec<u8>> {
     Ok(em)
 }
 
+/**
+ * Verifies a PSS signed hash using SHA-256
+ * Args:
+ *    em - &[u8]: The encoded message (signature)
+ *    hash - &[u8]: The original hash
+ * 
+ * Returns:
+ *    Result<bool>: True if the signature is valid, false otherwise
+ */
 fn verify_pss_sha256(em: &[u8], hash: &[u8]) -> Result<bool> {
     let hash_len = 32;
     let s_len = hash_len;
@@ -698,6 +956,15 @@ fn verify_pss_sha256(em: &[u8], hash: &[u8]) -> Result<bool> {
     Ok(&h_prime[..] == h)
 }
 
+/**
+ * Mask Generation Function 1 (MGF1) using SHA-256
+ * Args:
+ *    seed - &[u8]: The seed for MGF1
+ *    mask_len - usize: The desired length of the mask
+ * 
+ * Returns:
+ *    Vec<u8>: The generated mask
+ */
 fn mgf1_sha256(seed: &[u8], length: usize) -> Vec<u8> {
     let hash_len = 32;
     let mut output = Vec::with_capacity(length);
@@ -714,6 +981,15 @@ fn mgf1_sha256(seed: &[u8], length: usize) -> Vec<u8> {
     output
 }
 
+/**
+ * Computes the greatest common divisor (GCD) of two BigNums
+ * Args:
+ *    a - &BigNum: The first BigNum
+ *    b - &BigNum: The second BigNum
+ * 
+ * Returns:
+ *    BigNum: The GCD of a and b
+ */
 fn gcd(a: &BigNum, b: &BigNum) -> BigNum {
     let mut a = a.clone();
     let mut b = b.clone();
@@ -726,6 +1002,15 @@ fn gcd(a: &BigNum, b: &BigNum) -> BigNum {
     a
 }
 
+/**
+ * Computes the least common multiple (LCM) of two BigNums
+ * Args:
+ *    a - &BigNum: The first BigNum
+ *    b - &BigNum: The second BigNum
+ * 
+ * Returns:
+ *    BigNum: The LCM of a and b
+ */
 fn lcm(a: &BigNum, b: &BigNum) -> BigNum {
     let g = gcd(a, b);
     a.clone().mul(b.clone()).div(g)

@@ -1,5 +1,6 @@
 // crypto/random.rs - Cryptographic Random Number Generation Module
 // This module provides secure random number generation using a system-specific RNG
+// https://en.wikipedia.org/wiki/Cryptographically_secure_pseudorandom_number_generator
 
 use std::sync::Mutex;
 use crate::crypto::{Error, Result};

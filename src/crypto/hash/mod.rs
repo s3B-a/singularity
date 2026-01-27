@@ -1,6 +1,7 @@
 // crypto/hash/mod.rs - Hashing Module
 // This module provides various hashing algorithms and HMAC implementations
-// including SHA-2, SHA-3, and HMAC.
+// These hashing functions are integral for data integrity, authentication, and key derivation
+// Implementations include SHA-2, SHA-3, and HMAC.
 
 pub mod sha2;
 pub mod sha3;

@@ -1,18 +1,61 @@
+// crypto/kdf/pbkdf2.rs - Password-Based Key Derivation Function 2 (PBKDF2) implementation
+// https://datatracker.ietf.org/doc/html/rfc8018#section-5.2
+
 use crate::crypto::{Error, Result};
 use crate::crypto::hash::{HmacSha256, HmacSha512};
 
+// Minimum recommended iterations for PBKDF2
 const MIN_ITERATIONS: u32 = 100_000;
+
+// Recommended iterations for PBKDF2
 const RECOMMENDED_ITERATIONS: u32 = 600_000;
+
+// Maximum derived key length in bytes
 const MAX_DK_LEN: usize = 1024 * 1024;
 
+/**
+ * Derives a key using PBKDF2 with HMAC-SHA256
+ * Args:
+ *    password - &[u8]: The input password
+ *    salt - &[u8]: The cryptographic salt
+ *    iterations - u32: Number of iterations
+ *    dk_len - usize: Desired length of the derived key in bytes
+ * 
+ * Returns:
+ *    Result<Vec<u8>>: The derived key or an error if parameters are invalid
+ */
 pub fn pbkdf2_sha256(password: &[u8], salt: &[u8], iterations: u32, dk_len: usize) -> Result<Vec<u8>> {
     pbkdf2_sha256_impl(password, salt, iterations, dk_len, false)
 }
 
+/**
+ * Derives a key using PBKDF2 with HMAC-SHA256 in strict mode
+ * Strict mode enforces minimum security parameters
+ * Args:
+ *    password - &[u8]: The input password
+ *    salt - &[u8]: The cryptographic salt
+ *    iterations - u32: Number of iterations
+ *    dk_len - usize: Desired length of the derived key in bytes
+ * 
+ * Returns:
+ *    Result<Vec<u8>>: The derived key or an error if parameters are invalid
+ */
 pub fn pbkdf2_sha256_strict(password: &[u8], salt: &[u8], iterations: u32, dk_len: usize) -> Result<Vec<u8>> {
     pbkdf2_sha256_impl(password, salt, iterations, dk_len, true)
 }
 
+/**
+ * Internal implementation of PBKDF2 with HMAC-SHA256
+ * Args:
+ *    password - &[u8]: The input password
+ *    salt - &[u8]: The cryptographic salt
+ *    iterations - u32: Number of iterations
+ *    dk_len - usize: Desired length of the derived key in bytes
+ *    strict - bool: Whether to enforce strict security parameters
+ * 
+ * Returns:
+ *    Result<Vec<u8>>: The derived key or an error if parameters are invalid
+ */
 fn pbkdf2_sha256_impl(password: &[u8], salt: &[u8], iterations: u32, dk_len: usize, strict: bool) -> Result<Vec<u8>> {
     if iterations == 0 {
         return Err(Error::InvalidLength);
@@ -67,14 +110,49 @@ fn pbkdf2_sha256_impl(password: &[u8], salt: &[u8], iterations: u32, dk_len: usi
     Ok(dk)
 }
 
+/**
+ * Derives a key using PBKDF2 with HMAC-SHA512
+ * Args:
+ *    password - &[u8]: The input password
+ *    salt - &[u8]: The cryptographic salt
+ *    iterations - u32: Number of iterations
+ *    dk_len - usize: Desired length of the derived key in bytes
+ * 
+ * Returns:
+ *    Result<Vec<u8>>: The derived key or an error if parameters are invalid
+ */
 pub fn pbkdf2_sha512(password: &[u8], salt: &[u8], iterations: u32, dk_len: usize) -> Result<Vec<u8>> {
     pbkdf2_sha512_impl(password, salt, iterations, dk_len, false)
 }
 
+/**
+ * Derives a key using PBKDF2 with HMAC-SHA512 in strict mode
+ * Strict mode enforces minimum security parameters
+ * Args:
+ *    password - &[u8]: The input password
+ *    salt - &[u8]: The cryptographic salt
+ *    iterations - u32: Number of iterations
+ *    dk_len - usize: Desired length of the derived key in bytes
+ * 
+ * Returns:
+ *    Result<Vec<u8>>: The derived key or an error if parameters are invalid
+ */
 pub fn pbkdf2_sha512_strict(password: &[u8], salt: &[u8], iterations: u32, dk_len: usize) -> Result<Vec<u8>> {
     pbkdf2_sha512_impl(password, salt, iterations, dk_len, true)
 }
 
+/**
+ * Internal implementation of PBKDF2 with HMAC-SHA512
+ * Args:
+ *    password - &[u8]: The input password
+ *    salt - &[u8]: The cryptographic salt
+ *    iterations - u32: Number of iterations
+ *    dk_len - usize: Desired length of the derived key in bytes
+ *    strict - bool: Whether to enforce strict security parameters
+ * 
+ * Returns:
+ *    Result<Vec<u8>>: The derived key or an error if parameters are invalid
+ */
 fn pbkdf2_sha512_impl(password: &[u8], salt: &[u8], iterations: u32, dk_len: usize, strict: bool) -> Result<Vec<u8>> {
     if iterations == 0 {
         return Err(Error::InvalidLength);
@@ -129,6 +207,15 @@ fn pbkdf2_sha512_impl(password: &[u8], salt: &[u8], iterations: u32, dk_len: usi
     Ok(dk)
 }
 
+/**
+ * Securely compares two byte slices in constant times
+ * Args:
+ *    a - &[u8]: First byte slice
+ *    b - &[u8]: Second byte slice
+ * 
+ * Returns:
+ *    bool: True if slices are equal, false otherwise
+ */
 pub fn secure_compare(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;

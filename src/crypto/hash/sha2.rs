@@ -1,5 +1,6 @@
 // crypto/hash/sha2.rs
 // Implementations of SHA-224, SHA-256, SHA-384, SHA-512, SHA-512/224, and SHA-512/256
+// https://nvlpubs.nist.gov/nistpubs/FIPS/NIST.FIPS.180-4.pdf
 
 // SHA-256 round constants
 const K256: [u32; 64] = [
@@ -78,7 +79,7 @@ impl Sha256 {
      * Update the SHA-256 state with input data
      * Args:
      *    &mut self: Mutable reference to SHA-256 instance
-     *    data: &[u8]: Input data to hash
+     *    data - &[u8]: Input data to hash
      * 
      * Returns:
      *    (): Nothing   
@@ -146,7 +147,7 @@ impl Sha256 {
      * Process a single 512-bit block
      * Args:
      *    &mut self: Mutable reference to SHA-256 instance
-     *    block: &[u8; 64]: 512-bit block to process
+     *    block - &[u8; 64]: 512-bit block to process
      * 
      * Returns:
      *    (): Nothing
@@ -210,7 +211,10 @@ impl Sha256 {
 /**
  * Hash data using SHA-256
  * Args:
- *    data: &[u8]: Input data to hash
+ *    data - &[u8]: Input data to hash
+ * 
+ * Returns:
+ *    [u8; 32]: The resulting SHA-256 hash digest
  */
 pub fn sha256(data: &[u8]) -> [u8; 32] {
     let mut hasher = Sha256::new();
@@ -219,6 +223,7 @@ pub fn sha256(data: &[u8]) -> [u8; 32] {
     hasher.finalize()
 }
 
+// Implement Default trait for Sha256
 impl Default for Sha256 {
     fn default() -> Self {
         Self::new()
@@ -235,6 +240,15 @@ pub struct Sha224 {
 }
 
 impl Sha224 {
+
+    /**
+     * Create a new SHA-224 instance
+     * Args:
+     *    (): No arguments
+     * 
+     * Returns:
+     *    Self: New SHA-224 instance
+     */
     pub fn new() -> Self {
         Sha224 {
             state: [
@@ -253,6 +267,15 @@ impl Sha224 {
         }
     }
 
+    /**
+     * Update the SHA-224 state with input data
+     * Args:
+     *    &mut self: Mutable reference to SHA-224 instance
+     *    data - &[u8]: Input data to hash
+     * 
+     * Returns:
+     *    (): Nothing
+     */
     pub fn update(&mut self, data: &[u8]) {
         let mut pos = 0;
         while pos < data.len() {
@@ -272,6 +295,14 @@ impl Sha224 {
         self.total_len += data.len() as u64;
     }
 
+    /**
+     * Finalize the SHA-224 hash and return the digest
+     * Args:
+     *    mut self: Mutable SHA-224 instance
+     * 
+     * Returns:
+     *    [u8; 28]: The resulting SHA-224 hash digest
+     */
     pub fn finalize(mut self) -> [u8; 28] {
         finalize_sha256_state(&mut self.state, &mut self.buffer, self.buffer_len, self.total_len);
 
@@ -284,6 +315,14 @@ impl Sha224 {
     }
 }
 
+/**
+ * Hash data using SHA-224
+ * Args:
+ *    data - &[u8]: Input data to hash
+ * 
+ * Returns:
+ *    [u8; 28]: The resulting SHA-224 hash digest
+ */
 pub fn sha224(data: &[u8]) -> [u8; 28] {
     let mut hasher = Sha224::new();
     hasher.update(data);
@@ -291,6 +330,7 @@ pub fn sha224(data: &[u8]) -> [u8; 28] {
     hasher.finalize()
 }
 
+// Implement Default trait for Sha224
 impl Default for Sha224 {
     fn default() -> Self {
         Self::new()
@@ -307,6 +347,15 @@ pub struct Sha512 {
 }
 
 impl Sha512 {
+
+    /**
+     * Create a new SHA-512 instance
+     * Args:
+     *    (): No arguments
+     * 
+     * Returns:
+     *    Self: New SHA-512 instance
+     */
     pub fn new() -> Self {
         Sha512 {
             state: [
@@ -325,6 +374,15 @@ impl Sha512 {
         }
     }
 
+    /**
+     * Update the SHA-512 state with input data
+     * Args:
+     *    &mut self: Mutable reference to SHA-512 instance
+     *    data - &[u8]: Input data to hash
+     * 
+     * Returns:
+     *    (): Nothing
+     */
     pub fn update(&mut self, data: &[u8]) {
         let mut pos = 0;
         while pos < data.len() {
@@ -344,6 +402,14 @@ impl Sha512 {
         self.total_len += data.len() as u128;
     }
 
+    /**
+     * Finalize the SHA-512 hash and return the digest
+     * Args:
+     *    mut self: Mutable SHA-512 instance
+     * 
+     * Returns:
+     *    [u8; 64]: The resulting SHA-512 hash digest
+     */
     pub fn finalize(mut self) -> [u8; 64] {
         let bit_len = self.total_len * 8;
 
@@ -375,6 +441,15 @@ impl Sha512 {
         output
     }
 
+    /**
+     * Process a single 1024-bit block
+     * Args:
+     *    &mut self: Mutable reference to SHA-512 instance
+     *    block - &[u8; 128]: 1024-bit block to process
+     * 
+     * Returns:
+     *    (): Nothing
+     */
     fn process_block(&mut self, block: &[u8; 128]) {
         let mut w = [0u64; 80];
         for i in 0..16 {
@@ -435,6 +510,14 @@ impl Sha512 {
     }
 }
 
+/**
+ * Hash data using SHA-512
+ * Args:
+ *    data - &[u8]: Input data to hash
+ * 
+ * Returns:
+ *    [u8; 64]: The resulting SHA-512 hash digest
+ */
 pub fn sha512(data: &[u8]) -> [u8; 64] {
     let mut hasher = Sha512::new();
     hasher.update(data);
@@ -442,6 +525,7 @@ pub fn sha512(data: &[u8]) -> [u8; 64] {
     hasher.finalize()
 }
 
+// Implement Default trait for Sha512
 impl Default for Sha512 {
     fn default() -> Self {
         Self::new()
@@ -455,6 +539,15 @@ pub struct Sha384 {
 }
 
 impl Sha384 {
+
+    /**
+     * Create a new SHA-384 instance
+     * Args:
+     *    (): No arguments
+     * 
+     * Returns:
+     *    Self: New SHA-384 instance
+     */
     pub fn new() -> Self {
         let mut hasher = Sha512::new();
         hasher.state = [
@@ -471,10 +564,24 @@ impl Sha384 {
         Sha384 { inner: hasher }
     }
 
+    /**
+     * Update the SHA-384 state with input data
+     * Args:
+     *    &mut self: Mutable reference to SHA-384 instance
+     *    data - &[u8]: Input data to hash
+     */
     pub fn update(&mut self, data: &[u8]) {
         self.inner.update(data);
     }
 
+    /**
+     * Finalize the SHA-384 hash and return the digest
+     * Args:
+     *    self: SHA-384 instance
+     * 
+     * Returns:
+     *    [u8; 48]: The resulting SHA-384 hash digest
+     */
     pub fn finalize(self) -> [u8; 48] {
         let full_hash = self.inner.finalize();
         let mut output = [0u8; 48];
@@ -484,6 +591,14 @@ impl Sha384 {
     }
 }
 
+/**
+ * Hash data using SHA-384
+ * Args:
+ *    data - &[u8]: Input data to hash
+ * 
+ * Returns:
+ *    [u8; 48]: The resulting SHA-384 hash digest
+ */
 pub fn sha384(data: &[u8]) -> [u8; 48] {
     let mut hasher = Sha384::new();
     hasher.update(data);
@@ -491,13 +606,22 @@ pub fn sha384(data: &[u8]) -> [u8; 48] {
     hasher.finalize()
 }
 
+// Implement Default trait for Sha384
 impl Default for Sha384 {
     fn default() -> Self {
         Self::new()
     }
 }
 
-// Helper for SHA-224/256 processing
+/**
+ * Helper for processing SHA-224/256 blocks
+ * Args:
+ *    state - &mut [u32; 8]: Current hash state
+ *    block - &[u8; 64]: 512-bit block to process
+ * 
+ * Returns:
+ *    (): Nothing
+ */
 fn process_sha256_block(state: &mut [u32; 8], block: &[u8; 64]) {
     let mut w = [0u32; 64];
     for i in 0..16 {
@@ -552,7 +676,17 @@ fn process_sha256_block(state: &mut [u32; 8], block: &[u8; 64]) {
     state[7] = state[7].wrapping_add(h);
 }
 
-// Helper for finalizing SHA-224/256
+/**
+ * Helper for finalizing SHA-224/256 state
+ * Args:
+ *    state - &mut [u32, 8]: Current hash state
+ *    buffer - &mut [u8; 64]: Buffer containing remaining data
+ *    buffer_len - usize: Length of data in the buffer
+ *    total_len - u64: Total length of input data in bytes
+ * 
+ * Returns:
+ *    (): Nothing
+ */
 fn finalize_sha256_state(state: &mut [u32; 8], buffer: &mut [u8; 64], buffer_len: usize, total_len: u64) {
     let bit_len = total_len * 8;
     let mut temp_buffer_len = buffer_len;

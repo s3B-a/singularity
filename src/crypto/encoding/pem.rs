@@ -1,7 +1,19 @@
+// crypto/encoding/pem.rs - Base64 encoding and decoding
+// https://datatracker.ietf.org/doc/html/rfc4648
+
 use crate::crypto::{Error, Result};
 
+// Base64 character set
 const BASE64_CHARS: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
+/**
+ * Encodes input bytes to a base64 string
+ * Args:
+ *    input - &[u8]: The byte slice to encode
+ * 
+ * Returns:
+ *    String: The base64 encoded string
+ */
 pub fn encode(input: &[u8]) -> String {
     let mut output = String::new();
     let mut i = 0;
@@ -35,6 +47,14 @@ pub fn encode(input: &[u8]) -> String {
     output
 }
 
+/**
+ * Decodes a base64 string to bytes
+ * Args:
+ *    input - &str: The base64 encoded string
+ * 
+ * Returns:
+ *    Result<Vec<u8>>: The decoded byte vector or an error if decoding fails
+ */
 pub fn decode(input: &str) -> Result<Vec<u8>> {
     let mut output = Vec::new();
     let mut buf = [0u8; 4];
