@@ -1,4 +1,5 @@
 pub mod net;
+pub mod crypto;
 pub mod url;
 pub mod html;
 pub mod css;
