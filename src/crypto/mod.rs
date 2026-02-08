@@ -34,6 +34,8 @@ pub enum Error {
     InsufficientEntropy,
     // Generic cryptographic error with a message
     CryptoError(String),
+    // Used for invalid data formats or values
+    InvalidData(String),
 }
 
 /**
@@ -85,6 +87,7 @@ impl std::fmt::Display for Error {
             Error::InvalidCertificate => write!(f, "Invalid certificate"),
             Error::InsufficientEntropy => write!(f, "Insufficient entropy"),
             Error::CryptoError(msg) => write!(f, "Cryptographic error: {}", msg),
+            Error::InvalidData(msg) => write!(f, "Invalid data: {}", msg),
         }
     }
 }

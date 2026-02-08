@@ -26,7 +26,7 @@ pub enum RsaPadding {
 }
 
 // RSA Private Key Structure
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct RsaPrivateKey {
     n: BigNum,
     e: BigNum,
@@ -413,6 +413,53 @@ impl RsaPublicKey {
             e: BigNum::from_bytes_be(&components.e),
             size,
         })
+    }
+
+    /**
+     * Constructs an RSA public key from DER-encoded bytes
+     * Args:
+     *    der - &[u8]: The DER-encoded public key bytes
+     * 
+     * Returns:
+     *    Result<Self>: The constructed RsaPublicKey or an error if construction fails
+     */
+    pub fn from_bytes(der: &[u8]) -> Result<Self> {
+        let mut index = 0;
+        if der[index] != 0x30 {
+            return Err(Error::CryptoError("Invalid DER format".to_string()));
+        }
+
+        index += 1;
+        let _len = der[index] as usize;
+        index += 1;
+        if der[index] != 0x02 {
+            return Err(Error::CryptoError("Invalid DER format".to_string()));
+        }
+
+        index += 1;
+        let n_len = der[index] as usize;
+        index += 1;
+        let n_bytes = &der[index..index + n_len];
+        index += n_len;
+        if der[index] != 0x02 {
+            return Err(Error::CryptoError("Invalid DER format".to_string()));
+        }
+        
+        index += 1;
+        let e_len = der[index] as usize;
+        index += 1;
+        let e_bytes = &der[index..index + e_len];
+
+        let n = BigNum::from_bytes_be(n_bytes);
+        let e = BigNum::from_bytes_be(e_bytes);
+        let size = match n.bit_length() {
+            2048 => RsaKeySize::Rsa2048,
+            3072 => RsaKeySize::Rsa3072,
+            4096 => RsaKeySize::Rsa4096,
+            _ => return Err(Error::CryptoError("Unsupported RSA key size".to_string())),
+        };
+
+        Ok(Self { n, e, size })
     }
 }
 

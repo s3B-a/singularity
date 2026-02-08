@@ -1,4 +1,3 @@
-use singularity::*;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Singularity Web Engine v0.0.1");

@@ -2,6 +2,7 @@ pub mod tcp;
 pub mod udp;
 pub mod socket;
 pub mod http;
+pub mod https;
 pub mod dns;
 pub mod cookie;
 pub mod connection_pool;
@@ -11,9 +12,11 @@ pub mod https;
 
 pub use tcp::TcpStream;
 pub use udp::UdpSocket;
-//pub use http::HttpClient;
+pub use http::HttpClient;
 pub use dns::DnsResolver;
 pub use cookie::CookieJar;
+
+pub use crate::crypto as crypto;
 
 use std::io;
 

@@ -614,10 +614,10 @@ impl HttpClient {
     fn build_redirect_request(&self, original: &HttpRequest, location: &str) -> Result<HttpRequest, io::Error> {
         let mut new_request = HttpRequest::new(original.method().clone(), location.to_string());
         if let Some(user_agent) = original.headers().get("User-Agent") {
-            new_request.headers_mut().insert("User-Agent".to_string(), user_agent.clone());
+            new_request.headers_mut().insert("User-Agent".to_string(), user_agent);
         }
         if let Some(accept) = original.headers().get("Accept") {
-            new_request.headers_mut().insert("Accept".to_string(), accept.clone());
+            new_request.headers_mut().insert("Accept".to_string(), accept);
         }
 
         Ok(new_request)

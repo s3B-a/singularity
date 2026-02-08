@@ -2,7 +2,7 @@
 // https://datatracker.ietf.org/doc/html/rfc8032#section-5.1
 
 use crate::crypto::{Error, Result};
-use super::x25519::{fe_from_bytes, fe_to_bytes, fe_add, fe_sub, fe_mul, fe_square, fe_invert, fe_reduce};
+use super::x25519::{fe_from_bytes, fe_to_bytes, fe_add, fe_sub, fe_mul, fe_square, fe_invert};
 use crate::crypto::hash::sha2::Sha512;
 
 // Extended coordinates representation
