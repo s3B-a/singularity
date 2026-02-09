@@ -998,10 +998,10 @@ impl HttpClient {
             stream_id,
             headers,
             Some(request.get_body().to_vec()),
-        );
+        ).ok();
 
         if !request.get_body().is_empty() {
-            entry.connection.send_data(stream_id, request.get_body(), true);
+            entry.connection.send_data(stream_id, request.get_body(), true).ok();
         }
 
         let response = Self::extract_http2_response(entry, stream_id)?;

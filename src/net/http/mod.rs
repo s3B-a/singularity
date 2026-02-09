@@ -9,6 +9,7 @@ pub mod status;
 pub mod parser;
 pub mod chunked;
 pub mod trailer;
+pub mod server;
 
 pub use status::StatusCode;
 pub use headers::Headers;
@@ -18,6 +19,7 @@ pub use client::{HttpClient, HttpClientBuilder};
 pub use request::HttpRequest;
 pub use trailer::TrailerHeaders;
 pub use response::HttpResponse;
+pub use server::{HttpServer, HttpServerCfg};
 
 #[cfg(test)]
 mod tests;
