@@ -6,7 +6,8 @@ use super::response::HttpResponse;
 use crate::net::tcp::TcpStream;
 use crate::net::cookie::{CookieJar, Cookie, parse_set_cookie};
 use crate::net::dns::DnsResolver;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, Mutex};
 use std::io::{self, BufRead, BufReader, Read};
 use std::net::{SocketAddr, IpAddr};
 use std::time::{Duration, Instant};
@@ -31,6 +32,13 @@ pub struct ConnectionInfo {
     pub requests_made: usize,
 }
 
+#[derive(Clone)]
+struct PipelinedRequest {
+    request: HttpRequest,
+    request_id: u64,
+    sent_at: Instant,
+}
+
 struct Http1ConnectionEntry {
     stream: TcpStream,
     host: String,
@@ -42,6 +50,10 @@ struct Http1ConnectionEntry {
     idle_timeout: Duration,
     supports_pipelining: bool,
     pending_requests: usize,
+    pipeline_queue: VecDeque<PipelinedRequest>,
+    pipeline_depth: usize,
+    max_pipeline_depth: usize,
+    response_buffer: Vec<u8>,
 }
 
 impl Http1ConnectionEntry {
@@ -57,6 +69,10 @@ impl Http1ConnectionEntry {
             idle_timeout: Duration::from_secs(30),
             supports_pipelining: false,
             pending_requests: 0,
+            pipeline_queue: VecDeque::new(),
+            pipeline_depth: 0,
+            max_pipeline_depth: 6,
+            response_buffer: Vec::new(),
         }
     }
 
@@ -82,7 +98,264 @@ impl Http1ConnectionEntry {
     }
 
     fn can_pipeline(&self) -> bool {
-        self.supports_pipelining && self.pending_requests < 5
+        self.supports_pipelining && self.pipeline_depth < self.max_pipeline_depth
+    }
+
+    fn enqueue_request(&mut self, request: HttpRequest, request_id: u64) -> Result<(), io::Error> {
+        if !self.can_pipeline() {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "Pipeline is full"
+            ));
+        }
+
+        let pipelined = PipelinedRequest {
+            request,
+            request_id,
+            sent_at: Instant::now(),
+        };
+
+        self.pipeline_queue.push_back(pipelined);
+        self.pipeline_depth += 1;
+        self.pending_requests += 1;
+
+        Ok(())
+    }
+
+    fn send_pipelined_request(&mut self) -> Result<(), io::Error> {
+        while let Some(pipelined) = self.pipeline_queue.front() {
+            let request_bytes = pipelined.request.build(&self.host);
+            match self.stream.write_all(&request_bytes) {
+                Ok(_) => {
+                    self.stream.flush()?;
+                    self.pipeline_queue.pop_front();
+                    self.requests_made += 1;
+                    self.mark_used();
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    return Ok(());
+                }
+                Err(e) => return Err(e)
+            }
+        }
+
+        Ok(())
+    }
+
+    fn read_pipelined_response(&mut self, timeout: Duration) -> Result<Option<HttpResponse>, io::Error> {
+        if self.pending_requests == 0 {
+            return Ok(None);
+        }
+
+        self.stream.set_read_timeout(Some(timeout))?;
+        let mut temp_buffer = vec![0u8; 8192];
+        
+        let start = Instant::now();
+        loop {
+            match self.stream.read(&mut temp_buffer) {
+                Ok(n) if n > 0 => {
+                    self.response_buffer.extend_from_slice(&temp_buffer[..n]);
+                    if let Ok(Some(response)) = self.try_parse_response() {
+                        self.pending_requests -= 1;
+                        self.pipeline_depth = self.pipeline_depth.saturating_sub(1);
+                        return Ok(Some(response));
+                    }
+                }
+                Ok(_) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::ConnectionAborted,
+                        "Connection closed by peer"
+                    ));
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut => {
+                    if !self.response_buffer.is_empty() {
+                        if let Ok(Some(response)) = self.try_parse_response() {
+                            self.pending_requests -= 1;
+                            self.pipeline_depth = self.pipeline_depth.saturating_sub(1);
+                            return Ok(Some(response));
+                        }
+                    }
+                    
+                    if start.elapsed() >= timeout {
+                        return Ok(None);
+                    }
+                    
+                    std::thread::sleep(Duration::from_millis(1));
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    fn try_parse_response(&mut self) -> Result<Option<HttpResponse>, io::Error> {
+        if self.response_buffer.len() < 4 {
+            return Ok(None);
+        }
+
+        let header_end = self.response_buffer.windows(4).position(|w| w == b"\r\n\r\n");
+        let header_end = match header_end {
+            Some(pos) => pos,
+            None => {
+                if self.response_buffer.len() > 65536 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "Response headers too large",
+                    ));
+                }
+
+                return Ok(None);
+            }
+        };
+
+        let header_section = &self.response_buffer[..header_end];
+        let header_str = std::str::from_utf8(header_section).map_err(|_| io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Invalid UTF-8 in headers")
+        )?;
+
+        let content_length = self.extract_content_length(header_str);
+        let is_chunked = self.is_chunked_encoding(header_str);
+        let body_start = header_end + 4;
+        if is_chunked {
+            if let Some(body_end) = self.find_chunked_end(body_start) {
+                let response_bytes = self.response_buffer.drain(..body_end).collect::<Vec<_>>();
+                return Ok(Some(HttpResponse::from_bytes(&response_bytes).map_err(|e| io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    e))
+                ?));
+            }
+
+            return Ok(None);
+        }
+
+        if let Some(len) = content_length {
+            let body_end = body_start + len;
+            if self.response_buffer.len() >= body_end {
+                let response_bytes = self.response_buffer.drain(..body_end).collect::<Vec<_>>();
+                return Ok(Some(HttpResponse::from_bytes(&response_bytes).map_err(|e| io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    e))
+                ?));
+            }
+
+            return Ok(None);
+        }
+
+        let response_bytes = self.response_buffer.drain(..).collect::<Vec<_>>();
+        
+        Ok(Some(HttpResponse::from_bytes(&response_bytes).map_err(|e| io::Error::new(
+            io::ErrorKind::InvalidData,
+            e))
+        ?))
+    }
+
+    fn extract_content_length(&self, headers: &str) -> Option<usize> {
+        for line in headers.lines() {
+            if line.to_lowercase().starts_with("content-length:") {
+                if let Some(value) = line.split(':').nth(1) {
+                    return value.trim().parse().ok();
+                }
+            }
+        }
+
+        None
+    }
+
+    fn is_chunked_encoding(&self, headers: &str) -> bool {
+        for line in headers.lines() {
+            if line.to_lowercase().starts_with("transfer-encoding:") {
+                if let Some(value) = line.split(':').nth(1) {
+                    return value.to_lowercase().contains("chunked");
+                }
+            }
+        }
+
+        false
+    }
+
+    fn find_chunked_end(&self, start: usize) -> Option<usize> {
+        let data = &self.response_buffer[start..];
+        let mut pos = 0;
+        loop {
+            let size_line_end = data[pos..].iter().position(|&b| b == b'\n').map(|p| pos + p)?;
+            
+            let size_line = &data[pos..size_line_end];
+            let size_str = std::str::from_utf8(size_line).ok()?.trim_end_matches('\r').split(';').next()?.trim();
+            
+            let chunk_size = usize::from_str_radix(size_str, 16).ok()?;
+            if chunk_size == 0 {
+                let after_zero = size_line_end + 1;
+                let mut trailer_end = after_zero;
+                loop {
+                    if trailer_end + 1 >= data.len() {
+                        return None;
+                    }
+                    
+                    if data[trailer_end] == b'\r' && data[trailer_end + 1] == b'\n' {
+                        return Some(start + trailer_end + 2);
+                    }
+                    
+                    trailer_end = data[trailer_end..].iter().position(|&b| b == b'\n').map(|p| trailer_end + p + 1)?;
+                }
+            }
+            
+            pos = size_line_end + 1 + chunk_size + 2;
+            
+            if pos > data.len() {
+                return None;
+            }
+        }
+    }
+
+    fn detect_pipelining_support(&mut self, response: &HttpResponse) {
+        if let Some(connection) = response.header("Connection") {
+            if connection.to_lowercase() == "close" {
+                self.supports_pipelining = false;
+                self.max_pipeline_depth = 1;
+            }
+        }
+
+        if response.version() == HttpVersion::Http10 {
+            self.supports_pipelining = false;
+            self.max_pipeline_depth = 1;
+        }
+    }
+
+    fn flush_pipeline(&mut self, timeout: Duration) -> Result<Vec<HttpResponse>, io::Error> {
+        while let Some(_) = self.pipeline_queue.front() {
+            self.send_pipelined_request()?;
+        }
+
+        let mut responses = Vec::new();
+        let deadline = Instant::now() + timeout;
+        while self.pending_requests > 0 {
+            if Instant::now() > deadline {
+                return Err(io::Error::new(io::ErrorKind::TimedOut, "Pipeline flush timeout"));
+            }
+
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let read_timeout = remaining.min(Duration::from_millis(100));            
+            match self.read_pipelined_response(read_timeout) {
+                Ok(Some(response)) => {
+                    self.detect_pipelining_support(&response);
+                    responses.push(response);
+                }
+                Ok(None) => {
+                    if self.pending_requests > 0 {
+                        continue;
+                    } else {
+                        break;
+                    }
+                }
+                Err(e) if e.kind() == io::ErrorKind::TimedOut => {
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        Ok(responses)
     }
 
     fn is_healthy(&mut self) -> bool {
@@ -339,6 +612,8 @@ pub struct HttpClient {
     cookie_jar: CookieJar,
     enable_cookies: bool,
     dns_resolver: DnsResolver,
+    next_request_id: u64,
+    pipeline_requests: HashMap<String, VecDeque<(u64, HttpRequest)>>,
     version_cache: HashMap<String, HttpVersion>,
     alt_svc_cache: HashMap<String, Vec<(HttpVersion, String, u16)>>,
     enable_version_negotiation: bool,
@@ -364,6 +639,8 @@ impl HttpClient {
             cookie_jar: CookieJar::new(),
             enable_cookies: true,
             dns_resolver: DnsResolver::new(),
+            next_request_id: 0,
+            pipeline_requests: HashMap::new(),
             version_cache: HashMap::new(),
             alt_svc_cache: HashMap::new(),
             enable_version_negotiation: true,
@@ -477,14 +754,11 @@ impl HttpClient {
     }
 
     fn send_to_address(&self, request: &HttpRequest, addr: SocketAddr) -> Result<HttpResponse, io::Error> {
-        let mut stream = TcpStream::connect(addr)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        let mut stream = TcpStream::connect(addr).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
 
         if let Some(timeout) = self.timeout {
-            stream.set_read_timeout(Some(timeout))
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-            stream.set_write_timeout(Some(timeout))
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            stream.set_read_timeout(Some(timeout)).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            stream.set_write_timeout(Some(timeout)).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
         }
 
         let url = request.path();
@@ -493,34 +767,96 @@ impl HttpClient {
             .map(|(s, h, p, path)| (s, h, p, if path.is_empty() { "/".to_string() } else { format!("/{}", path) }))?;
         
         let request_line = format!("{} {} HTTP/1.1\r\n", request.method().as_str(), path);
-        stream.write_all(request_line.as_bytes())
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        stream.write_all(request_line.as_bytes()).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
         
         let host_header = format!("Host: {}\r\n", host);
-        stream.write_all(host_header.as_bytes())
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        stream.write_all(host_header.as_bytes()).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
         
         for (key, values) in request.headers().iter() {
             if key.to_lowercase() != "host" {
                 let header = format!("{}: {}\r\n", key, values.join(", "));
-                stream.write_all(header.as_bytes())
-                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+                stream.write_all(header.as_bytes()).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
             }
         }
         
-        stream.write_all(b"\r\n")
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        stream.write_all(b"\r\n").map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
         
         if !request.get_body().is_empty() {
-            stream.write_all(request.get_body())
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            stream.write_all(request.get_body()).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
         }
         
-        stream.flush()
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        stream.flush().map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
 
         let mut reader = BufReader::new(&mut stream);
         self.read_response(&mut reader)
+    }
+
+    pub fn send_pipelined(&mut self, requests: Vec<HttpRequest>) -> Result<Vec<HttpResponse>, io::Error> {
+        if requests.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        if !self.enable_pipelining {
+            return requests.into_iter()
+                .map(|req| self.send(&req))
+                .collect::<Result<Vec<_>, _>>();
+        }
+
+        let first_url = requests[0].path();
+        let (host, port) = self.parse_host_port(first_url)?;
+        let connection_key = format!("{}:{}", host, port);
+
+        let mut conn = self.get_or_create_http1_connection(&host, port)?;
+        if !conn.can_pipeline() {
+            return requests.into_iter()
+                .map(|req| self.send(&req))
+                .collect::<Result<Vec<_>, _>>();
+        }
+
+        for request in requests {
+            let request_id = self.next_request_id;
+            self.next_request_id += 1;
+
+            conn.enqueue_request(request, request_id)?;
+        }
+
+        let responses = conn.flush_pipeline(self.timeout.unwrap_or(Duration::from_secs(30)))?;
+        self.http1_connections.insert(connection_key, conn);
+
+        Ok(responses)
+    }
+
+    pub fn pipeline_get(&mut self, urls: Vec<&str>) -> Result<Vec<HttpResponse>, io::Error> {
+        let requests: Vec<HttpRequest> = urls.into_iter().map(|url| HttpRequest::new(
+            HttpMethod::GET, url)
+        ).collect();
+
+        self.send_pipelined(requests)
+    }
+
+    fn get_or_create_http1_connection(&mut self, host: &str, port: u16) -> Result<Http1ConnectionEntry, io::Error> {
+        let connection_key = format!("{}:{}", host, port);
+        if let Some(mut conn) = self.http1_connections.remove(&connection_key) {
+            if !conn.should_close() && conn.is_healthy() {
+                return Ok(conn);
+            }
+        }
+
+        let addr = format!("{}:{}", host, port);
+        let stream = TcpStream::connect(&addr)?;
+        stream.set_nodelay(true)?;
+
+        Ok(Http1ConnectionEntry::new(stream, host.to_string(), port))
+    }
+
+    pub fn set_pipelining(&mut self, enable: bool) {
+        self.enable_pipelining = enable;
+    }
+
+    pub fn set_max_pipeline_depth(&mut self, depth: usize) {
+        for conn in self.http1_connections.values_mut() {
+            conn.max_pipeline_depth = depth;
+        }
     }
 
     fn read_response<R: BufRead>(&self, reader: &mut R) -> Result<HttpResponse, io::Error> {
