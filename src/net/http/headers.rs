@@ -104,6 +104,30 @@ impl Headers {
             (k, v.join(", "))
         }).collect()
     }
+
+    pub fn ensure_keep_alive(&mut self) {
+        if !self.contains("connection") {
+            self.insert("Connection", "keep-alive");
+        }
+    }
+
+    pub fn has_keep_alive(&self) -> bool {
+        self.get("connection").map(|v| v.to_lowercase().contains("keep-alive")).unwrap_or(false)
+    }
+
+    pub fn set_connection_type(&mut self, connection_type: &str) {
+        self.insert("Connection", connection_type);
+    }
+
+    pub fn connection_type(&self) -> String {
+        self.get("connection").unwrap_or("keep-alive").to_string()
+    }
+
+    pub fn clone_for_connection(&self) -> Self {
+        let mut new_headers = self.clone();
+        new_headers.ensure_keep_alive();
+        new_headers
+    }
 }
 
 impl Default for Headers {

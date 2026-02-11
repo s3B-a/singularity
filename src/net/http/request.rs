@@ -198,6 +198,62 @@ impl HttpRequest {
     pub fn set_accept_charset(&mut self, charsets: Vec<String>) {
         self.headers.insert("Accept-Charset", charsets.join(", "));
     }
+
+    pub fn with_keep_alive(mut self) -> Self {
+        self.headers.insert("Connection", "keep-alive");
+        self
+    }
+
+    pub fn without_keep_alive(mut self) -> Self {
+        self.headers.insert("Connection", "close");
+        self
+    }
+
+    pub fn wants_keep_alive(&self) -> bool {
+        self.headers.get("connection").map(|v| !v.to_lowercase().contains("close")).unwrap_or(true)
+    }
+
+    pub fn set_connection(&mut self, keep_alive: bool) {
+        if keep_alive {
+            self.headers.insert("Connection", "keep-alive");
+        } else {
+            self.headers.insert("Connection", "close");
+        }
+    }
+
+    pub fn build_with_defaults(&self, host: &str) -> Vec<u8> {
+        let mut request = String::new();
+        request.push_str(&format!("{} {} {}\r\n", self.method.as_str(), self.path, self.version.as_str()));
+
+        let mut headers = self.headers.clone();
+        if !headers.contains("Host") {
+            headers.insert("Host", host);
+        }
+
+        if !headers.contains("User-Agent") {
+            headers.insert("User-Agent", "Singularity/0.0.1");
+        }
+
+        if !headers.contains("Accept") {
+            headers.insert("Accept", "*/*");
+        }
+
+        if !headers.contains("Connection") {
+            headers.insert("Connection", "keep-alive");
+        }
+
+        if !self.body.is_empty() && !headers.contains("Content-Length") {
+            headers.insert("Content-Length", self.body.len().to_string());
+        }
+
+        request.push_str(&headers.format());
+        request.push_str("\r\n");
+
+        let mut bytes = request.into_bytes();
+        bytes.extend_from_slice(&self.body);
+
+        bytes
+    }
 }
 
 impl fmt::Debug for HttpRequest {
@@ -235,5 +291,20 @@ impl RequestBuilder {
 
     pub fn build(self) -> HttpRequest {
         self.request
+    }
+
+    pub fn keep_alive(mut self, enable: bool) -> Self {
+        if enable {
+            self.request.headers_mut().insert("Connection", "keep-alive");
+        } else {
+            self.request.headers_mut().insert("Connection", "close");
+        }
+        
+        self
+    }
+
+    pub fn connection(mut self, connection_type: impl Into<String>) -> Self {
+        self.request.headers_mut().insert("Connection", connection_type);
+        self
     }
 }

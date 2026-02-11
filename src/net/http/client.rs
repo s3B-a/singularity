@@ -6,6 +6,7 @@ use super::response::HttpResponse;
 use crate::net::tcp::TcpStream;
 use crate::net::cookie::{CookieJar, Cookie, parse_set_cookie};
 use crate::net::dns::DnsResolver;
+use crate::net::connection_pool::ConnectionPool;
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::io::{self, BufRead, BufReader, Read};
@@ -612,6 +613,30 @@ impl HttpClientBuilder {
         self.client.default_headers.insert("Accept-Charset".to_string(), charsets.join(", "));
         self
     }
+
+    pub fn connection_pool_cfg(mut self, max_idle: usize, idle_timeout: Duration, max_age: Duration) -> Self {
+        self.client.connection_pool = ConnectionPool::with_limits(max_idle, idle_timeout, max_age, 100);
+        self
+    }
+
+    pub fn connection_timeout(self, timeout: Duration) -> Self {
+        self.timeout(timeout)
+    }
+
+    pub fn idle_timeout(mut self, timeout: Duration) -> Self {
+        self.client.idle_timeout = timeout;
+        self
+    }
+
+    pub fn keep_alive(self, _enable: bool) -> Self {
+        // Keep-alive is always enabled, this method is for API compatibility only
+        self
+    }
+
+    pub fn max_connections(mut self, max: usize) -> Self {
+        self.client.max_connections_per_host = max;
+        self
+    }
 }
 
 pub struct HttpClient {
@@ -632,6 +657,7 @@ pub struct HttpClient {
     cookie_jar: CookieJar,
     enable_cookies: bool,
     dns_resolver: DnsResolver,
+    connection_pool: ConnectionPool,
     next_request_id: u64,
     pipeline_requests: HashMap<String, VecDeque<(u64, HttpRequest)>>,
     version_cache: HashMap<String, HttpVersion>,
@@ -659,6 +685,7 @@ impl HttpClient {
             cookie_jar: CookieJar::new(),
             enable_cookies: true,
             dns_resolver: DnsResolver::new(),
+            connection_pool: ConnectionPool::new(),
             next_request_id: 0,
             pipeline_requests: HashMap::new(),
             version_cache: HashMap::new(),
@@ -1628,6 +1655,61 @@ impl HttpClient {
 
         infos
     }
+
+    pub fn request(&mut self, method: HttpMethod, url: &str) -> Result<HttpResponse, io::Error> {
+        let request = HttpRequest::new(method, url);
+        self.execute(request)
+    }
+
+    pub fn simple_request(&mut self, method: &str, url: &str, body: Option<Vec<u8>>) -> Result<HttpResponse, io::Error> {
+        let http_method = HttpMethod::from_str(method).ok_or_else(|| io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("Invalid HTTP method: {}", method),
+        ));
+        
+        let mut request = HttpRequest::new(http_method?, url);
+        if let Some(body_data) = body {
+            request.set_body(body_data);
+        }
+
+        self.execute(request)
+    }
+
+    pub fn cleanup_old_connections(&mut self) {
+        self.cleanup_idle_connections();
+    }
+
+    pub fn active_connections(&self) -> usize {
+        self.http1_connections.len() + self.http2_connections.len()
+    }
+
+    pub fn has_connection(&self, host: &str, port: u16) -> bool {
+        let key = format!("{}:{}", host, port);
+        self.http1_connections.contains_key(&key) || self.http2_connections.contains_key(&key)
+    }
+
+    pub fn close_connection(&mut self, host: &str, port: u16) -> Result<(), io::Error> {
+        let key = format!("{}:{}", host, port);
+        if let Some(mut entry) = self.http1_connections.remove(&key) {
+            let _ = entry.stream.shutdown(std::net::Shutdown::Both);
+        }
+
+        if let Some(mut entry) = self.http2_connections.remove(&key) {
+            let _ = entry.connection.close();
+        }
+
+        Ok(())
+    }
+
+    pub fn set_keep_alive(&mut self, _enable: bool) {
+        // Keep-alive is always enabled by default in the implementation
+        // This method exists for backward compatibility but doesn't change behavior
+        // No implementation is needed since keep-alive is the default and shouldn't be disabled
+    }
+
+    pub fn is_keep_alive(&self) -> bool {
+        true // Keep-alive is default and always enabled
+    }
 }
 
 impl Default for HttpClient {
@@ -1639,6 +1721,34 @@ impl Default for HttpClient {
 impl Default for HttpClientBuilder {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl std::fmt::Display for Http1ConnectionEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Http1Connection {{ host: {}:{}, requests: {}, age: {:?}, idle: {:?} }}",
+            self.host,
+            self.port,
+            self.requests_made,
+            self.age(),
+            self.last_used.elapsed()
+        )
+    }
+}
+
+impl std::fmt::Display for Http2ConnectionEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Http2Connection {{ host: {}:{}, streams: {}/{}, idle: {:?} }}",
+            self.host,
+            self.port,
+            self.active_stream_count(),
+            self.max_concurrent_streams,
+            self.last_used.elapsed()
+        )
     }
 }
 

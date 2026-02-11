@@ -1,6 +1,7 @@
 use std::io::{Read, Write};
 use std::time::Duration;
 use crate::net::tcp::TcpStream;
+use crate::net::connection_pool::ConnectionPool;
 use crate::net::http::{HttpRequest, HttpResponse, HttpMethod, headers::Headers};
 use crate::net::https::tls::{TlsStream, TlsCfg, TlsError};
 use crate::url::Url;
@@ -37,7 +38,7 @@ impl Default for HttpsClientCfg {
             timeout: Duration::from_secs(30),
             follow_redirect: true,
             max_redirects: 10,
-            user_agent: "Singularity/0.0.1".to_string(),
+            user_agent: "Singularity/Beta-0.0.1".to_string(),
             default_headers,
         }
     }
@@ -45,46 +46,50 @@ impl Default for HttpsClientCfg {
 
 pub struct HttpsClient {
     cfg: HttpsClientCfg,
+    connection_pool: ConnectionPool,
 }
 
 impl HttpsClient {
     pub fn new(cfg: HttpsClientCfg) -> Self {
-        HttpsClient { cfg }
+        HttpsClient {
+            cfg,
+            connection_pool: ConnectionPool::with_limits(5, Duration::from_secs(90), Duration::from_secs(600), 100),
+        }
     }
 
-    pub fn get(&self, url: &str) -> Result<HttpResponse, HttpsError> {
+    pub fn get(&mut self, url: &str) -> Result<HttpResponse, HttpsError> {
         self.request(HttpMethod::GET, url, None, None)
     }
 
-    pub fn post(&self, url: &str, body: Vec<u8>) -> Result<HttpResponse, HttpsError> {
+    pub fn post(&mut self, url: &str, body: Vec<u8>) -> Result<HttpResponse, HttpsError> {
         self.request(HttpMethod::POST, url, Some(body), None)
     }
 
-    pub fn put(&self, url: &str, body: Vec<u8>) -> Result<HttpResponse, HttpsError> {
+    pub fn put(&mut self, url: &str, body: Vec<u8>) -> Result<HttpResponse, HttpsError> {
         self.request(HttpMethod::PUT, url, Some(body), None)
     }
 
-    pub fn delete(&self, url: &str) -> Result<HttpResponse, HttpsError> {
+    pub fn delete(&mut self, url: &str) -> Result<HttpResponse, HttpsError> {
         self.request(HttpMethod::DELETE, url, None, None)
     }
 
-    pub fn head(&self, url: &str) -> Result<HttpResponse, HttpsError> {
+    pub fn head(&mut self, url: &str) -> Result<HttpResponse, HttpsError> {
         self.request(HttpMethod::HEAD, url, None, None)
     }
 
-    pub fn options(&self, url: &str) -> Result<HttpResponse, HttpsError> {
+    pub fn options(&mut self, url: &str) -> Result<HttpResponse, HttpsError> {
         self.request(HttpMethod::OPTIONS, url, None, None)
     }
 
-    pub fn patch(&self, url: &str, body: Vec<u8>) -> Result<HttpResponse, HttpsError> {
+    pub fn patch(&mut self, url: &str, body: Vec<u8>) -> Result<HttpResponse, HttpsError> {
         self.request(HttpMethod::PATCH, url, Some(body), None)
     }
 
-    pub fn request(&self, method: HttpMethod, url: &str, body: Option<Vec<u8>>, headers: Option<Headers>) -> Result<HttpResponse, HttpsError> {
+    pub fn request(&mut self, method: HttpMethod, url: &str, body: Option<Vec<u8>>, headers: Option<Headers>) -> Result<HttpResponse, HttpsError> {
         self.request_with_redirects(method, url, body, headers, 0)
     }
 
-    fn request_with_redirects(&self, method: HttpMethod, url: &str, body: Option<Vec<u8>>, headers: Option<Headers>, redirect_count: usize) -> Result<HttpResponse, HttpsError> {
+    fn request_with_redirects(&mut self, method: HttpMethod, url: &str, body: Option<Vec<u8>>, headers: Option<Headers>, redirect_count: usize) -> Result<HttpResponse, HttpsError> {
         if redirect_count > self.cfg.max_redirects {
             return Err(HttpsError::InvalidResponse("Maximum redirects exceeded".to_string()));
         }
@@ -130,7 +135,7 @@ impl HttpsClient {
         }
 
         let addr = format!("{}:{}", host, port);
-        let tcp_stream = TcpStream::connect(&addr).map_err(|e| HttpsError::ConnectionFailed(format!("Failed to connect to {}: {}", addr, e)))?;
+        let tcp_stream = self.connection_pool.get_or_connect(host, port).map_err(|e| HttpsError::ConnectionFailed(format!("Failed to connect to {}: {}", addr, e)))?;
         let timeout = self.cfg.timeout;
         tcp_stream.set_read_timeout(Some(timeout))?;
         tcp_stream.set_write_timeout(Some(timeout))?;
@@ -278,7 +283,7 @@ mod tests {
     #[test]
     fn test_https_client_creation() {
         let client = HttpsClient::default();
-        assert_eq!(client.cfg.user_agent, "Singularity/0.0.1");
+        assert_eq!(client.cfg.user_agent, "Singularity/Beta-0.0.1");
         assert!(client.cfg.follow_redirect);
         assert_eq!(client.cfg.max_redirects, 10);
     }
@@ -298,7 +303,7 @@ mod tests {
 
     #[test]
     fn test_invalid_url_scheme() {
-        let client = HttpsClient::default();
+        let mut client = HttpsClient::default();
         let result = client.get("http://example.com");
         assert!(result.is_err());
         if let Err(HttpsError::InvalidUrl(msg)) = result {
