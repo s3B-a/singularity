@@ -166,6 +166,38 @@ impl HttpRequest {
             body,
         })
     }
+
+    pub fn accept(&self) -> Option<&str> {
+        self.headers.get("Accept")
+    }
+    
+    pub fn accept_language(&self) -> Option<&str> {
+        self.headers.get("Accept-Language")
+    }
+    
+    pub fn accept_encoding(&self) -> Option<&str> {
+        self.headers.get("Accept-Encoding")
+    }
+    
+    pub fn accept_charset(&self) -> Option<&str> {
+        self.headers.get("Accept-Charset")
+    }
+    
+    pub fn set_accept(&mut self, media_types: Vec<String>) {
+        self.headers.insert("Accept", media_types.join(", "));
+    }
+    
+    pub fn set_accept_language(&mut self, languages: Vec<String>) {
+        self.headers.insert("Accept-Language", languages.join(", "));
+    }
+    
+    pub fn set_accept_encoding(&mut self, encodings: Vec<String>) {
+        self.headers.insert("Accept-Encoding", encodings.join(", "));
+    }
+    
+    pub fn set_accept_charset(&mut self, charsets: Vec<String>) {
+        self.headers.insert("Accept-Charset", charsets.join(", "));
+    }
 }
 
 impl fmt::Debug for HttpRequest {

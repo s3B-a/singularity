@@ -1,4 +1,5 @@
 use super::{HttpRequest, HttpResponse, HttpMethod, HttpVersion};
+use super::negotiation::ContentNegotiator;
 use crate::net::tcp::{TcpListener, TcpStream};
 use std::io::{Read, BufRead, BufReader};
 use std::net::SocketAddr;
@@ -307,6 +308,30 @@ impl HttpServer {
             },
             body.into_bytes(),
         )
+    }
+
+    pub fn negotiate_content_type(request: &HttpRequest, available: &[&str]) -> Option<String> {
+        if let Some(accept) = request.accept() {
+            ContentNegotiator::negotiate_media_type(accept, available)
+        } else {
+            available.first().map(|s| s.to_string())
+        }
+    }
+    
+    pub fn negotiate_language(request: &HttpRequest, available: &[&str]) -> Option<String> {
+        if let Some(accept_lang) = request.accept_language() {
+            ContentNegotiator::negotiate_language(accept_lang, available)
+        } else {
+            available.first().map(|s| s.to_string())
+        }
+    }
+    
+    pub fn negotiate_encoding(request: &HttpRequest, available: &[&str]) -> Option<String> {
+        if let Some(accept_enc) = request.accept_encoding() {
+            ContentNegotiator::negotiate_encoding(accept_enc, available)
+        } else {
+            Some("identity".to_string())
+        }
     }
 }
 

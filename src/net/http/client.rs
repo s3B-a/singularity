@@ -592,6 +592,26 @@ impl HttpClientBuilder {
     pub fn build(self) -> HttpClient {
         self.client
     }
+
+    pub fn accept(mut self, media_types: Vec<String>) -> Self {
+        self.client.default_headers.insert("Accept".to_string(), media_types.join(", "));
+        self
+    }
+
+    pub fn accept_language(mut self, languages: Vec<String>) -> Self {
+        self.client.default_headers.insert("Accept-Language".to_string(), languages.join(", "));
+        self
+    }
+
+    pub fn accept_encoding(mut self, encodings: Vec<String>) -> Self {
+        self.client.default_headers.insert("Accept-Encoding".to_string(), encodings.join(", "));
+        self
+    }
+
+    pub fn accept_charset(mut self, charsets: Vec<String>) -> Self {
+        self.client.default_headers.insert("Accept-Charset".to_string(), charsets.join(", "));
+        self
+    }
 }
 
 pub struct HttpClient {
@@ -714,6 +734,22 @@ impl HttpClient {
     pub fn with_dns_servers(self, servers: Vec<SocketAddr>) -> Self {
         self.dns_resolver.set_servers(servers);
         self
+    }
+
+    pub fn set_accept(&mut self, media_types: Vec<String>) {
+        self.default_headers.insert("Accept".to_string(), media_types.join(", "));
+    }
+
+    pub fn set_accept_language(&mut self, languages: Vec<String>) {
+        self.default_headers.insert("Accept-Language".to_string(), languages.join(", "));
+    }
+    
+    pub fn set_accept_encoding(&mut self, encodings: Vec<String>) {
+        self.default_headers.insert("Accept-Encoding".to_string(), encodings.join(", "));
+    }
+
+    pub fn set_accept_charset(&mut self, charsets: Vec<String>) {
+        self.default_headers.insert("Accept-Charset".to_string(), charsets.join(", "));
     }
 
     pub fn send(&self, request: &HttpRequest) -> Result<HttpResponse, io::Error> {
