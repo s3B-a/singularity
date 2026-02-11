@@ -220,6 +220,22 @@ impl HttpResponse {
         }
         .to_string()
     }
+
+    pub fn wants_keep_alive(&self) -> bool {
+        self.headers.get("Connection").map(|v| !v.to_lowercase().contains("close")).unwrap_or_else(|| {
+                self.version == HttpVersion::Http11 || 
+                self.version == HttpVersion::Http2 ||
+                self.version == HttpVersion::Http3
+            })
+    }
+
+    pub fn connection_type(&self) -> String {
+        self.headers.get("Connection").unwrap_or(&"keep-alive".to_string()).clone()
+    }
+
+    pub fn should_close_connection(&self) -> bool {
+        self.headers.get("Connection").map(|v| v.to_lowercase().contains("close")).unwrap_or(false)
+    }
 }
 
 impl std::fmt::Debug for HttpResponse {
