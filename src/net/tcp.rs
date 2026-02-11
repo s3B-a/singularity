@@ -36,6 +36,14 @@ impl TcpListener {
         })
     }
 
+    pub fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
+        self.socket.set_nonblocking(nonblocking)
+    }
+
+    pub fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        self.socket.set_read_timeout(timeout)
+    }
+
     pub fn incoming(&self) -> impl Iterator<Item = io::Result<TcpStream>> + '_ {
         std::iter::repeat_with(move || self.accept().map(|(stream, _)| stream))
     }
@@ -128,6 +136,13 @@ impl TcpStream {
 
     pub fn set_nodelay(&self, nodelay: bool) -> io::Result<()> {
         self.socket.set_nodelay(nodelay)
+    }
+
+    pub fn try_clone(&self) -> io::Result<Self> {
+        Ok(Self {
+            socket: self.socket.try_clone()?,
+            reader: BufReader::new(self.socket.try_clone()?),
+        })
     }
 }
 

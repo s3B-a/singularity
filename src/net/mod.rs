@@ -13,6 +13,8 @@ pub mod https;
 pub use tcp::TcpStream;
 pub use udp::UdpSocket;
 pub use http::HttpClient;
+pub use http::HttpServer;
+pub use https::HttpsServer;
 pub use dns::DnsResolver;
 pub use cookie::CookieJar;
 

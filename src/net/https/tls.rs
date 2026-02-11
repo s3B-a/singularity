@@ -1338,6 +1338,38 @@ impl TlsStream {
 
         Ok(())
     }
+
+    pub fn set_read_timeout(&self, dur: Option<std::time::Duration>) -> Result<(), TlsError> {
+        self.stream.set_read_timeout(dur)?;
+        Ok(())
+    }
+
+    pub fn set_write_timeout(&self, dur: Option<std::time::Duration>) -> Result<(), TlsError> {
+        self.stream.set_write_timeout(dur)?;
+        Ok(())
+    }
+
+    pub fn try_clone(&self) -> Result<TlsStream, TlsError> {
+        let cloned_stream = self.stream.try_clone()?;
+        Ok(TlsStream {
+            stream: cloned_stream,
+            config: self.config.clone(),
+            state: self.state,
+            is_client: self.is_client,
+            buffer: Vec::new(),
+            session_id: self.session_id.clone(),
+            server_name: self.server_name.clone(),
+            cipher_suite: self.cipher_suite,
+            version: self.version,
+            keys: None,
+            client_cipher: None,
+            server_cipher: None,
+            client_seq: 0,
+            server_seq: 0,
+            handshake_msg: Vec::new(),
+            resuming_session: self.resuming_session,
+        })
+    }
 }
 
 impl Default for TlsCfg {

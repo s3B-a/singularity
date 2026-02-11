@@ -54,6 +54,10 @@ impl Socket {
         self.inner.set_nodelay(nodelay)
     }
 
+    pub fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
+        self.inner.set_nonblocking(nonblocking)
+    }
+
     pub fn peer_addr(&self) -> io::Result<SocketAddr> {
         self.inner.peer_addr()
     }

@@ -3,6 +3,7 @@ use crate::net::http::method::HttpMethod;
 use crate::net::http::version::HttpVersion;
 use std::fmt;
 
+#[derive(Clone)]
 pub struct HttpRequest {
     method: HttpMethod,
     path: String,
