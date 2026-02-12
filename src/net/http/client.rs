@@ -1,3 +1,4 @@
+use super::auth::{Authenticator, Credentials, AuthChallenge};
 use super::http2::Http2Connection;
 use super::method::HttpMethod;
 use super::version::HttpVersion;
@@ -31,6 +32,13 @@ pub struct ConnectionInfo {
     pub age: Duration,
     pub is_http2: bool,
     pub requests_made: usize,
+}
+
+#[derive(Clone)]
+struct CachedChallenge {
+    challenge: AuthChallenge,
+    cached_at: Instant,
+    url_pattern: String,
 }
 
 #[derive(Clone)]
@@ -637,6 +645,26 @@ impl HttpClientBuilder {
         self.client.max_connections_per_host = max;
         self
     }
+
+    pub fn credentials(mut self, username: impl Into<String>, password: impl Into<String>) -> Self {
+        self.client.set_credentials(username, password);
+        self
+    }
+    
+    pub fn auto_auth(mut self, enable: bool) -> Self {
+        self.client.set_auto_auth(enable);
+        self
+    }
+
+    pub fn challenge_cache_ttl(mut self, ttl: Duration) -> Self {
+        self.client.challenge_cache_ttl = ttl;
+        self
+    }
+    
+    pub fn disable_challenge_cache(mut self) -> Self {
+        self.client.challenge_cache_ttl = Duration::from_secs(0);
+        self
+    }
 }
 
 pub struct HttpClient {
@@ -663,6 +691,10 @@ pub struct HttpClient {
     version_cache: HashMap<String, HttpVersion>,
     alt_svc_cache: HashMap<String, Vec<(HttpVersion, String, u16)>>,
     enable_version_negotiation: bool,
+    authenticator: Authenticator,
+    auto_auth: bool,
+    challenge_cache: HashMap<String, CachedChallenge>,
+    challenge_cache_ttl: Duration,
 }
 
 impl HttpClient {
@@ -691,6 +723,10 @@ impl HttpClient {
             version_cache: HashMap::new(),
             alt_svc_cache: HashMap::new(),
             enable_version_negotiation: true,
+            authenticator: Authenticator::new(),
+            auto_auth: true,
+            challenge_cache: HashMap::new(),
+            challenge_cache_ttl: Duration::from_secs(300),
         }
     }
 
@@ -777,6 +813,180 @@ impl HttpClient {
 
     pub fn set_accept_charset(&mut self, charsets: Vec<String>) {
         self.default_headers.insert("Accept-Charset".to_string(), charsets.join(", "));
+    }
+
+    pub fn set_credentials(&mut self, username: impl Into<String>, password: impl Into<String>) {
+        self.authenticator.set_credentials(Credentials::new(username, password));
+    }
+    
+    pub fn set_auto_auth(&mut self, enable: bool) {
+        self.auto_auth = enable;
+    }
+    
+    pub fn auth_execute(&mut self, mut request: HttpRequest) -> io::Result<HttpResponse> {
+        let url = self.build_full_url(&request)?;
+        let response = self.send_request(&request, &url)?;
+        if response.status_code() == 401 && self.auto_auth {
+            if let Some(www_auth) = response.header("WWW-Authenticate") {
+                if let Ok(challenge) = AuthChallenge::parse(www_auth) {
+                    self.cache_challenge(&url, &challenge);
+                    
+                    let (_, _, _, path) = parse_url(&url)?;
+                    let method_str = request.method().as_str();
+                    let body = if !request.body_bytes().is_empty() {
+                        Some(request.body_bytes())
+                    } else {
+                        None
+                    };
+                    
+                    if let Ok(auth_header) = self.authenticator.authorize_with_body(
+                        &challenge,
+                        method_str,
+                        &path,
+                        body,
+                    ) {
+                        request.set_header("Authorization", auth_header);
+                        return self.send_request(&request, &url);
+                    }
+                }
+            }
+        }
+        
+        Ok(response)
+    }
+    
+    pub fn preauth_request(&mut self, mut request: HttpRequest, scheme: &str) -> io::Result<HttpRequest> {
+        let url = self.build_full_url(&request)?;
+        let (_, _, _, path) = parse_url(&url)?;
+        let method_str = request.method().as_str();
+        if scheme.to_lowercase() == "basic" {
+            if let Ok(auth_header) = self.authenticator.authorize(
+                &AuthChallenge::Basic { realm: "".to_string() },
+                method_str,
+                &path,
+            ) {
+                request.set_header("Authorization", auth_header);
+            }
+        } else if scheme.to_lowercase() == "digest" {
+            if let Some(cached_challenge) = self.get_cached_challenge(&url) {
+                let body = if !request.body_bytes().is_empty() {
+                    Some(request.body_bytes())
+                } else {
+                    None
+                };
+                
+                if let Ok(auth_header) = self.authenticator.authorize_with_body(
+                    &cached_challenge,
+                    method_str,
+                    &path,
+                    body,
+                ) {
+                    request.set_header("Authorization", auth_header);
+                } else {
+                    eprintln!("Failed to generate auth header from cached challenge");
+                }
+            } else {
+                eprintln!("Warning: No cached Digest challenge available for {}", url);
+            }
+        }
+        
+        Ok(request)
+    }
+
+    fn build_full_url(&self, request: &HttpRequest) -> io::Result<String> {
+        let path = request.path();
+        
+        if path.starts_with("http://") || path.starts_with("https://") {
+            return Ok(path.to_string());
+        }
+        
+        if let Some(host) = request.headers().get("host") {
+            let scheme = if self.preferred_version == HttpVersion::Http2 || 
+                           self.preferred_version == HttpVersion::Http3 {
+                "https"
+            } else {
+                "http"
+            };
+            
+            Ok(format!("{}://{}{}", scheme, host, path))
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Cannot build full URL: missing Host header"
+            ))
+        }
+    }
+
+    fn cache_challenge(&mut self, url: &str, challenge: &AuthChallenge) {
+        let cache_key = self.extract_realm_key(url, challenge);
+        
+        self.challenge_cache.insert(
+            cache_key,
+            CachedChallenge {
+                challenge: challenge.clone(),
+                cached_at: Instant::now(),
+                url_pattern: self.extract_url_pattern(url),
+            },
+        );
+    }
+    
+    fn get_cached_challenge(&mut self, url: &str) -> Option<AuthChallenge> {
+        self.cleanup_expired_challenges();
+        let cache_key = self.extract_cache_key_from_url(url);
+        if let Some(cached) = self.challenge_cache.get(&cache_key) {
+            if cached.cached_at.elapsed() < self.challenge_cache_ttl {
+                return Some(cached.challenge.clone());
+            }
+        }
+        
+        for (_, cached) in self.challenge_cache.iter() {
+            if self.url_matches_pattern(url, &cached.url_pattern) {
+                if cached.cached_at.elapsed() < self.challenge_cache_ttl {
+                    return Some(cached.challenge.clone());
+                }
+            }
+        }
+        
+        None
+    }
+    
+    fn extract_realm_key(&self, url: &str, challenge: &AuthChallenge) -> String {
+        let (scheme, host, port, _) = parse_url(url).unwrap_or_default();
+        let realm = match challenge {
+            AuthChallenge::Basic { realm } => realm.as_str(),
+            AuthChallenge::Digest(digest) => digest.realm.as_str(),
+        };
+        
+        format!("{}:{}:{}:{}", scheme, host, port, realm)
+    }
+    
+    fn extract_cache_key_from_url(&self, url: &str) -> String {
+        let (scheme, host, port, _) = parse_url(url).unwrap_or_default();
+        format!("{}:{}:{}", scheme, host, port)
+    }
+    
+    fn extract_url_pattern(&self, url: &str) -> String {
+        let (scheme, host, port, _) = parse_url(url).unwrap_or_default();
+        format!("{}://{}:{}", scheme, host, port)
+    }
+    
+    fn url_matches_pattern(&self, url: &str, pattern: &str) -> bool {
+        url.starts_with(pattern)
+    }
+    
+    fn cleanup_expired_challenges(&mut self) {
+        let ttl = self.challenge_cache_ttl;
+        self.challenge_cache.retain(|_, cached| {
+            cached.cached_at.elapsed() < ttl
+        });
+    }
+    
+    pub fn clear_challenge_cache(&mut self) {
+        self.challenge_cache.clear();
+    }
+    
+    pub fn set_challenge_cache_ttl(&mut self, ttl: Duration) {
+        self.challenge_cache_ttl = ttl;
     }
 
     pub fn send(&self, request: &HttpRequest) -> Result<HttpResponse, io::Error> {
@@ -982,6 +1192,147 @@ impl HttpClient {
             version,
             headers,
             body,
+        ))
+    }
+
+    fn send_request(&mut self, request: &HttpRequest, url: &str) -> io::Result<HttpResponse> {
+        let (scheme, host, port, path) = parse_url(url)?;
+        
+        let use_http2 = scheme == "https" && 
+                       (self.preferred_version == HttpVersion::Http2 || 
+                        self.enable_version_negotiation);
+        
+        if use_http2 {
+            match self.send_http2_request(request, &host, port, &path) {
+                Ok(response) => return Ok(response),
+                Err(e) => {
+                    eprintln!("HTTP/2 failed, falling back to HTTP/1.1: {}", e);
+                }
+            }
+        }
+        
+        self.send_http1_request(request, &host, port, &path)
+    }
+
+    fn send_http1_request(&mut self, request: &HttpRequest, host: &str, port: u16, path: &str) -> io::Result<HttpResponse> {
+        let connection_key = format!("{}:{}", host, port);
+        let mut conn = if let Some(existing) = self.http1_connections.remove(&connection_key) {
+            if existing.is_stale(self.idle_timeout) || existing.should_close() {
+                self.create_http1_connection(host, port)?
+            } else {
+                existing
+            }
+        } else {
+            self.create_http1_connection(host, port)?
+        };
+        
+        let mut modified_request = request.clone();
+        modified_request.headers_mut().insert("Host", host);
+        if request.path() != path {
+            modified_request = HttpRequest::new(request.method(), path);
+            for (key, values) in request.headers().iter() {
+                for value in values {
+                    modified_request.headers_mut().append(key.clone(), value.clone());
+                }
+            }
+            modified_request.set_body(request.body_bytes().to_vec());
+        }
+        
+        if self.enable_pipelining || modified_request.wants_keep_alive() {
+            modified_request.headers_mut().insert("Connection", "keep-alive");
+        }
+        
+        let request_bytes = modified_request.build(host);
+        conn.stream.write_all(&request_bytes)?;
+        conn.stream.flush()?;
+        let response = self.read_http1_response(&mut conn.stream)?;
+        
+        conn.mark_used();
+        if response.wants_keep_alive() && !conn.should_close() {
+            self.http1_connections.insert(connection_key, conn);
+        }
+        
+        Ok(response)
+    }
+    
+    fn send_http2_request(&mut self, request: &HttpRequest, host: &str, port: u16, path: &str) -> io::Result<HttpResponse> {
+        let connection_key = format!("{}:{}", host, port);
+        
+        let conn = if let Some(existing) = self.http2_connections.get_mut(&connection_key) {
+            existing
+        } else {
+            let tcp_stream = self.connection_pool.get_or_connect(host, port)?;
+            let http2_conn = Http2Connection::new(tcp_stream)
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            
+            let mut entry = Http2ConnectionEntry::new(
+                http2_conn,
+                host.to_string(),
+                port
+            );
+            
+            entry.connection.handshake()
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            
+            self.http2_connections.insert(connection_key.clone(), entry);
+            self.http2_connections.get_mut(&connection_key).unwrap()
+        };
+        
+        let stream_id = conn.create_tracked_stream(path.to_string())?;
+        let mut headers = vec![
+            (":method".to_string(), request.method().as_str().to_string()),
+            (":path".to_string(), path.to_string()),
+            (":scheme".to_string(), "https".to_string()),
+            (":authority".to_string(), host.to_string()),
+        ];
+        
+        for (key, values) in request.headers().iter() {
+            for value in values {
+                headers.push((key.to_lowercase(), value.clone()));
+            }
+        }
+        
+        conn.connection.send_request(stream_id, headers, Some(request.body_bytes().to_vec()))
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        
+        let (response_headers, body) = conn.receive_response_with_timeout(
+            stream_id,
+            self.timeout.unwrap_or(Duration::from_secs(30))
+        )?;
+        
+        conn.remove_stream(stream_id);
+        let status_code = response_headers.get(":status")
+            .and_then(|s| s.parse::<u16>().ok())
+            .unwrap_or(500);
+        
+        let reason = HttpResponse::default_reason_phrase(status_code);
+        
+        let mut headers_map = HashMap::new();
+        for (key, value) in response_headers {
+            if !key.starts_with(':') {
+                headers_map.insert(key, value);
+            }
+        }
+        
+        Ok(HttpResponse::new(
+            status_code,
+            reason,
+            HttpVersion::Http2,
+            headers_map,
+            body
+        ))
+    }
+    
+    fn create_http1_connection(&self, host: &str, port: u16) -> io::Result<Http1ConnectionEntry> {
+        let tcp_stream = self.connection_pool.get_or_connect(host, port)?;
+        
+        tcp_stream.set_read_timeout(self.timeout)?;
+        tcp_stream.set_write_timeout(self.timeout)?;
+        
+        Ok(Http1ConnectionEntry::new(
+            tcp_stream,
+            host.to_string(),
+            port
         ))
     }
 
@@ -1253,8 +1604,7 @@ impl HttpClient {
                     stream.flush()?;
                 } else if status >= 400 {
                     drop(reader);
-                    let reader = BufReader::new(stream);
-                    return self.read_http1_response(reader, host.clone(), port, connection_key, use_keep_alive);
+                    return self.read_http1_response(&mut stream);
                 }
             }
         } else {
@@ -1266,110 +1616,61 @@ impl HttpClient {
             stream.flush()?;
         }
 
-        let reader = BufReader::new(stream);
-        self.read_http1_response(reader, host, port, connection_key, use_keep_alive)
+        self.read_http1_response(&mut stream)
     }
 
-    fn read_http1_response(&mut self, mut reader: BufReader<TcpStream>, host: String, port: u16, connection_key: String, requested_keep_alive: bool) -> Result<HttpResponse, io::Error> {
+    fn read_http1_response(&self, stream: &mut TcpStream) -> io::Result<HttpResponse> {
+        let mut reader = BufReader::new(stream);
         let mut status_line = String::new();
         reader.read_line(&mut status_line)?;
-
+        
         let parts: Vec<&str> = status_line.trim().split_whitespace().collect();
-        if parts.len() < 3 {
+        if parts.len() < 2 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "Invalid status line",
+                "Invalid status line"
             ));
         }
-
-        let version = HttpVersion::from_str(parts[0]).unwrap_or(HttpVersion::Http11);
-
-        let status_code: u16 = parts[1].parse().map_err(|_| {
-            io::Error::new(io::ErrorKind::InvalidData, "Invalid status code")
-        })?;
-
-        let reason_phrase = parts[2..].join(" ");
-
+        
+        let version = HttpVersion::from_str(parts[0]).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Invalid HTTP version"))?;
+        let status_code = parts[1].parse::<u16>().map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Invalid status code"))?;
+        let reason_phrase = parts.get(2..).map(|p| p.join(" ")).unwrap_or_default();
         let mut headers = HashMap::new();
-        let mut has_trailer_header = false;
-        let mut expected_trailers: Vec<String> = Vec::new();
         loop {
             let mut line = String::new();
             reader.read_line(&mut line)?;
+            
             if line.trim().is_empty() {
                 break;
             }
-
-            if let Some(pos) = line.find(':') {
-                let key = line[..pos].trim().to_string();
-                let value = line[pos + 1..].trim().to_string();
-                if key.to_lowercase() == "trailer" {
-                    has_trailer_header = true;
-                    expected_trailers = value
-                        .split(',')
-                        .map(|s| s.trim().to_lowercase())
-                        .collect();
-                }
-                
-                headers.insert(key, value);
+            
+            if let Some((key, value)) = line.split_once(':') {
+                headers.insert(
+                    key.trim().to_lowercase(),
+                    value.trim().to_string()
+                );
             }
         }
-
-        let is_chunked = headers.get("Transfer-Encoding")
-            .map(|s| s.to_lowercase().contains("chunked"))
-            .unwrap_or(false);
-
-        let body = if let Some(content_length) = headers.get("Content-Length") {
-            let length: usize = content_length.parse().unwrap_or(0);
-            let mut body = vec![0u8; length];
+        
+        let body = if let Some(content_length_str) = headers.get("content-length") {
+            let content_length = content_length_str.parse::<usize>()
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Invalid content-length"))?;
+            
+            let mut body = vec![0u8; content_length];
             reader.read_exact(&mut body)?;
             body
-        } else if is_chunked {
+        } else if headers.get("transfer-encoding").map(|v| v.as_str()) == Some("chunked") {
             read_chunked_body(&mut reader)?
         } else {
-            let mut body = Vec::new();
-            reader.read_to_end(&mut body)?;
-            body
+            Vec::new()
         };
-
-        let mut trailer_headers = HashMap::new();
-        if is_chunked {
-            trailer_headers = self.read_trailing_headers(&mut reader, has_trailer_header, &expected_trailers)?;
-            
-            // Trailers should not override existing headers (RFC 7230 4.1.2)
-            for (key, value) in trailer_headers {
-                headers.entry(key).or_insert(value);
-            }
-        }
-
-        let server_wants_close = headers.get("Connection")
-            .map(|v| v.to_lowercase().contains("close"))
-            .unwrap_or(false);
-
-        let should_keep_alive = requested_keep_alive 
-            && !server_wants_close 
-            && version == HttpVersion::Http11
-            && self.http1_connections.len() < self.max_connections_per_host;
-
-        if should_keep_alive {
-            let stream = reader.into_inner();
-            let entry = Http1ConnectionEntry::new(stream, host.clone(), port);
-            self.http1_connections.insert(connection_key, entry);
-        }
-
-        if let Some(upgrade) = headers.get("Upgrade") {
-            if upgrade.to_lowercase().contains("h2c") {
-                let connection_key = format!("{}:{}", host, port);
-                self.version_cache.insert(connection_key, HttpVersion::Http2);
-            }
-        }
-
+        
         Ok(HttpResponse::new(
             status_code,
             reason_phrase,
             version,
             headers,
-            body,
+            body
         ))
     }
 

@@ -6,11 +6,13 @@
 pub mod sha2;
 pub mod sha3;
 pub mod hmac;
+pub mod md5;
 
 pub use sha2::{Sha224, Sha256, Sha384, Sha512, sha224, sha256, sha384, sha512};
 pub use sha3::{Sha3_224, Sha3_256, Sha3_384, Sha3_512, sha3_224, sha3_256, sha3_384, sha3_512};
 pub use sha3::{Keccak256, keccak256, Shake128, Shake256};
 pub use hmac::{Hmac, HmacSha256, HmacSha512};
+pub use md5::{Md5, md5, md5_hex, md5_str, md5_str_hex};
 
 // Trait defining common interface for hash functions
 pub trait Digest {

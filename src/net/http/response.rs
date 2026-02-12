@@ -192,7 +192,7 @@ impl HttpResponse {
         Ok(result)
     }
 
-    fn default_reason_phrase(status_code: u16) -> String {
+    pub fn default_reason_phrase(status_code: u16) -> String {
         match status_code {
             100 => "Continue",
             101 => "Switching Protocols",
