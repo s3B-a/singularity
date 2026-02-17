@@ -221,6 +221,23 @@ impl DerEncoder {
     }
 
     /**
+     * Encodes a UTC TIME value
+     * Args:
+     *    &mut self: Mutable reference to the Derencoder instance
+     *    time - &str: The UTC time string in the format "YYMMDDhhmmssZ" to encode
+     * 
+     * Returns:
+     *    &mut Self: Mutable reference to the DerEncoder instance
+     */
+    pub fn utc_time(&mut self, time: &str) -> &mut Self {
+        self.write_tag(Tag::UtcTime as u8, false);
+        self.write_length(time.len());
+        self.data.extend_from_slice(time.as_bytes());
+
+        self
+    }
+
+    /**
      * Encodes a PRINTABLE STRING value
      * Args:
      *    &mut self: Mutable reference to the DerEncoder instance
@@ -269,6 +286,23 @@ impl DerEncoder {
 
         self.write_tag(Tag::Sequence as u8, true);
         self.write_length(inner.data.len());
+        self.data.extend_from_slice(&inner.data);
+
+        self
+    }
+
+    /**
+     * Encodes a SEQUENCE value without writing the SEQUENCE tag and length (used for raw SEQUENCE content)
+     * Args:
+     *    &mut self: Mutable reference to the DerEncoder instance
+     *    f - F: A closure that takes a mutable reference to DerEncoder to encode the sequence elements
+     * 
+     * Returns:
+     *    &mut Self where F: FnOnce(&mut DerEncoder): Mutable reference to the DerEncoder instance
+     */
+    pub fn sequence_raw<F>(&mut self, f: F) -> &mut Self where F: FnOnce(&mut DerEncoder) {
+        let mut inner = DerEncoder::new();
+        f(&mut inner);
         self.data.extend_from_slice(&inner.data);
 
         self
@@ -654,6 +688,23 @@ impl<'a> DerDecoder<'a>{
     }
 
     /**
+     * Reads a UTC TIME value
+     * Args:
+     *    &mut self: Mutable reference to the DerDecoder instance
+     * 
+     * Returns:
+     *    Result<String>: The string value read or an error if reading fails
+     */
+    pub fn utc_time(&mut self) -> Result<String> {
+        let element = self.read_element()?;
+        if element.tag != Tag::UtcTime as u8 {
+            return Err(Error::CryptoError("Invalid UTC TIME element".to_string()));
+        }
+
+        String::from_utf8(element.data).map_err(|_| Error::CryptoError("Invalid UTC TIME".to_string()))
+    }
+
+    /**
      * Reads a PRINTABLE STRING value
      * Args:
      *    &mut self: Mutable reference to the DerDecoder instance
@@ -701,6 +752,26 @@ impl<'a> DerDecoder<'a>{
         let element = self.read_element()?;
         if element.tag != Tag::Sequence as u8 || !element.constructed {
             return Err(Error::CryptoError("Invalid SEQUENCE element".to_string()));
+        }
+
+        let mut inner = DerDecoder::new(&element.data);
+        f(&mut inner)
+    }
+
+    /**
+     * Reads a SEQUENCE value without expecting the SEQUENCE tag and length (used for raw SEQUENCE content)
+     * Args:
+     *    &mut self: Mutable reference to the DerDecoder instance
+     *    f - F: A closure that takes a mutable reference to DerDecoder to decode the sequence elements
+     * 
+     * Returns:
+     *    Result<T> where F: FnOnce(&mut DerDecoder) -> Result<T>: The result of the closure or an error
+     *    if reading fails
+     */
+    pub fn sequence_raw<F, T>(&mut self, f: F) -> Result<T> where F: FnOnce(&mut DerDecoder) -> Result<T> {
+        let element = self.read_element()?;
+        if !element.constructed {
+            return Err(Error::CryptoError("Expected constructed SEQUENCE content".to_string()));
         }
 
         let mut inner = DerDecoder::new(&element.data);

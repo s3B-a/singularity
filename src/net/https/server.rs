@@ -1,6 +1,8 @@
 use super::tls::{TlsStream, TlsCfg};
 use crate::net::http::{HttpRequest, HttpResponse, HttpMethod, HttpVersion};
 use crate::net::tcp::{TcpListener, TcpStream};
+use crate::net::http::http2::alpn::AlpnProtocol;
+use crate::net::http::http2::Http2Connection;
 use std::io::{Read, Write, BufRead, BufReader};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -165,6 +167,255 @@ impl HttpsServer {
                     tls_stream.write_all(&response_bytes)?;
                     tls_stream.flush()?;
                     if !config.keep_alive || request.headers().get("Connection").map(|v| v.to_lowercase().contains("close")).unwrap_or(false) {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Error parsing request from {}: {}", peer_addr, e);
+                    let err_response = Self::error_response(400, "Bad Request");
+                    let response_bytes = Self::serialize_response(&err_response);
+                    let _ = tls_stream.write_all(&response_bytes);
+                    break;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn handle_connection_with_alpn(stream: TcpStream, peer_addr: SocketAddr, config: HttpsServerCfg, handler: Option<HttpsHandler>) -> std::io::Result<()> {
+        let mut tls_stream =
+            TlsStream::new_server(stream, config.tls_config.clone())
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+
+        let negotiated_protocol = tls_stream.get_negotiated_protocol();
+
+        tls_stream
+            .set_read_timeout(Some(config.request_timeout))
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        tls_stream
+            .set_write_timeout(Some(config.request_timeout))
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+
+        match negotiated_protocol {
+            Some(AlpnProtocol::Http2) => {
+                Self::handle_http2_connection(tls_stream, peer_addr, config, handler)
+            }
+            Some(AlpnProtocol::Http11) | None => {
+                Self::handle_http1_connection(tls_stream, peer_addr, config, handler)
+            }
+            _ => {
+                eprintln!(
+                    "Unsupported protocol negotiated for {}",
+                    peer_addr
+                );
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "Unsupported protocol",
+                ))
+            }
+        }
+    }
+
+    fn handle_http2_connection(tls_stream: TlsStream, peer_addr: SocketAddr, config: HttpsServerCfg, handler: Option<HttpsHandler>) -> std::io::Result<()> {
+        let tcp_stream = tls_stream.stream_into_inner()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        let mut http2_conn = Http2Connection::new_with_alpn(tcp_stream, Some(AlpnProtocol::Http2))
+            .map_err(|e| std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("Failed to create HTTP/2 connection: {}", e),
+            ))?;
+
+        http2_conn.handshake_with_alpn(Some(AlpnProtocol::Http2))
+            .map_err(|e| std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("HTTP/2 handshake failed: {}", e),
+            ))?;
+
+        loop {
+            if http2_conn.goaway_received {
+                eprintln!("HTTP/2 GOAWAY received from peer {}", peer_addr);
+                break;
+            }
+
+            match http2_conn.receive_frames() {
+                Ok(_) => {
+                    if let Err(e) = Self::process_http2_streams(&mut http2_conn, &handler, peer_addr) {
+                        eprintln!("Error processing HTTP/2 streams: {}", e);
+                        break;
+                    }
+                }
+                Err(e) => {
+                    if e.to_string().contains("would block") {
+                        if let Err(e) = http2_conn.send_pending_data() {
+                            eprintln!("Error sending pending HTTP/2 data: {}", e);
+                            break;
+                        }
+                        
+                        std::thread::sleep(Duration::from_millis(10));
+                        continue;
+                    }
+                    
+                    eprintln!("HTTP/2 frame receive error: {}", e);
+                    break;
+                }
+            }
+        }
+
+        if let Err(e) = http2_conn.close() {
+            eprintln!("Error closing HTTP/2 connection: {}", e);
+        }
+
+        Ok(())
+    }
+
+    fn process_http2_streams(http2_conn: &mut Http2Connection, handler: &Option<HttpsHandler>, peer_addr: SocketAddr) -> std::io::Result<()> {
+        let stream_ids: Vec<u32> = http2_conn.streams.keys().cloned().collect();
+        for stream_id in stream_ids {
+            let (method, path, request_headers) = {
+                let stream = match http2_conn.get_stream(stream_id) {
+                    Some(s) => s,
+                    None => continue,
+                };
+
+                if !stream.headers_received {
+                    continue;
+                }
+
+                let headers = stream.response_headers().to_vec();
+                let method = headers
+                    .iter()
+                    .find(|(name, _)| name == ":method")
+                    .map(|(_, value)| value.clone())
+                    .unwrap_or_else(|| "GET".to_string());
+
+                let path = headers
+                    .iter()
+                    .find(|(name, _)| name == ":path")
+                    .map(|(_, value)| value.clone())
+                    .unwrap_or_else(|| "/".to_string());
+
+                (method, path, headers)
+            };
+
+            let http_method = match HttpMethod::from_str(&method) {
+                Some(m) => m,
+                None => {
+                    eprintln!("Invalid HTTP method: {}", method);
+                    continue;
+                }
+            };
+
+            let mut request = HttpRequest::new(http_method, &path);
+            for (name, value) in request_headers {
+                if !name.starts_with(':') {
+                    request.set_header(name, value);
+                }
+            }
+
+            let stream = http2_conn.get_stream(stream_id).unwrap();
+            let body_data = stream.data().to_vec();
+            if !body_data.is_empty() {
+                request.set_body(body_data);
+            }
+
+            let response = if let Some(h) = handler {
+                h(&request)
+            } else {
+                Self::default_h2_handler(&request)
+            };
+
+            if let Err(e) = Self::send_http2_response(http2_conn, stream_id, &response) {
+                eprintln!(
+                    "Error sending HTTP/2 response for stream {}: {}",
+                    stream_id, e
+                );
+            }
+
+            if let Err(e) = http2_conn.close_stream(stream_id) {
+                eprintln!("Error closing stream {}: {}", stream_id, e);
+            }
+        }
+
+        Ok(())
+    }
+
+    fn send_http2_response(http2_conn: &mut Http2Connection, stream_id: u32, response: &HttpResponse) -> std::io::Result<()> {
+        let mut headers = vec![
+            (":status".to_string(), response.status_code().to_string()),
+        ];
+
+        for (key, value) in response.headers() {
+            headers.push((key.clone(), value.clone()));
+        }
+
+        if !response.body().is_empty() {
+            headers.push((
+                "content-length".to_string(),
+                response.body().len().to_string(),
+            ));
+        }
+
+        http2_conn
+            .send_request(stream_id, headers, Some(response.body().to_vec()))
+            .map_err(|e| std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("HTTP/2 send request failed: {}", e),
+            ))
+    }
+
+    fn default_h2_handler(request: &HttpRequest) -> HttpResponse {
+        let body = format!(
+            r#"{{
+  "status": "404",
+  "message": "Not Found",
+  "path": "{}",
+  "method": "{}"
+}}"#,
+            request.path(),
+            request.method().as_str()
+        );
+
+        let mut headers = HashMap::new();
+        headers.insert("content-type".to_string(), "application/json".to_string());
+        headers.insert("x-frame-options".to_string(), "DENY".to_string());
+        headers.insert("x-content-type-options".to_string(), "nosniff".to_string());
+        headers.insert("x-xss-protection".to_string(), "1; mode=block".to_string());
+
+        HttpResponse::new(
+            404,
+            "Not Found".to_string(),
+            HttpVersion::Http2,
+            headers,
+            body.into_bytes(),
+        )
+    }
+
+    fn handle_http1_connection(mut tls_stream: TlsStream, peer_addr: SocketAddr, config: HttpsServerCfg, handler: Option<HttpsHandler>) -> std::io::Result<()> {
+        let cloned_stream = tls_stream.try_clone()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        
+        let mut reader = BufReader::new(cloned_stream);
+        loop {
+            match Self::parse_request(&mut reader, &config) {
+                Ok(request) => {
+                    let response = if let Some(ref h) = handler {
+                        h(&request)
+                    } else {
+                        Self::default_handler(&request)
+                    };
+
+                    let response_bytes = Self::serialize_response(&response);
+                    tls_stream.write_all(&response_bytes)?;
+                    tls_stream.flush()?;
+
+                    if !config.keep_alive
+                        || request
+                            .headers()
+                            .get("Connection")
+                            .map(|v| v.to_lowercase().contains("close"))
+                            .unwrap_or(false)
+                    {
                         break;
                     }
                 }

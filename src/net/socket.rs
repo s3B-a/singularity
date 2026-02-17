@@ -2,6 +2,7 @@ use std::io::{self, Read, Write};
 use std::net::{SocketAddr, ToSocketAddrs, TcpStream as StdTcpStream};
 use std::time::Duration;
 
+#[derive(Debug)]
 pub struct Socket {
     inner: StdTcpStream,
 }

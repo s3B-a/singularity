@@ -421,6 +421,203 @@ impl Certificate {
             false
         }
     }
+
+    /**
+     * Gets the raw issuer bytes from the TBS certificate for signature verification
+     * Args:
+     *    &self: The Certificate instance
+     * 
+     * Returns:
+     *    Vec<u8>: The raw issuer bytes from the TBS certificate
+     */
+    pub fn issuer_raw(&self) -> Vec<u8> {
+        let mut decoder = DerDecoder::new(&self.tbs);
+        decoder.sequence(|tbs| {
+            let _ = tbs.optional_context_specific(0, |v| v.integer());
+            let _ = tbs.integer()?;
+            let _ = tbs.sequence(|_| Ok(()))?;
+            let start = tbs.pos;
+            tbs.sequence(|_| Ok(()))?;
+            let end = tbs.pos;
+            Ok(tbs.data[start..end].to_vec())
+        }).unwrap_or_default()
+    }
+    
+    /**
+     * Gets the raw subject bytes from the TBS certificate for signature verification
+     * Args:
+     *    &self: The Certificate instance
+     * 
+     * Returns:
+     *    Vec<u8>: The raw subject bytes from the TBS certificate
+     */
+    pub fn subject_raw(&self) -> Vec<u8> {
+        let mut decoder = DerDecoder::new(&self.tbs);
+        decoder.sequence(|tbs| {
+            let _ = tbs.optional_context_specific(0, |v| v.integer());
+            let _ = tbs.integer()?;
+            let _ = tbs.sequence(|_| Ok(()))?;
+            let _ = tbs.sequence(|_| Ok(()))?;
+            let _ = tbs.sequence(|_| Ok(()))?;
+            let start = tbs.pos;
+            tbs.sequence(|_| Ok(()))?;
+            let end = tbs.pos;
+            Ok(tbs.data[start..end].to_vec())
+        }).unwrap_or_default()
+    }
+    
+    /**
+     * Gets the Authority Key Identifier from the certificate extensions, if present
+     * Args:
+     *    &self: The Certificate instance
+     * 
+     * Returns:
+     *    Result<Vec<u8>>: The Authority Key Identifier bytes if present, or an empty vector if not present
+     */
+    pub fn get_authority_key_identifier(&self) -> Result<Vec<u8>> {
+        let mut decoder = DerDecoder::new(&self.tbs);
+        decoder.sequence(|tbs| {
+            let _ = tbs.optional_context_specific(0, |v| v.integer());
+            let _ = tbs.integer()?;
+            let _ = tbs.sequence(|_| Ok(()))?;
+            let _ = tbs.set(|_| Ok(()))?;
+            let _ = tbs.sequence(|_| Ok(()))?;
+            let _ = tbs.set(|_| Ok(()))?;
+            let _ = tbs.sequence(|_| Ok(()))?;
+            let result = tbs.optional_context_specific(3, |ext_seq| {
+                ext_seq.sequence(|exts| {
+                    while exts.has_more() {
+                        let result = exts.sequence(|ext| {
+                            let oid = ext.object_identifier()?;
+                            let _ = ext.boolean().ok();
+                            let value = ext.octet_string()?;
+                            if oid == vec![2, 5, 29, 35] {
+                                let mut val_decoder = DerDecoder::new(&value);
+                                return val_decoder.sequence(|aki_seq| {
+                                    aki_seq.context_specific(0, |key_id| {
+                                        key_id.octet_string()
+                                    })
+                                });
+                            }
+                            
+                            Ok(Vec::new())
+                        })?;
+                        
+                        if !result.is_empty() {
+                            return Ok(result);
+                        }
+                    }
+
+                    Ok(Vec::new())
+                })
+            });
+            
+            match result {
+                Ok(Some(vec)) => Ok(vec),
+                _ => Ok(Vec::new())
+            }
+        })
+    }
+    
+    /**
+     * Gets the Subject Key Identifier from the certificate extensions, if present
+     * Args:
+     *    &self: The Certificate instance
+     * 
+     * Returns:
+     *    Result<Vec<u8>>: The Subject Key Identifier bytes if present, or an empty vector if not present
+     */
+    pub fn get_subject_key_identifier(&self) -> Result<Vec<u8>> {
+        let mut decoder = DerDecoder::new(&self.tbs);
+        decoder.sequence(|tbs| {
+            let _ = tbs.optional_context_specific(0, |v| v.integer());
+            let _ = tbs.integer()?;
+            let _ = tbs.sequence(|_| Ok(()))?;
+            let _ = tbs.set(|_| Ok(()))?;
+            let _ = tbs.sequence(|_| Ok(()))?;
+            let _ = tbs.set(|_| Ok(()))?;
+            let _ = tbs.sequence(|_| Ok(()))?;
+            let result = tbs.optional_context_specific(3, |ext_seq| {
+                ext_seq.sequence(|exts| {
+                    while exts.has_more() {
+                        let result = exts.sequence(|ext| {
+                            let oid = ext.object_identifier()?;
+                            let _ = ext.boolean().ok();
+                            let value = ext.octet_string()?;
+                            if oid == vec![2, 5, 29, 14] {
+                                let mut val_decoder = DerDecoder::new(&value);
+                                return val_decoder.octet_string();
+                            }
+                            
+                            Ok(Vec::new())
+                        })?;
+                        
+                        if !result.is_empty() {
+                            return Ok(result);
+                        }
+                    }
+
+                    Ok(Vec::new())
+                })
+            })?;
+            
+            Ok(result.unwrap_or(Vec::new()))
+        })
+    }
+    
+    /**
+     * Gets the Key Usage bits from the certificate extensions, if present
+     * Args:
+     *    &self: The Certificate instance
+     * 
+     * Returns:
+     *    Result<u16>: The Key Usage bits as a u16, or 0 if not present
+     */
+    pub fn get_key_usage(&self) -> Result<u16> {
+        let mut decoder = DerDecoder::new(&self.tbs);
+        decoder.sequence(|tbs| {
+            let _ = tbs.optional_context_specific(0, |v| v.integer());
+            let _ = tbs.integer()?;
+            let _ = tbs.sequence(|_| Ok(()))?;
+            let _ = tbs.set(|_| Ok(()))?;
+            let _ = tbs.sequence(|_| Ok(()))?;
+            let _ = tbs.set(|_| Ok(()))?;
+            let _ = tbs.sequence(|_| Ok(()))?;
+            match tbs.optional_context_specific(3, |ext_seq| {
+                ext_seq.sequence(|exts| {
+                    while exts.has_more() {
+                        let result = exts.sequence(|ext| {
+                            let oid = ext.object_identifier()?;
+                            let _ = ext.boolean().ok();
+                            let value = ext.octet_string()?;
+                            if oid == vec![2, 5, 29, 15] {
+                                let mut val_decoder = DerDecoder::new(&value);
+                                let (bits, _unused) = val_decoder.bit_string()?;
+                                let mut usage: u16 = 0;
+                                for (i, &byte) in bits.iter().take(2).enumerate() {
+                                    usage |= (byte as u16) << (8 * (1 - i));
+                                }
+
+                                return Ok(usage);
+                            }
+                            
+                            Ok(0)
+                        })?;
+                        
+                        if result != 0 {
+                            return Ok(result);
+                        }
+                    }
+
+                    Ok(0)
+                })
+            }) {
+                Ok(Some(usage)) => Ok(usage),
+                Ok(None) => Ok(0),
+                Err(e) => Err(e),
+            }
+        })
+    }
 }
 
 /**

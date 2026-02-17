@@ -1,4 +1,5 @@
 use super::error::{ErrorCode, Http2Error, Result};
+use super::alpn::AlpnProtocol;
 use super::flow_control::FlowControl;
 use super::frame::{Frame, FrameFlags, FrameType};
 use super::hpack::HpackCodec;
@@ -14,7 +15,7 @@ const CLIENT_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 
 pub struct Http2Connection {
     stream: TcpStream,
-    streams: HashMap<u32, Http2Stream>,
+    pub streams: HashMap<u32, Http2Stream>,
     next_stream_id: u32,
     local_settings: Settings,
     remote_settings: Settings,
@@ -23,8 +24,8 @@ pub struct Http2Connection {
     decoder: HpackCodec,
     priority_tree: PriorityTree,
     last_stream_id: u32,
-    goaway_sent: bool,
-    goaway_received: bool,
+    pub goaway_sent: bool,
+    pub goaway_received: bool,
     continuation_state: Option<ContinuationState>,
     scheduler: PriorityScheduler,
     max_frame_size: u32,
@@ -105,6 +106,90 @@ impl Http2Connection {
         }
 
         Ok(())
+    }
+
+    pub fn new_with_alpn(stream: TcpStream, negotiated_protocol: Option<AlpnProtocol>) -> Result<Self> {
+        if let Some(protocol) = negotiated_protocol {
+            if protocol != AlpnProtocol::Http2 {
+                return Err(Http2Error::Protocol(
+                    ErrorCode::ProtocolError,
+                    format!(
+                        "HTTP/2 connection requires h2 protocol, got: {}",
+                        protocol.name()
+                    ),
+                ));
+            }
+        }
+
+        Self::new(stream)
+    }
+
+    pub fn handshake_with_alpn(&mut self, negotiated_protocol: Option<AlpnProtocol>) -> Result<()> {
+        if let Some(protocol) = negotiated_protocol {
+            if protocol != AlpnProtocol::Http2 {
+                return Err(Http2Error::Protocol(
+                    ErrorCode::ProtocolError,
+                    format!(
+                        "ALPN negotiated {:?} but HTTP/2 expected",
+                        protocol.name()
+                    ),
+                ));
+            }
+        }
+
+        self.stream.write_all(CLIENT_PREFACE).map_err(|e| {
+            Http2Error::Io(e)
+        })?;
+
+        let settings_frame = Frame::settings(vec![
+            (
+                SettingId::HeaderTableSize as u16,
+                self.local_settings.header_table_size(),
+            ),
+            (
+                SettingId::EnablePush as u16,
+                if self.local_settings.enable_push() { 1 } else { 0 },
+            ),
+            (
+                SettingId::MaxConcurrentStreams as u16,
+                self.local_settings.max_concurrent_streams(),
+            ),
+            (
+                SettingId::InitialWindowSize as u16,
+                self.local_settings.initial_window_size(),
+            ),
+            (
+                SettingId::MaxFrameSize as u16,
+                self.local_settings.max_frame_size(),
+            ),
+            (
+                SettingId::MaxHeaderListSize as u16,
+                self.local_settings.max_header_list_size(),
+            ),
+        ]);
+
+        settings_frame.write(&mut self.stream).map_err(|e| {
+            Http2Error::Io(e)
+        })?;
+
+        self.stream.flush().map_err(|e| Http2Error::Io(e))?;
+        let frame = Frame::read(&mut self.stream)?;
+        if frame.header.frame_type == FrameType::Settings && !frame.header.flags.has(FrameFlags::ACK) {
+            self.handle_settings_frame(&frame)?;
+            Frame::settings_ack()
+                .write(&mut self.stream)
+                .map_err(|e| Http2Error::Io(e))?;
+            self.stream.flush().map_err(|e| Http2Error::Io(e))?;
+        }
+
+        Ok(())
+    }
+
+    /// Get negotiated ALPN protocol
+    pub fn negotiated_protocol(&self) -> Option<AlpnProtocol> {
+        // Would need to track this in the connection struct
+        // For now, HTTP/2 connection implies h2 protocol
+        Some(AlpnProtocol::Http2)
     }
 
     pub fn create_stream(&mut self) -> Result<u32> {

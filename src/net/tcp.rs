@@ -3,6 +3,7 @@ use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{ToSocketAddrs, SocketAddr};
 use std::time::Duration;
 
+#[derive(Debug)]
 pub struct TcpStream {
     socket: Socket,
     reader: BufReader<Socket>,
@@ -136,6 +137,10 @@ impl TcpStream {
 
     pub fn set_nodelay(&self, nodelay: bool) -> io::Result<()> {
         self.socket.set_nodelay(nodelay)
+    }
+
+    pub fn peer_addr(&self) -> io::Result<SocketAddr> {
+        self.socket.peer_addr()
     }
 
     pub fn try_clone(&self) -> io::Result<Self> {

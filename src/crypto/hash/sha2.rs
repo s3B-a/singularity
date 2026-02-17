@@ -2,6 +2,9 @@
 // Implementations of SHA-224, SHA-256, SHA-384, SHA-512, SHA-512/224, and SHA-512/256
 // https://nvlpubs.nist.gov/nistpubs/FIPS/NIST.FIPS.180-4.pdf
 
+// SHA-1 round constants
+const K1: [u32; 4] = [0x5a827999, 0x6ed9eba1, 0x8f1bbcdc, 0xca62c1d6];
+
 // SHA-256 round constants
 const K256: [u32; 64] = [
     0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
@@ -37,6 +40,174 @@ const K512: [u64; 80] = [
     0x28db77f523047d84, 0x32caab7b40c72493, 0x3c9ebe0a15c9bebc, 0x431d67c49c100d4c,
     0x4cc5d4becb3e42b6, 0x597f299cfc657e2a, 0x5fcb6fab3ad6faec, 0x6c44198c4a475817,
 ];
+
+// SHA-1
+#[derive(Clone)]
+pub struct Sha1 {
+    state: [u32; 5],
+    buffer: [u8; 64],
+    buffer_len: usize,
+    total_len: u64,
+}
+
+impl Sha1 {
+    /**
+     * Create a new SHA-1 instance
+     * Args:
+     *    (): No arguments
+     * 
+     * Returns:
+     *    Self: New SHA-1 instance
+     */
+    pub fn new() -> Self {
+        Sha1 {
+            state: [0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476, 0xc3d2e1f0],
+            buffer: [0u8; 64],
+            buffer_len: 0,
+            total_len: 0,
+        }
+    }
+
+    /**
+     * Update the SHA-1 state with input data
+     * Args:
+     *    &mut self: Mutable reference to SHA-1 instance
+     *    data - &[u8]: Input data to hash
+     * 
+     * Returns:
+     *    (): Nothing
+     */
+    pub fn update(&mut self, data: &[u8]) {
+        let mut pos = 0;
+        while pos < data.len() {
+            let remaining = 64 - self.buffer_len;
+            let to_copy = remaining.min(data.len() - pos);
+
+            self.buffer[self.buffer_len..self.buffer_len + to_copy]
+                .copy_from_slice(&data[pos..pos + to_copy]);
+
+            self.buffer_len += to_copy;
+            pos += to_copy;
+            if self.buffer_len == 64 {
+                self.process_block(&self.buffer.clone());
+                self.buffer_len = 0;
+            }
+        }
+
+        self.total_len += data.len() as u64;
+    }
+
+    /**
+     * Finalize the SHA-1 hash and return the digest
+     * Args:
+     *    mut self: Mutable SHA-1 instance
+     * 
+     * Returns:
+     *    [u8; 20]: The resulting SHA-1 hash digest
+     */
+    pub fn finalize(mut self) -> [u8; 20] {
+        let bit_len = self.total_len * 8;
+
+        self.buffer[self.buffer_len] = 0x80;
+        self.buffer_len += 1;
+        if self.buffer_len > 56 {
+            while self.buffer_len < 64 {
+                self.buffer[self.buffer_len] = 0;
+                self.buffer_len += 1;
+            }
+            self.process_block(&self.buffer.clone());
+            self.buffer_len = 0;
+        }
+
+        while self.buffer_len < 56 {
+            self.buffer[self.buffer_len] = 0;
+            self.buffer_len += 1;
+        }
+
+        self.buffer[56..64].copy_from_slice(&bit_len.to_be_bytes());
+        let buffer_copy = self.buffer;
+        self.process_block(&buffer_copy);
+
+        let mut output = [0u8; 20];
+        for (i, &word) in self.state.iter().enumerate() {
+            output[i * 4..(i + 1) * 4].copy_from_slice(&word.to_be_bytes());
+        }
+
+        output
+    }
+
+    /**
+     * Process a single 512-bit block
+     * Args:
+     *    &mut self: Mutable reference to SHA-1 instance
+     *    block - &[u8; 64]: 512-bit block to process
+     * 
+     * Returns:
+     *    (): Nothing
+     */
+    fn process_block(&mut self, block: &[u8; 64]) {
+        let mut w = [0u32; 80];
+        for i in 0..16 {
+            w[i] = u32::from_be_bytes([
+                block[i * 4],
+                block[i * 4 + 1],
+                block[i * 4 + 2],
+                block[i * 4 + 3],
+            ]);
+        }
+
+        for i in 16..80 {
+            w[i] = (w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]).rotate_left(1);
+        }
+
+        let mut a = self.state[0];
+        let mut b = self.state[1];
+        let mut c = self.state[2];
+        let mut d = self.state[3];
+        let mut e = self.state[4];
+
+        for i in 0..80 {
+            let (f, k) = match i {
+                0..=19 => ((b & c) | ((!b) & d), K1[0]),
+                20..=39 => (b ^ c ^ d, K1[1]),
+                40..=59 => ((b & c) | (b & d) | (c & d), K1[2]),
+                60..=79 => (b ^ c ^ d, K1[3]),
+                _ => unreachable!(),
+            };
+
+            let temp = a
+                .rotate_left(5)
+                .wrapping_add(f)
+                .wrapping_add(e)
+                .wrapping_add(k)
+                .wrapping_add(w[i]);
+            e = d;
+            d = c;
+            c = b.rotate_left(30);
+            b = a;
+            a = temp;
+        }
+
+        self.state[0] = self.state[0].wrapping_add(a);
+        self.state[1] = self.state[1].wrapping_add(b);
+        self.state[2] = self.state[2].wrapping_add(c);
+        self.state[3] = self.state[3].wrapping_add(d);
+        self.state[4] = self.state[4].wrapping_add(e);
+    }
+}
+
+pub fn sha1(data: &[u8]) -> [u8; 20] {
+    let mut hasher = Sha1::new();
+    hasher.update(data);
+    hasher.finalize()
+}
+
+// Implement Default trait for Sha1
+impl Default for Sha1 {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 // SHA-256
 #[derive(Clone)]

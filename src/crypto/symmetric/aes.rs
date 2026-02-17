@@ -49,7 +49,7 @@ const RCON: [u8; 11] = [
 ];
 
 // Key expansion for AES-128
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct Aes {
     round_keys: Vec<[u8; 16]>,
     num_rounds: usize,

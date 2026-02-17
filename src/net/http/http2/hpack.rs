@@ -425,21 +425,19 @@ impl HpackCodec {
         // https://datatracker.ietf.org/doc/html/rfc7541#section-2
         let mut output = Vec::new();
         for (name, value) in headers {
-            if let Some(index) = self.find_in_static_table(name, value) {
-                output.push(0);
-                self.encode_integer(&mut output, index, 7);
-                let first_zero_pos = output.iter().rposition(|&x| x == 0).unwrap();
-                output[first_zero_pos] |= 0x80;
-            } else if let Some(index) = self.find_name_in_static_table(name) {
+            let name_lower = name.to_lowercase();
+            if let Some(index) = self.find_in_static_table(&name_lower, value) {
+                self.encode_indexed(&mut output, index);
+            } else if let Some(index) = self.find_name_in_static_table(&name_lower) {
                 output.push(0x40);
                 self.encode_integer(&mut output, index, 6);
                 self.encode_string_with_huffman(&mut output, value);
-                self.add_to_dynamic_table(name.clone(), value.clone());
+                self.add_to_dynamic_table(name_lower, value.clone());
             } else {
                 output.push(0x40);
-                self.encode_string_with_huffman(&mut output, name);
+                self.encode_string_with_huffman(&mut output, &name_lower);
                 self.encode_string_with_huffman(&mut output, value);
-                self.add_to_dynamic_table(name.clone(), value.clone());
+                self.add_to_dynamic_table(name_lower, value.clone());
             }
         }
         
@@ -451,44 +449,76 @@ impl HpackCodec {
         // Decoding HPACK encoded headers
         // Done by reading the bytes and interpreting them
         // according to the HPACK specification
-        let mut headers = Vec::new();
+        let mut headers = HashMap::new();
         let mut pos = 0;
         while pos < data.len() {
-            let byte = data[pos];
+            let byte = data[pos];            
             if byte & 0x80 != 0 {
                 let (index, consumed) = self.decode_integer(&data[pos..], 7)?;
                 pos += consumed;
+                
                 if let Some((name, value)) = self.get_from_table(index) {
-                    headers.push((name, value));
+                    headers.insert(name, value);
                 } else {
-                    return Err(format!("Invalid index: {}", index));
+                    return Err(format!("Invalid table index: {}", index));
                 }
             } else if byte & 0x40 != 0 {
-                pos += 1;
-                let (name, consumed) = self.decode_string(&data[pos..])?;
+                let (index, consumed) = self.decode_integer(&data[pos..], 6)?;
                 pos += consumed;
-                let (value, consumed) = self.decode_string(&data[pos..])?;
-                pos += consumed;
+                
+                let (name, consumed_name) = if index == 0 {
+                    self.decode_string(&data[pos..])?
+                } else if let Some((n, _)) = self.get_from_table(index) {
+                    (n, 0)
+                } else {
+                    return Err(format!("Invalid table index: {}", index));
+                };
+                pos += consumed_name;
+                
+                let (value, consumed_value) = self.decode_string(&data[pos..])?;
+                pos += consumed_value;
                 
                 self.add_to_dynamic_table(name.clone(), value.clone());
-                headers.push((name, value));
+                headers.insert(name, value);
             } else if byte & 0x20 != 0 {
                 let (new_size, consumed) = self.decode_integer(&data[pos..], 5)?;
-                pos += consumed;
                 self.max_dynamic_table_size = new_size;
                 self.evict_to_fit();
-            } else {
-                pos += 1;
-                let (name, consumed) = self.decode_string(&data[pos..])?;
                 pos += consumed;
-                let (value, consumed) = self.decode_string(&data[pos..])?;
+            } else {
+                let (index, consumed) = self.decode_integer(&data[pos..], 4)?;
                 pos += consumed;
                 
-                headers.push((name, value));
+                let (name, consumed_name) = if index == 0 {
+                    self.decode_string(&data[pos..])?
+                } else if let Some((n, _)) = self.get_from_table(index) {
+                    (n, 0)
+                } else {
+                    return Err(format!("Invalid table index: {}", index));
+                };
+                pos += consumed_name;
+                
+                let (value, consumed_value) = self.decode_string(&data[pos..])?;
+                pos += consumed_value;
+                
+                headers.insert(name, value);
             }
         }
         
-        Ok(headers.into_iter().collect())
+        Ok(headers)
+    }
+
+    fn encode_indexed(&self, output: &mut Vec<u8>, index: usize) {
+        if output.is_empty() {
+            let mut byte = 0x80u8;
+            if index < 127 {
+                byte |= index as u8;
+                output.push(byte);
+            } else {
+                output.push(byte | 0x7F);
+                self.encode_integer(output, index - 127, 7);
+            }
+        }
     }
 
     fn find_in_static_table(&self, name: &str, value: &str) -> Option<usize> {
@@ -503,14 +533,15 @@ impl HpackCodec {
         if index == 0 {
             return None;
         }
-
+        
         if index <= STATIC_TABLE.len() {
             let (name, value) = STATIC_TABLE[index - 1];
-            Some((name.to_string(), value.to_string()))
-        } else {
-            let dynamic_index = index - STATIC_TABLE.len() - 1;
-            self.dynamic_table.get(dynamic_index).cloned()
+            return Some((name.to_string(), value.to_string()));
         }
+        
+        let dynamic_index = index - STATIC_TABLE.len() - 1;
+        self.dynamic_table.get(dynamic_index)
+            .map(|(n, v)| (n.clone(), v.clone()))
     }
 
     fn add_to_dynamic_table(&mut self, name: String, value: String) {
@@ -519,188 +550,176 @@ impl HpackCodec {
     }
 
     fn evict_to_fit(&mut self) {
-        while self.current_dynamic_table_size() > self.max_dynamic_table_size && !self.dynamic_table.is_empty() {
+        while self.current_dynamic_table_size() > self.max_dynamic_table_size 
+            && !self.dynamic_table.is_empty() {
             self.dynamic_table.pop();
         }
     }
 
     fn current_dynamic_table_size(&self) -> usize {
-        self.dynamic_table.iter().map(|(n, v)| n.len() + v.len() + 32).sum()
+        self.dynamic_table.iter()
+            .map(|(n, v)| n.len() + v.len() + 32)
+            .sum()
     }
 
-    fn encode_integer(&self, output: &mut Vec<u8>, value: usize, prefix_bits: u8) {
-        
+    fn encode_integer(&self, output: &mut Vec<u8>, mut value: usize, prefix_bits: u8) {        
         // Encoding var-length integer
         // Done by using the prefix bits and continuing with bytes
         // with MSB set until the value is fully encoded
         let max_prefix = (1 << prefix_bits) - 1;
         if value < max_prefix {
-            let last_idx = output.len() - 1;
-            output[last_idx] |= value as u8;
-        } else {
-            let last_idx = output.len() - 1;
-            output[last_idx] |= max_prefix as u8;
-            let mut remaining = value - max_prefix;
-            
-            while remaining >= 128 {
-                output.push(((remaining % 128) + 128) as u8);
-                remaining /= 128;
+            if output.is_empty() {
+                output.push(value as u8);
+            } else {
+                *output.last_mut().unwrap() |= value as u8;
             }
-            output.push(remaining as u8);
+        } else {
+            if output.is_empty() {
+                output.push(max_prefix as u8);
+            } else {
+                *output.last_mut().unwrap() |= max_prefix as u8;
+            }
+            
+            value -= max_prefix;
+            while value >= 128 {
+                output.push((value % 128 + 128) as u8);
+                value /= 128;
+            }
+            output.push(value as u8);
         }
     }
 
     fn decode_integer(&self, data: &[u8], prefix_bits: u8) -> Result<(usize, usize), String> {
         if data.is_empty() {
-            return Err("Empty data".to_string());
+            return Err("Empty data for integer decode".to_string());
         }
-
+        
         let mask = (1 << prefix_bits) - 1;
-        let mut value = (data[0] & mask) as usize;
-        if value < mask as usize {
+        let mut value = (data[0] & mask as u8) as usize;
+        
+        if value < mask {
             return Ok((value, 1));
         }
-
-        // Math for decoding var-length integer
-        // Done by shifting by 7 bits for each byte read
-        // and accumulating the value until a byte with MSB 0 is found
+        
         let mut pos = 1;
         let mut m = 0;
+        
         loop {
             if pos >= data.len() {
-                return Err("Incomplete integer encoding".to_string());
+                return Err("Incomplete integer".to_string());
             }
-
-            let byte = data[pos];
-            value += ((byte & 0x7F) as usize) << m;
-            m += 7;
-            pos += 1;
-
+            
+            let byte = data[pos] as usize;
+            value += (byte & 0x7F) << m;
+            
             if byte & 0x80 == 0 {
-                break;
+                return Ok((value, pos + 1));
+            }
+            
+            pos += 1;
+            m += 7;
+            
+            if m > 28 {
+                return Err("Integer overflow".to_string());
             }
         }
-
-        Ok((value, pos))
     }
 
     fn encode_string_with_huffman(&self, output: &mut Vec<u8>, s: &str) {
         let bytes = s.as_bytes();
         let huffman_encoded = self.huffman_encode(bytes);
-        let plain_size = bytes.len();
-        let huffman_size = huffman_encoded.len();
-        if huffman_size < plain_size {
-            output.push(0x80);
-            self.encode_integer(output, huffman_size, 7);
+        
+        if huffman_encoded.len() < bytes.len() {
+            let len_byte = 0x80 | (huffman_encoded.len() as u8);
+            output.push(len_byte);
             output.extend_from_slice(&huffman_encoded);
         } else {
-            output.push(0x00);
-            self.encode_integer(output, plain_size, 7);
+            self.encode_integer(output, bytes.len(), 7);
             output.extend_from_slice(bytes);
         }
     }
 
     fn decode_string(&self, data: &[u8]) -> Result<(String, usize), String> {
         if data.is_empty() {
-            return Err("Empty data".to_string());
+            return Err("Empty data for string decode".to_string());
         }
-
+        
         let huffman = data[0] & 0x80 != 0;
         let (length, consumed) = self.decode_integer(data, 7)?;
+        
         if data.len() < consumed + length {
-            return Err("Incomplete string".to_string());
+            return Err("Incomplete string data".to_string());
         }
-
+        
         let string_data = &data[consumed..consumed + length];
         let s = if huffman {
-            let decoded_bytes = self.huffman_decode(string_data)?;
-            String::from_utf8(decoded_bytes)
-                .map_err(|_| "Invalid UTF-8 in Huffman decoded string".to_string())?
+            self.huffman_decode(string_data)?
         } else {
-            String::from_utf8_lossy(string_data).to_string()
+            String::from_utf8(string_data.to_vec())
+                .map_err(|_| "Invalid UTF-8 in header string".to_string())?
         };
-
+        
         Ok((s, consumed + length))
     }
 
     fn huffman_encode(&self, data: &[u8]) -> Vec<u8> {
         let mut output = Vec::new();
         let mut current_byte = 0u8;
-        let mut bits_in_current = 0u8;
+        let mut bits_used = 0u8;
         for &byte in data {
             let (code, bit_len) = self.huffman_codes[byte as usize];
             let mut remaining_bits = bit_len;
-            let mut code_to_write = code;
+            let code_bits = code;
             while remaining_bits > 0 {
-                let bits_to_write = remaining_bits.min(8 - bits_in_current);
+                let bits_to_write = (8 - bits_used).min(remaining_bits);
                 let shift = remaining_bits - bits_to_write;
-                let bits = ((code_to_write >> shift) & ((1 << bits_to_write) - 1)) as u8;
-
-                current_byte |= bits << (8 - bits_in_current - bits_to_write);
-                bits_in_current += bits_to_write;
+                let bits = ((code_bits >> shift) & ((1 << bits_to_write) - 1)) as u8;
+                
+                current_byte |= bits << (8 - bits_used - bits_to_write);
+                bits_used += bits_to_write;
                 remaining_bits -= bits_to_write;
-                if bits_in_current == 8 {
+                if bits_used == 8 {
                     output.push(current_byte);
                     current_byte = 0;
-                    bits_in_current = 0;
+                    bits_used = 0;
                 }
-
-                code_to_write &= (1 << shift) - 1;
             }
         }
         
-        if bits_in_current > 0 {
-            current_byte |= (1 << (8 - bits_in_current)) - 1;
+        if bits_used > 0 {
+            current_byte |= (1 << (8 - bits_used)) - 1;
             output.push(current_byte);
         }
         
         output
     }
 
-    fn huffman_decode(&self, data: &[u8]) -> Result<Vec<u8>, String> {
+    fn huffman_decode(&self, data: &[u8]) -> Result<String, String> {
         let mut output = Vec::new();
         let mut node = &self.huffman_root;
-
+        
         for &byte in data {
-            for bit_pos in (0..8).rev() {
-                let bit = (byte >> bit_pos) & 1;
+            for i in (0..8).rev() {
+                let bit = (byte >> i) & 1;
                 
                 node = if bit == 0 {
-                    node.left.as_ref()
-                        .ok_or_else(|| "Invalid Huffman code".to_string())?
+                    node.left.as_deref().ok_or("Invalid Huffman sequence")?
                 } else {
-                    node.right.as_ref()
-                        .ok_or_else(|| "Invalid Huffman code".to_string())?
+                    node.right.as_deref().ok_or("Invalid Huffman sequence")?
                 };
-
+                
                 if let Some(symbol) = node.symbol {
-                    if symbol != 256 {
-                        output.push(symbol as u8);
+                    if symbol == 256 {
+                        continue;
                     }
+                    output.push(symbol as u8);
                     node = &self.huffman_root;
                 }
             }
         }
-
-        if node as *const _ != &self.huffman_root as *const _ {
-            let mut test_node = node;
-            loop {
-                if let Some(symbol) = test_node.symbol {
-                    if symbol != 256 {
-                        return Err("Invalid Huffman padding".to_string());
-                    }
-                    break;
-                }
-                
-                if let Some(ref right) = test_node.right {
-                    test_node = right;
-                } else {
-                    return Err("Invalid Huffman padding".to_string());
-                }
-            }
-        }
-
-        Ok(output)
+        
+        String::from_utf8(output)
+            .map_err(|_| "Invalid UTF-8 in Huffman decoded string".to_string())
     }
 }
 
@@ -724,8 +743,7 @@ mod tests {
         
         for input in test_cases {
             let encoded = codec.huffman_encode(input.as_bytes());
-            let decoded = codec.huffman_decode(&encoded).expect("Decode failed");
-            let decoded_str = String::from_utf8(decoded).expect("UTF-8 conversion failed");
+            let decoded_str = codec.huffman_decode(&encoded).expect("Decode failed");
             assert_eq!(input, decoded_str, "Mismatch for: {}", input);
         }
     }

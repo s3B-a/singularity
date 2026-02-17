@@ -2,6 +2,7 @@ use std::io::{Read, Write};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, Duration};
+use crate::net::http::http2::alpn::{AlpnNegotiator, AlpnProtocol};
 use crate::net::tcp::TcpStream;
 use crate::crypto::asymmetric::{rsa, ecdh};
 use crate::crypto::symmetric::aes;
@@ -93,6 +94,7 @@ pub enum TlsError {
     NoSharedCipher,
     VerificationFailed(String),
     CipherError(String),
+    ProtocolNegotiationFailed(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -103,6 +105,7 @@ enum ConnectionState {
     Closed,
 }
 
+#[derive(Debug)]
 struct TlsKeys {
     client_write_key: Vec<u8>,
     server_write_key: Vec<u8>,
@@ -110,6 +113,7 @@ struct TlsKeys {
     server_write_iv: Vec<u8>,
 }
 
+#[derive(Debug)]
 pub struct TlsStream {
     stream: TcpStream,
     config: TlsCfg,
@@ -124,9 +128,11 @@ pub struct TlsStream {
     server_seq: u64,
     is_client: bool,
     buffer: Vec<u8>,
-    server_name: Option<String>,
+    pub server_name: Option<String>,
     session_id: Vec<u8>,
     resuming_session: bool,
+    alpn_negotiator: AlpnNegotiator,
+    negotiated_protocol: Option<AlpnProtocol>,
 }
 
 impl TlsSession {
@@ -223,6 +229,8 @@ impl TlsStream {
             server_name: Some(server_name),
             session_id: Vec::new(),
             resuming_session: false,
+            alpn_negotiator: AlpnNegotiator::new(),
+            negotiated_protocol: None,
         };
 
         tls_stream.client_handshake()?;
@@ -247,6 +255,8 @@ impl TlsStream {
             server_name: None,
             session_id: Vec::new(),
             resuming_session: false,
+            alpn_negotiator: AlpnNegotiator::new(),
+            negotiated_protocol: None,
         };
 
         tls_stream.server_handshake()?;
@@ -289,6 +299,10 @@ impl TlsStream {
         if server_hello_type != HANDSHAKE_SERVER_HELLO {
             return Err(TlsError::HandshakeFailed("Expected ServerHello".to_string()));
         }
+
+        let server_alpn_data = self.extract_alpn_from_handshake(&server_hello)?;
+        let negotiated = self.alpn_negotiator.negotiate(&server_alpn_data).ok();
+        self.negotiated_protocol = negotiated;
 
         self.handshake_msg.extend_from_slice(&server_hello);
         let (server_random, selected_cipher, peer_public_key, negotiated_version, session_resumed) =
@@ -424,19 +438,21 @@ impl TlsStream {
         hello.extend_from_slice(&TLS_VERSION_1_2.to_be_bytes());
         hello.extend_from_slice(client_random);
         hello.push(0);
+        let supported_ciphers = vec![
+            TLS_AES_256_GCM_SHA384,
+            TLS_AES_128_GCM_SHA256,
+            TLS_CHACHA20_POLY1305_SHA256,
+        ];
 
-        let cipher_count = self.config.supported_ciphers.len() as u16;
-        hello.extend_from_slice(&(cipher_count * 2).to_be_bytes());
-        for cipher in &self.config.supported_ciphers {
-            hello.extend_from_slice(&cipher.parse::<u16>().unwrap_or(0).to_be_bytes());
+        hello.extend_from_slice(&((supported_ciphers.len() * 2) as u16).to_be_bytes());
+        for cipher in supported_ciphers {
+            hello.extend_from_slice(&cipher.to_be_bytes());
         }
 
         hello.push(1);
         hello.push(0);
 
         let mut ext = Vec::new();
-
-        // Extension: Server Name Indication (SNI) - Type 0
         if let Some(ref server_name) = self.server_name {
             if !server_name.is_empty() {
                 ext.extend_from_slice(&0u16.to_be_bytes());
@@ -452,23 +468,16 @@ impl TlsStream {
             }
         }
 
-        // Extension: Supported Versions - Type 43
-        ext.extend_from_slice(&43u16.to_be_bytes());
-        ext.extend_from_slice(&3u16.to_be_bytes());
-        ext.push(2);
-        ext.extend_from_slice(&TLS_VERSION_1_3.to_be_bytes());
+        ext.extend_from_slice(&10u16.to_be_bytes());
+        ext.extend_from_slice(&4u16.to_be_bytes());
+        ext.extend_from_slice(&2u16.to_be_bytes());
+        ext.extend_from_slice(&0x001du16.to_be_bytes());
 
-        // Extension: Key Share - Type 51
-        let key_bytes = public_key.to_bytes();
-        let key_share_len = 2 + 2 + 2 + key_bytes.len();
-        ext.extend_from_slice(&51u16.to_be_bytes());
-        ext.extend_from_slice(&(key_share_len as u16).to_be_bytes());
-        ext.extend_from_slice(&(4 + key_bytes.len() as u16).to_be_bytes());
-        ext.extend_from_slice(&29u16.to_be_bytes());
-        ext.extend_from_slice(&(key_bytes.len() as u16).to_be_bytes());
-        ext.extend_from_slice(&key_bytes);
+        ext.extend_from_slice(&11u16.to_be_bytes());
+        ext.extend_from_slice(&2u16.to_be_bytes());
+        ext.push(1);
+        ext.push(0);
 
-        // Extension: Signature Algorithms - Type 13
         ext.extend_from_slice(&13u16.to_be_bytes());
         ext.extend_from_slice(&8u16.to_be_bytes());
         ext.extend_from_slice(&6u16.to_be_bytes());
@@ -476,34 +485,41 @@ impl TlsStream {
         ext.extend_from_slice(&0x0401u16.to_be_bytes());
         ext.extend_from_slice(&0x0403u16.to_be_bytes());
 
-        // Extension: Application-Layer Protocol Negotiation (ALPN) - Type 16
-        ext.extend_from_slice(&16u16.to_be_bytes());
-        let alpn_data: Vec<u8> = vec![
-            2, b'h', b'2',       // HTTP/2
-            8, b'h', b't', b't', b'p', b'/', b'1', b'.', b'1', // HTTP/1.1
-        ];
-        ext.extend_from_slice(&(alpn_data.len() as u16 + 2).to_be_bytes());
-        ext.extend_from_slice(&(alpn_data.len() as u16).to_be_bytes());
-        ext.extend_from_slice(&alpn_data);
+        if !self.alpn_negotiator.supported_protocols_wire().is_empty() {
+            ext.extend_from_slice(&16u16.to_be_bytes());
+            let protocols_wire = self.alpn_negotiator.supported_protocols_wire();
+            let alpn_list_len = protocols_wire.len();
+            ext.extend_from_slice(&((alpn_list_len + 2) as u16).to_be_bytes());
+            ext.extend_from_slice(&(alpn_list_len as u16).to_be_bytes());
+            ext.extend_from_slice(&protocols_wire);
+        }
 
-        // Extension: status_request (OCSP Stapling) - Type 5
+        ext.extend_from_slice(&43u16.to_be_bytes());
+        ext.extend_from_slice(&3u16.to_be_bytes());
+        ext.push(2);
+        ext.extend_from_slice(&TLS_VERSION_1_3.to_be_bytes());
+
+        let key_bytes = public_key.to_bytes();
+        let key_share_entry_len = 2 + 2 + key_bytes.len();
+        let key_share_ext_len = 2 + key_share_entry_len;
+        
+        ext.extend_from_slice(&51u16.to_be_bytes());
+        ext.extend_from_slice(&(key_share_ext_len as u16).to_be_bytes());
+        ext.extend_from_slice(&(key_share_entry_len as u16).to_be_bytes());
+        ext.extend_from_slice(&0x001du16.to_be_bytes());
+        ext.extend_from_slice(&(key_bytes.len() as u16).to_be_bytes());
+        ext.extend_from_slice(&key_bytes);
+
+        ext.extend_from_slice(&45u16.to_be_bytes());
+        ext.extend_from_slice(&2u16.to_be_bytes());
+        ext.push(1);
+        ext.push(1);
+
         ext.extend_from_slice(&5u16.to_be_bytes());
         ext.extend_from_slice(&5u16.to_be_bytes());
         ext.push(1);
         ext.extend_from_slice(&0u16.to_be_bytes());
         ext.extend_from_slice(&0u16.to_be_bytes());
-
-        // Extension: supported_groups - Type 10
-        ext.extend_from_slice(&10u16.to_be_bytes());
-        ext.extend_from_slice(&4u16.to_be_bytes());
-        ext.extend_from_slice(&2u16.to_be_bytes());
-        ext.extend_from_slice(&29u16.to_be_bytes());
-
-        // Extension: ec_point_formats - Type 11
-        ext.extend_from_slice(&11u16.to_be_bytes());
-        ext.extend_from_slice(&2u16.to_be_bytes());
-        ext.push(1);
-        ext.push(0);
 
         hello.extend_from_slice(&(ext.len() as u16).to_be_bytes());
         hello.extend_from_slice(&ext);
@@ -600,9 +616,20 @@ impl TlsStream {
         let key_share_len = 2 + 2 + key_bytes.len();
         ext.extend_from_slice(&51u16.to_be_bytes());
         ext.extend_from_slice(&(key_share_len as u16).to_be_bytes());
-        ext.extend_from_slice(&29u16.to_be_bytes());
+        ext.extend_from_slice(&0x001du16.to_be_bytes());
         ext.extend_from_slice(&(key_bytes.len() as u16).to_be_bytes());
         ext.extend_from_slice(&key_bytes);
+
+        if let Some(protocol) = self.negotiated_protocol {
+            ext.extend_from_slice(&16u16.to_be_bytes());
+            
+            let proto_wire = protocol.wire_format();
+            let alpn_data_len = 2 + proto_wire.len();
+            
+            ext.extend_from_slice(&(alpn_data_len as u16).to_be_bytes());
+            ext.extend_from_slice(&(proto_wire.len() as u16).to_be_bytes());
+            ext.extend_from_slice(&proto_wire);
+        }
 
         hello.extend_from_slice(&(ext.len() as u16).to_be_bytes());
         hello.extend_from_slice(&ext);
@@ -612,9 +639,29 @@ impl TlsStream {
 
     fn build_encrypted_extensions(&self) -> Result<Vec<u8>, TlsError> {
         let mut ext = Vec::new();
-        ext.extend_from_slice(&0u16.to_be_bytes());
+        if let Some(protocol) = self.negotiated_protocol {
+            if !self.is_client {
+                ext.extend_from_slice(&16u16.to_be_bytes());
+                
+                let proto_wire = protocol.wire_format();
+                let alpn_data_len = 2 + proto_wire.len();
+                
+                ext.extend_from_slice(&(alpn_data_len as u16).to_be_bytes());
+                ext.extend_from_slice(&(proto_wire.len() as u16).to_be_bytes());
+                ext.extend_from_slice(&proto_wire);
+            }
+        }
+        
+        if !self.is_client && self.server_name.is_some() {
+            ext.extend_from_slice(&0u16.to_be_bytes());
+            ext.extend_from_slice(&0u16.to_be_bytes());
+        }
 
-        Ok(ext)
+        let mut result = Vec::new();
+        result.extend_from_slice(&(ext.len() as u16).to_be_bytes());
+        result.extend_from_slice(&ext);
+
+        Ok(result)
     }
 
     fn build_certificate(&self) -> Result<Vec<u8>, TlsError> {
@@ -1339,6 +1386,18 @@ impl TlsStream {
         Ok(())
     }
 
+    pub fn stream_into_inner(self) -> Result<TcpStream, TlsError> {
+        self.stream.try_clone().map_err(TlsError::Io)
+    }
+
+    pub fn stream_get_ref(&self) -> &TcpStream {
+        &self.stream
+    }
+
+    pub fn stream_get_mut(&mut self) -> &mut TcpStream {
+        &mut self.stream
+    }
+
     pub fn set_read_timeout(&self, dur: Option<std::time::Duration>) -> Result<(), TlsError> {
         self.stream.set_read_timeout(dur)?;
         Ok(())
@@ -1347,6 +1406,207 @@ impl TlsStream {
     pub fn set_write_timeout(&self, dur: Option<std::time::Duration>) -> Result<(), TlsError> {
         self.stream.set_write_timeout(dur)?;
         Ok(())
+    }
+
+    pub fn set_alpn_protocols(&mut self, protocols: Vec<AlpnProtocol>) {
+        let mut new_negotiator = AlpnNegotiator::with_protocols(protocols);
+        new_negotiator.set_server_preference(false);
+        self.alpn_negotiator = new_negotiator;
+    }
+
+    pub fn get_negotiated_protocol(&self) -> Option<AlpnProtocol> {
+        self.negotiated_protocol
+    }
+
+    pub fn negotiate_alpn(&mut self, server_alpn_data: &[u8]) -> Result<AlpnProtocol, TlsError> {
+        self.alpn_negotiator.negotiate(server_alpn_data)
+            .map_err(|e| TlsError::HandshakeFailed(format!("ALPN negotiation failed: {}", e)))
+    }
+
+    pub fn extract_alpn_from_handshake(&self, server_hello_data: &[u8]) -> Result<Vec<u8>, TlsError> {
+        if server_hello_data.len() < 38 {
+            return Err(TlsError::HandshakeFailed(
+                "ServerHello too short".to_string(),
+            ));
+        }
+
+        let mut pos = 34;
+        let session_id_len = server_hello_data[pos] as usize;
+        pos += 1 + session_id_len;
+        if pos + 4 > server_hello_data.len() {
+            return Err(TlsError::HandshakeFailed(
+                "ServerHello truncated before extensions".to_string(),
+            ));
+        }
+        
+        pos += 3;
+        if pos + 2 > server_hello_data.len() {
+            return Err(TlsError::HandshakeFailed(
+                "ServerHello missing extensions length".to_string(),
+            ));
+        }
+        
+        let ext_len = u16::from_be_bytes([
+            server_hello_data[pos],
+            server_hello_data[pos + 1]
+        ]) as usize;
+
+        pos += 2;
+        let ext_end = pos + ext_len;
+        if ext_end > server_hello_data.len() {
+            return Err(TlsError::HandshakeFailed(
+                "ServerHello extensions truncated".to_string(),
+            ));
+        }
+        
+        while pos + 4 <= ext_end {
+            let ext_type = u16::from_be_bytes([
+                server_hello_data[pos],
+                server_hello_data[pos + 1]
+            ]);
+            let ext_data_len = u16::from_be_bytes([
+                server_hello_data[pos + 2],
+                server_hello_data[pos + 3]
+            ]) as usize;
+
+            pos += 4;
+            if pos + ext_data_len > ext_end {
+                return Err(TlsError::HandshakeFailed(
+                    "Extension data exceeds extensions boundary".to_string(),
+                ));
+            }
+            
+            if ext_type == 16 {
+                return Ok(server_hello_data[pos..pos + ext_data_len].to_vec());
+            }
+            
+            pos += ext_data_len;
+        }
+        
+        Ok(Vec::new())
+    }
+
+    pub fn complete_alpn_negotiation(&mut self) -> Result<Option<AlpnProtocol>, TlsError> {
+        if !self.alpn_negotiator.is_negotiated() {
+            return Ok(None);
+        }
+        
+        self.negotiated_protocol = self.alpn_negotiator.selected();
+        Ok(self.negotiated_protocol)
+    }
+
+    pub fn init_alpn_client(&mut self, preferred: Vec<AlpnProtocol>) {
+        self.alpn_negotiator = AlpnNegotiator::with_protocols(preferred);
+        self.alpn_negotiator.set_server_preference(false);
+    }
+
+    pub fn build_alpn_extension(&self) -> Vec<u8> {
+        let mut extension = Vec::new();
+        extension.extend_from_slice(&16u16.to_be_bytes());
+        let protocols_wire = self.alpn_negotiator.supported_protocols_wire();
+        let ext_len = 2 + protocols_wire.len();
+        extension.extend_from_slice(&(ext_len as u16).to_be_bytes());
+        extension.extend_from_slice(&(protocols_wire.len() as u16).to_be_bytes());
+        extension.extend_from_slice(&protocols_wire);
+        
+        extension
+    }
+
+    pub fn parse_alpn_extension(&mut self, extension_data: &[u8]) -> Result<(), TlsError> {
+        if extension_data.len() < 3 {
+            return Err(TlsError::HandshakeFailed(
+                "ALPN extension too short".to_string(),
+            ));
+        }
+
+        let list_len = u16::from_be_bytes([extension_data[0], extension_data[1]]) as usize;        
+        if extension_data.len() < 2 + list_len {
+            return Err(TlsError::HandshakeFailed(
+                "ALPN extension data truncated".to_string(),
+            ));
+        }
+
+        if list_len == 0 {
+            return Err(TlsError::HandshakeFailed(
+                "Server sent empty ALPN list".to_string(),
+            ));
+        }
+
+        let proto_len = extension_data[2] as usize;
+        if proto_len == 0 || 2 + 1 + proto_len > 2 + list_len {
+            return Err(TlsError::HandshakeFailed(
+                "Invalid ALPN protocol length".to_string(),
+            ));
+        }
+
+        let proto_data = &extension_data[3..3 + proto_len];
+        if let Some(protocol) = AlpnProtocol::from_wire(proto_data) {
+            let protocol_wire = protocol.wire_format();
+            let supported_wire = self.alpn_negotiator.supported_protocols_wire();
+            let mut is_supported = false;
+            let mut pos = 0;
+            while pos < supported_wire.len() {
+                if pos >= supported_wire.len() {
+                    break;
+                }
+                let len = supported_wire[pos] as usize;
+                pos += 1;
+                if pos + len <= supported_wire.len() {
+                    let supported_proto = &supported_wire[pos..pos + len];
+                    if supported_proto == &protocol_wire[1..] {
+                        is_supported = true;
+                        break;
+                    }
+                    pos += len;
+                } else {
+                    break;
+                }
+            }
+            
+            if !is_supported {
+                return Err(TlsError::HandshakeFailed(format!(
+                    "Server selected protocol '{}' not in client offer",
+                    protocol.name()
+                )));
+            }
+            
+            self.negotiated_protocol = Some(protocol);
+            Ok(())
+        } else {
+            Err(TlsError::HandshakeFailed(format!(
+                "Unknown ALPN protocol: {:?}",
+                proto_data
+            )))
+        }
+    }
+
+    pub fn validate_negotiated_protocol(&self, expected: &[AlpnProtocol]) -> Result<(), TlsError> {
+        match self.negotiated_protocol {
+            Some(proto) => {
+                if expected.is_empty() {
+                    return Ok(());
+                }
+                
+                if expected.contains(&proto) {
+                    Ok(())
+                } else {
+                    Err(TlsError::ProtocolNegotiationFailed(format!(
+                        "Server negotiated unexpected protocol: {} (expected one of: {:?})",
+                        proto.name(),
+                        expected.iter().map(|p| p.name()).collect::<Vec<_>>()
+                    )))
+                }
+            }
+            None => {
+                if expected.is_empty() {
+                    Ok(())
+                } else {
+                    Err(TlsError::ProtocolNegotiationFailed(
+                        "Server did not negotiate ALPN protocol".to_string(),
+                    ))
+                }
+            }
+        }
     }
 
     pub fn try_clone(&self) -> Result<TlsStream, TlsError> {
@@ -1368,6 +1628,8 @@ impl TlsStream {
             server_seq: 0,
             handshake_msg: Vec::new(),
             resuming_session: self.resuming_session,
+            alpn_negotiator: self.alpn_negotiator.clone(),
+            negotiated_protocol: self.negotiated_protocol.clone(),
         })
     }
 }
@@ -1473,6 +1735,7 @@ impl std::fmt::Display for TlsError {
             TlsError::UnsupportedVersion => write!(f, "Unsupported TLS Version"),
             TlsError::NoSharedCipher => write!(f, "No Shared Cipher Suite"),
             TlsError::VerificationFailed(msg) => write!(f, "Verification Failed: {}", msg),
+            TlsError::ProtocolNegotiationFailed(msg) => write!(f, "Protocol Negotiation Failed: {}", msg),
         }
     }
 }
@@ -1549,6 +1812,8 @@ mod tls_tests {
             server_name: None,
             session_id: Vec::new(),
             resuming_session: false,
+            alpn_negotiator: AlpnNegotiator::new(),
+            negotiated_protocol: None,
         };
 
         let client_ciphers = vec![0x1301, 0x1302];
@@ -1578,6 +1843,8 @@ mod tls_tests {
             server_name: None,
             session_id: Vec::new(),
             resuming_session: false,
+            alpn_negotiator: AlpnNegotiator::new(),
+            negotiated_protocol: None,
         };
 
         let client_hello = vec![
@@ -1618,6 +1885,8 @@ mod tls_tests {
             server_name: None,
             session_id: Vec::new(),
             resuming_session: false,
+            alpn_negotiator: AlpnNegotiator::new(),
+            negotiated_protocol: None,
         };
 
         let server_hello = vec![

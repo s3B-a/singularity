@@ -25,7 +25,7 @@ pub struct Http2Stream {
     request_headers: Vec<(String, String)>,
     response_headers: Vec<(String, String)>,
     trailers: Vec<(String, String)>,
-    headers_received: bool,
+    pub headers_received: bool,
     headers_sent: bool,
     end_stream_received: bool,
     pub end_stream_sent: bool,

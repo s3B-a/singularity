@@ -1,14 +1,16 @@
+pub mod alpn;
 mod connection;
 mod error;
 mod flow_control;
 mod frame;
-mod hpack;
+pub mod hpack;
 mod priority;
 mod push;
 mod settings;
 mod stream;
 mod scheduler;
 
+pub use alpn::{AlpnNegotiator, AlpnProtocol, NpnNegotiator, NpnProtocol};
 pub use connection::Http2Connection;
 pub use error::{ErrorCode, Http2Error, Result};
 pub use flow_control::FlowControl;
