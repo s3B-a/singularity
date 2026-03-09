@@ -7,14 +7,10 @@ pub mod dns;
 pub mod cookie;
 pub mod connection_pool;
 
-#[cfg(feature = "https")]
-pub mod https;
-
-pub use tcp::TcpStream;
+pub use tcp::{TcpStream, TcpListener};
 pub use udp::UdpSocket;
-pub use http::HttpClient;
-pub use http::HttpServer;
-pub use https::HttpsServer;
+pub use http::{HttpClient, HttpServer, HttpRequest, HttpResponse, HttpMethod, HttpVersion};
+pub use https::{HttpsServer, HttpsClient};
 pub use dns::DnsResolver;
 pub use cookie::CookieJar;
 
@@ -33,11 +29,19 @@ pub enum NetErr {
     DnsResFailed,
     InvalidResponse,
     ConnectionClosed,
+    Http3Error(String),
+    ProtocolError(String),
 }
 
 impl From<io::Error> for NetErr {
     fn from(err: io::Error) -> Self {
         NetErr::Io(err)
+    }
+}
+
+impl From<crate::net::http::http3::Error> for NetErr {
+    fn from(err: crate::net::http::http3::Error) -> Self {
+        NetErr::Http3Error(format!("{}", err))
     }
 }
 
@@ -51,6 +55,8 @@ impl std::fmt::Display for NetErr {
             NetErr::DnsResFailed => write!(f, "DNS Resolution Failed"),
             NetErr::InvalidResponse => write!(f, "Invalid Response"),
             NetErr::ConnectionClosed => write!(f, "Connection Closed"),
+            NetErr::Http3Error(msg) => write!(f, "HTTP/3 Error: {}", msg),
+            NetErr::ProtocolError(msg) => write!(f, "Protocol Error: {}", msg),
         }
     }
 }

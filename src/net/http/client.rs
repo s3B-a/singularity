@@ -1,5 +1,7 @@
 use super::auth::{Authenticator, Credentials, AuthChallenge};
 use super::http2::Http2Connection;
+use super::http3_client::Http3Client;
+use super::http3::Config as Http3Config;
 use super::method::HttpMethod;
 use super::version::HttpVersion;
 use super::request::HttpRequest;
@@ -598,6 +600,33 @@ impl HttpClientBuilder {
         self
     }
 
+    pub fn enable_http3(mut self, enable: bool) -> Self {
+        self.client.enable_http3 = enable;
+        if enable && self.client.http3_client.is_none() {
+            self.client.http3_client = Some(Http3Client::new());
+        }
+
+        self
+    }
+
+    pub fn http3_config(mut self, config: Http3Config) -> Self {
+        self.client.http3_client = Some(Http3Client::with_config(config));
+        self.client.enable_http3 = true;
+
+        self
+    }
+
+    pub fn http3_timeout(mut self, timeout: Duration) -> Self {
+        if let Some(ref mut client) = self.client.http3_client {
+            *client = std::mem::take(client).with_timeout(timeout);
+        } else {
+            self.client.http3_client = Some(Http3Client::new().with_timeout(timeout));
+        }
+
+        self.client.enable_http3 = true;
+        self
+    }
+
     pub fn build(self) -> HttpClient {
         self.client
     }
@@ -695,6 +724,8 @@ pub struct HttpClient {
     auto_auth: bool,
     challenge_cache: HashMap<String, CachedChallenge>,
     challenge_cache_ttl: Duration,
+    enable_http3: bool,
+    http3_client: Option<Http3Client>,
 }
 
 impl HttpClient {
@@ -727,6 +758,8 @@ impl HttpClient {
             auto_auth: true,
             challenge_cache: HashMap::new(),
             challenge_cache_ttl: Duration::from_secs(300),
+            enable_http3: false,
+            http3_client: None,
         }
     }
 
@@ -1741,6 +1774,51 @@ impl HttpClient {
             response_headers,
             body,
         ))
+    }
+
+    pub fn with_http3(mut self, enable: bool) -> Self {
+        self.enable_http3 = enable;
+        if enable {
+            self.http3_client = Some(Http3Client::new());
+        }
+
+        self
+    }
+
+    pub fn set_http3_config(&mut self, config: Http3Config) {
+        self.http3_client = Some(Http3Client::with_config(config));
+        self.enable_http3 = true;
+    }
+
+    fn send_request_internal(&mut self, request: &HttpRequest, url: &str) -> io::Result<HttpResponse> {
+        if self.enable_http3 {
+            if let Some(http3_info) = self.check_alt_svc(url) {
+                return self.send_http3_request(request, http3_info);
+            }
+        }
+
+        self.send_request(request, url)
+    }
+
+    fn check_alt_svc(&self, url: &str) -> Option<(String, u16)> {
+        self.alt_svc_cache.get(url).and_then(|entries| {
+                entries.iter().find(|(version, _, _)| *version == HttpVersion::Http3).map(|(_, host, port)| (host.clone(), *port))
+        })
+    }
+
+    fn send_http3_request(&mut self, request: &HttpRequest, (host, port): (String, u16)) -> io::Result<HttpResponse> {
+        if self.http3_client.is_none() {
+            self.http3_client = Some(Http3Client::new());
+        }
+
+        let client = self.http3_client.as_mut().unwrap();
+        client.request(request.clone()).map_err(|e| io::Error::new(io::ErrorKind::Other, format!("HTTP/3 error: {}", e)))
+    }
+
+    pub fn cleanup_http3(&mut self) {
+        if let Some(ref mut client) = self.http3_client {
+            client.cleanup();
+        }
     }
 
     fn read_trailing_headers(&self, reader: &mut BufReader<TcpStream>, has_trailer_header: bool, expected_trailers: &[String]) -> Result<HashMap<String, String>, io::Error> {

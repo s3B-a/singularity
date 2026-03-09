@@ -2,6 +2,7 @@
 // https://tools.ietf.org/html/rfc8017
 
 use crate::crypto::{Error, Result};
+use crate::crypto::encoding::pem;
 use crate::crypto::bignum::BigNum;
 use crate::crypto::hash::sha2::Sha256;
 use crate::crypto::random;
@@ -45,8 +46,6 @@ pub struct RsaPublicKey {
     n: BigNum,
     e: BigNum,
     size: RsaKeySize,
-
-
 }
 
 // RSA Private Key Components for serialization and deserialization
@@ -460,6 +459,68 @@ impl RsaPublicKey {
         };
 
         Ok(Self { n, e, size })
+    }
+
+    pub fn to_der(&self) -> Vec<u8> {
+        let n_bytes = self.n.to_bytes_be();
+        let e_bytes = self.e.to_bytes_be();
+        
+        let mut der = Vec::new();
+        der.push(0x30);
+        der.push((2 + n_bytes.len() + 2 + e_bytes.len()) as u8);
+        der.push(0x02);
+        der.push(n_bytes.len() as u8);
+        der.extend_from_slice(&n_bytes);
+        der.push(0x02);
+        der.push(e_bytes.len() as u8);
+        der.extend_from_slice(&e_bytes);
+        
+        der
+    }
+
+    pub fn from_der(der: &[u8]) -> Result<Self> {
+        Self::from_bytes(der)
+    }
+
+    pub fn to_pem(&self) -> String {
+        let der = self.to_der();
+        let b64 = pem::encode(&der);
+        let mut pem = String::new();
+        pem.push_str("-----BEGIN PUBLIC KEY-----\n");
+        for chunk in b64.as_bytes().chunks(64) {
+            pem.push_str(std::str::from_utf8(chunk).unwrap());
+            pem.push('\n');
+        }
+        pem.push_str("-----END PUBLIC KEY-----\n");
+        
+        pem
+    }
+
+    pub fn from_pem(pem_str: &str) -> Result<Self> {
+        let b64 = pem_str
+            .lines()
+            .filter(|line| !line.starts_with("-----"))
+            .collect::<String>();
+        let der = pem::decode(&b64)?;
+        Self::from_bytes(&der)
+    }
+
+    pub fn verify_pss(&self, message_hash: &[u8], signature: &[u8]) -> Result<bool> {
+        let s = BigNum::from_bytes_be(signature);
+        if s.cmp(&self.n) != Ordering::Less {
+            return Ok(false);
+        }
+        
+        let m = s.mod_exp(&self.e, &self.n)?;
+        let mut m_bytes = m.to_bytes_be();
+        let target_len = self.size.bytes();
+        if m_bytes.len() < target_len {
+            let mut padded = vec![0u8; target_len - m_bytes.len()];
+            padded.extend_from_slice(&m_bytes);
+            m_bytes = padded;
+        }
+        
+        verify_pss_sha256(&m_bytes, message_hash)
     }
 }
 
