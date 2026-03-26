@@ -1,0 +1,618 @@
+use super::utils::{BitReader, BitWriter, SlidingWindow, adler32};
+use super::{Compressor, Decompressor, CompressionLevel};
+use std::io;
+
+const BLOCKTYPE_UNCOMPRESSED: u8 = 0;
+const BLOCKTYPE_FIXED_HUFFMAN: u8 = 1;
+const BLOCKTYPE_DYNAMIC_HUFFMAN: u8 = 2;
+
+const MAX_MATCH_DISTANCE: usize = 32768;
+const MAX_MATCH_LENGTH: usize = 258;
+const MIN_MATCH_LENGTH: usize = 3;
+const MAX_UNCOMPRESSED_BLOCK_LEN: usize = 65535;
+
+const FIXED_LITERAL_CODE_LENGTHS: [u8; 288] = {
+    let mut lengths = [0u8; 288];
+    let mut i = 0;
+    while i < 144 { lengths[i] = 8; i += 1; }
+    while i < 256 { lengths[i] = 9; i += 1; }
+    while i < 280 { lengths[i] = 7; i += 1; }
+    while i < 288 { lengths[i] = 8; i += 1; }
+    lengths
+};
+
+const FIXED_DISTANCE_CODE_LENGTHS: [u8; 32] = [5; 32];
+
+const LENGTH_CODES: [(u16, u8, u16); 29] = [
+    (3, 0, 257), (4, 0, 258), (5, 0, 259), (6, 0, 260), (7, 0, 261),
+    (8, 0, 262), (9, 0, 263), (10, 0, 264), (11, 1, 265), (13, 1, 266),
+    (15, 1, 267), (17, 1, 268), (19, 2, 269), (23, 2, 270), (27, 2, 271),
+    (31, 2, 272), (35, 3, 273), (43, 3, 274), (51, 3, 275), (59, 3, 276),
+    (67, 4, 277), (83, 4, 278), (99, 4, 279), (115, 4, 280), (131, 5, 281),
+    (163, 5, 282), (195, 5, 283), (227, 5, 284), (258, 0, 285),
+];
+
+const DISTANCE_CODES: [(u16, u8, u8); 30] = [
+    (1, 0, 0), (2, 0, 1), (3, 0, 2), (4, 0, 3), (5, 1, 4), (7, 1, 5),
+    (9, 2, 6), (13, 2, 7), (17, 3, 8), (25, 3, 9), (33, 4, 10), (49, 4, 11),
+    (65, 5, 12), (97, 5, 13), (129, 6, 14), (193, 6, 15), (257, 7, 16),
+    (385, 7, 17), (513, 8, 18), (769, 8, 19), (1025, 9, 20), (1537, 9, 21),
+    (2049, 10, 22), (3073, 10, 23), (4097, 11, 24), (6145, 11, 25),
+    (8193, 12, 26), (12289, 12, 27), (16385, 13, 28), (24577, 13, 29),
+];
+
+#[derive(Debug, Clone)]
+struct HuffmanCode {
+    symbol: u16,
+    code: u16,
+    length: u8,
+}
+
+#[derive(Debug, Clone)]
+struct HuffmanTree {
+    codes: Vec<HuffmanCode>,
+}
+
+impl HuffmanTree {
+    fn build_from_lengths(code_lengths: &[u8]) -> Self {
+        let mut codes = Vec::new();
+        let max_len = *code_lengths.iter().max().unwrap_or(&0) as usize;
+        if max_len == 0 {
+            return Self { codes };
+        }
+
+        let mut bl_count = vec![0u16; max_len + 1];
+        for &len in code_lengths {
+            if len > 0 {
+                bl_count[len as usize] += 1;
+            }
+        }
+
+        let mut next_code = vec![0u16; max_len + 1];
+        let mut code = 0u16;
+        for bits in 1..=max_len {
+            code = (code + bl_count[bits - 1]) << 1;
+            next_code[bits] = code;
+        }
+
+        for (symbol, &len) in code_lengths.iter().enumerate() {
+            if len > 0 {
+                let code = next_code[len as usize];
+                next_code[len as usize] += 1;
+                codes.push(HuffmanCode {
+                    symbol: symbol as u16,
+                    code,
+                    length: len,
+                });
+            }
+        }
+
+        Self { codes }
+    }
+
+    fn encode(&self, symbol: u16) -> Option<(u16, u8)> {
+        self.codes.iter().find(|c| c.symbol == symbol).map(|c| (c.code, c.length))
+    }
+
+    fn decode(&self, reader: &mut BitReader) -> Option<u16> {
+        if self.codes.is_empty() {
+            return None;
+        }
+
+        let mut code = 0u16;
+        let max_bits = self.codes.iter().map(|c| c.length).max().unwrap_or(15) as usize;
+        for bit_len in 1..=max_bits {
+            let bit = reader.read_bits(1)? as u16;
+            code = (code << 1) | bit;
+            for huffman_code in &self.codes {
+                if huffman_code.length == bit_len as u8 && huffman_code.code == code {
+                    match huffman_code.symbol {
+                        0..=255 | 256..=285 | 256 => return Some(huffman_code.symbol),
+                        _ => return None,
+                    }
+                }
+            }
+        }
+
+        None
+    }
+}
+
+pub struct DeflateCompressor {
+    level: CompressionLevel,
+    window: SlidingWindow,
+}
+
+impl DeflateCompressor {
+    pub fn new(level: CompressionLevel) -> Self {
+        Self {
+            level,
+            window: SlidingWindow::new(MAX_MATCH_DISTANCE),
+        }
+    }
+
+    fn compress_block(&mut self, data: &[u8], final_block: bool) -> io::Result<Vec<u8>> {
+        let mut writer = BitWriter::new();
+        writer.write_bits(if final_block { 1 } else { 0 }, 1);
+        self.write_uncompressed_block(&mut writer, data)?;
+        Ok(writer.finish())
+    }
+
+    fn write_uncompressed_block(&self, writer: &mut BitWriter, data: &[u8]) -> io::Result<()> {
+        writer.write_bits(BLOCKTYPE_UNCOMPRESSED as u32, 2);
+        writer.align_to_byte();
+
+        let len = data.len() as u16;
+        let nlen = !len;
+
+        writer.write_bits(len as u32, 16);
+        writer.write_bits(nlen as u32, 16);
+        for &byte in data {
+            writer.write_bits(byte as u32, 8);
+        }
+
+        Ok(())
+    }
+
+    fn write_compressed_block(&mut self, writer: &mut BitWriter, data: &[u8]) -> io::Result<()> {
+        let literal = HuffmanTree::build_from_lengths(&FIXED_LITERAL_CODE_LENGTHS);
+        let distance = HuffmanTree::build_from_lengths(&FIXED_DISTANCE_CODE_LENGTHS);
+        let mut i = 0;
+        while i < data.len() {
+            let remaining = &data[i..];
+            let max_len = remaining.len().min(MAX_MATCH_LENGTH);
+            if let Some((dist, length)) = self.window.find_match(remaining, max_len) {
+                if length >= MIN_MATCH_LENGTH {
+                    let (length_code, extra_bits, extra_len) = Self::get_length_code(length);
+                    if let Some((code, code_len)) = literal.encode(length_code) {
+                        writer.write_bits_reverse(code as u32, code_len);
+                        if extra_len > 0 {
+                            writer.write_bits(extra_bits as u32, extra_len);
+                        }
+                    }
+                    
+                    let (dist_code, extra_bits, extra_len) = Self::get_distance_code(dist);
+                    if let Some((code, code_len)) = distance.encode(dist_code) {
+                        writer.write_bits_reverse(code as u32, code_len);
+                        if extra_len > 0 {
+                            writer.write_bits(extra_bits as u32, extra_len);
+                        }
+                    }
+                    
+                    for j in 0..length {
+                        self.window.push(data[i + j]);
+                    }
+
+                    i += length;
+                    continue;
+                }
+            }
+
+            let byte = data[i];
+            if let Some((code, code_len)) = literal.encode(byte as u16) {
+                writer.write_bits_reverse(code as u32, code_len);
+            }
+
+            self.window.push(byte);
+            i += 1;
+        }
+
+        if let Some((code, code_len)) = literal.encode(256) {
+            writer.write_bits_reverse(code as u32, code_len);
+        }
+
+        Ok(())
+    }
+
+    fn get_length_code(length: usize) -> (u16, u16, u8) {
+        for &(base, extra_bits, code) in &LENGTH_CODES {
+            let next_base = LENGTH_CODES.iter().find(|&&(b, _, _)| b > base).map(|&(b, _, _)| b).unwrap_or(259);
+            if length >= base as usize && length < next_base as usize {
+                let extra = (length - base as usize) as u16;
+                return (code as u16, extra, extra_bits);
+            }
+        }
+
+        (285, 0, 0)
+    }
+
+    fn get_distance_code(distance: usize) -> (u16, u16, u8) {
+        for &(base, extra_bits, code) in &DISTANCE_CODES {
+            let next_base = DISTANCE_CODES.iter().find(|&&(b, _, _)| b > base).map(|&(b, _, _)| b).unwrap_or(32769);
+            if distance >= base as usize && distance < next_base as usize {
+                let extra = (distance - base as usize) as u16;
+                return (code as u16, extra, extra_bits);
+            }
+        }
+
+        (29, 0, 0)
+    }
+}
+
+pub struct DeflateDecompressor {
+    window: SlidingWindow,
+}
+
+impl DeflateDecompressor {
+    pub fn new() -> Self {
+        Self {
+            window: SlidingWindow::new(MAX_MATCH_DISTANCE),
+        }
+    }
+
+    fn decompress_block(&mut self, reader: &mut BitReader) -> io::Result<Vec<u8>> {
+        let mut output = Vec::new();
+        loop {
+            let bfinal = reader.read_bits(1).ok_or_else(
+                ||io::Error::new(io::ErrorKind::UnexpectedEof, "Unexpected EOF reading BFINAL"))?;
+            let btype = reader.read_bits(2).ok_or_else(
+                || io::Error::new(io::ErrorKind::UnexpectedEof, "Unexpected EOF reading BTYPE"))? as u8;
+            
+            match btype {
+                BLOCKTYPE_UNCOMPRESSED => {
+                    self.read_uncompressed_block(reader, &mut output)?;
+                }
+                BLOCKTYPE_FIXED_HUFFMAN => {
+                    self.read_fixed_huffman_block(reader, &mut output)?;
+                }
+                BLOCKTYPE_DYNAMIC_HUFFMAN => {
+                    self.read_dynamic_huffman_block(reader, &mut output)?;
+                }
+                _ => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData, "Invalid block type"));
+                }
+            }
+
+            if bfinal == 1 {
+                break;
+            }
+        }
+
+        Ok(output)
+    }
+
+    fn read_uncompressed_block(&mut self, reader: &mut BitReader, output: &mut Vec<u8>) -> io::Result<()> {
+        reader.align_to_byte();
+        let len = reader.read_bits(16).ok_or_else(
+            || io::Error::new(io::ErrorKind::UnexpectedEof, "EOF reading length"))? as u16;
+        let nlen = reader.read_bits(16).ok_or_else(
+            || io::Error::new(io::ErrorKind::UnexpectedEof, "EOF reading nlen"))? as u16;
+        
+        if len != !nlen {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData, "Invalid uncompressed block length"))
+        }
+
+        for _ in 0..len {
+            let byte = reader.read_bits(8).ok_or_else(
+                || io::Error::new(io::ErrorKind::UnexpectedEof, "EOF reading byte"))? as u8;
+            
+            output.push(byte);
+            self.window.push(byte);
+        }
+
+        Ok(())
+    }
+
+    fn read_fixed_huffman_block(&mut self, reader: &mut BitReader, output: &mut Vec<u8>) -> io::Result<()> {
+        let literal = HuffmanTree::build_from_lengths(&FIXED_LITERAL_CODE_LENGTHS);
+        let distance = HuffmanTree::build_from_lengths(&FIXED_DISTANCE_CODE_LENGTHS);
+        if literal.codes.is_empty() || distance.codes.is_empty() {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "Empty Huffman trees"));
+        }
+
+        self.decode_huffman_data(reader, &literal, &distance, output)
+    }
+
+    fn read_dynamic_huffman_block(&mut self, reader: &mut BitReader, output: &mut Vec<u8>) -> io::Result<()> {
+        let hlit = reader.read_bits(5).ok_or_else(
+            || io::Error::new(io::ErrorKind::UnexpectedEof, "EOF"))?+ 257;
+        
+        let hlit = hlit.min(286) as usize;
+        
+        let hdist = reader.read_bits(5).ok_or_else(
+            || io::Error::new(io::ErrorKind::UnexpectedEof, "EOF"))? + 1;
+        
+        let hdist = hdist.min(30) as usize;
+        
+        let hclen = reader.read_bits(4).ok_or_else(
+            || io::Error::new(io::ErrorKind::UnexpectedEof, "EOF"))? + 4;
+
+        const CODE_LENGTH_ORDER: [usize; 19] = [
+            16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15
+        ];
+
+        let mut code_length_lengths = vec![0u8; 19];
+        for i in 0..hclen as usize {
+            if i >= CODE_LENGTH_ORDER.len() {
+                break;
+            }
+
+            let len = reader.read_bits(3).ok_or_else(
+                || io::Error::new(io::ErrorKind::UnexpectedEof, "EOF"))?;
+            
+            code_length_lengths[CODE_LENGTH_ORDER[i]] = len as u8;
+        }
+
+        let code_length_tree = HuffmanTree::build_from_lengths(&code_length_lengths);
+        let mut literal_lengths = Vec::new();
+        while literal_lengths.len() < hlit {
+            self.decode_code_lengths(reader, &code_length_tree, &mut literal_lengths)?;
+        }
+
+        literal_lengths.truncate(hlit);
+        let mut distance_lengths = Vec::new();
+        while distance_lengths.len() < hdist {
+            self.decode_code_lengths(reader, &code_length_tree, &mut distance_lengths)?;
+        }
+
+        distance_lengths.truncate(hdist);
+        let literal_tree = HuffmanTree::build_from_lengths(&literal_lengths);
+        let distance_tree = HuffmanTree::build_from_lengths(&distance_lengths);
+
+        self.decode_huffman_data(reader, &literal_tree, &distance_tree, output)
+    }
+
+    fn decode_code_lengths(&self, reader: &mut BitReader, tree: &HuffmanTree, lengths: &mut Vec<u8>) -> io::Result<()> {
+        let symbol = tree.decode(reader).ok_or_else(
+            || io::Error::new(io::ErrorKind::InvalidData, "Invalid code"))?;
+        
+        match symbol {
+            0..=15 => {
+                lengths.push(symbol as u8);
+            }
+            16 => {
+                let repeat = reader.read_bits(2).ok_or_else(
+                    || io::Error::new(io::ErrorKind::UnexpectedEof, "EOF"))? + 3;
+                
+                let prev = *lengths.last().unwrap_or(&0);
+                for _ in 0..repeat {
+                    lengths.push(prev);
+                }
+            }
+            17 => {
+                let repeat = reader.read_bits(3).ok_or_else(
+                    || io::Error::new(io::ErrorKind::UnexpectedEof, "EOF"))? + 3;
+                
+                for _ in 0..repeat {
+                    lengths.push(0);
+                }
+            }
+            18 => {
+                let repeat = reader.read_bits(7).ok_or_else(
+                    || io::Error::new(io::ErrorKind::UnexpectedEof, "EOF"))? + 11;
+                
+                for _ in 0..repeat {
+                    lengths.push(0);
+                }
+            }
+            _ => {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid code length symbol"));
+            }
+        }
+
+        Ok(())
+    }
+
+    fn decode_distance(code: u16, reader: &mut BitReader) -> io::Result<(usize, u8)> {
+        let code_idx = if code as usize >= DISTANCE_CODES.len() {
+            DISTANCE_CODES.len() - 1
+        } else {
+            code as usize
+        };
+
+        let (base, extra_bits, _symbol_code) = DISTANCE_CODES[code_idx];
+        let extra = if extra_bits > 0 {
+            reader.read_bits(extra_bits).ok_or_else(
+                || io::Error::new(io::ErrorKind::UnexpectedEof, "EOF reading distance extra bits"))?
+        } else {
+            0
+        };
+
+        let distance = (base as u32 + extra) as usize;
+        if distance == 0 {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid distance: 0"));
+        }
+
+        Ok((distance, extra_bits))
+    }
+
+    fn decode_length(code: u16, reader: &mut BitReader) -> io::Result<(usize, u8)> {
+        if code < 257 || code as usize > 285 {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, 
+                format!("Invalid length code: {} (must be 257-285)", code)));
+        }
+
+        let code_index = (code - 257) as usize;
+        if code_index >= LENGTH_CODES.len() {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, 
+                format!("Invalid length code index: {}", code_index)));
+        }
+
+        let (base, extra_bits, _) = LENGTH_CODES[code_index];
+        
+        let extra = if extra_bits > 0 {
+            reader.read_bits(extra_bits).ok_or_else(
+                || io::Error::new(io::ErrorKind::UnexpectedEof, "EOF reading length extra bits"))?
+        } else {
+            0
+        };
+
+        let length = (base as u32 + extra) as usize;
+        Ok((length, extra_bits))
+    }
+
+    fn decode_huffman_data(&mut self, reader: &mut BitReader, literal_tree: &HuffmanTree, distance_tree: &HuffmanTree, output: &mut Vec<u8>) -> io::Result<()> {
+        loop {
+            let symbol = literal_tree.decode(reader);
+            match symbol {
+                Some(0..=255) => {
+                    let sym = symbol.unwrap();
+                    output.push(sym as u8);
+                    self.window.push(sym as u8);
+                }
+                Some(256) => {
+                    break;
+                }
+                Some(257..=285) => {
+                    let sym = symbol.unwrap();
+                    let (length, _extra_bits) = Self::decode_length(sym, reader)?;
+                    
+                    let dist_symbol = distance_tree.decode(reader);
+                    if dist_symbol.is_none() {
+                        return Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid distance symbol"));
+                    }
+                    
+                    let dist_code = dist_symbol.unwrap();
+                    
+                    let (distance, _) = Self::decode_distance(dist_code, reader)?;
+                    for _ in 0..length {
+                        if let Some(byte) = self.window.get(distance) {
+                            output.push(byte);
+                            self.window.push(byte);
+                        } else {
+                            return Err(io::Error::new(io::ErrorKind::InvalidData, 
+                                format!("Invalid distance: {} (window pos: {})", distance, self.window.pos)));
+                        }
+                    }
+                }
+                Some(sym) if sym > 285 => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData, 
+                        format!("Invalid symbol: {} (must be 0-285 or 256)", sym)));
+                }
+                _ => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData, 
+                        format!("Invalid symbol: {:?}", symbol)));
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
+impl Compressor for DeflateCompressor {
+    fn compress(&mut self, input: &[u8]) -> io::Result<Vec<u8>> {
+        self.window.clear();
+        if input.is_empty() {
+            return self.compress_block(&[], true);
+        }
+
+        let mut out = Vec::new();
+        let chunks: Vec<&[u8]> = input.chunks(MAX_UNCOMPRESSED_BLOCK_LEN).collect();
+
+        for (i, chunk) in chunks.iter().enumerate() {
+            let final_block = i + 1 == chunks.len();
+            let block = self.compress_block(chunk, final_block)?;
+            out.extend_from_slice(&block);
+        }
+
+        Ok(out)
+    }
+
+    fn compress_stream(&mut self, input: &[u8], output: &mut Vec<u8>) -> io::Result<()> {
+        for chunk in input.chunks(MAX_UNCOMPRESSED_BLOCK_LEN) {
+            let block = self.compress_block(chunk, false)?;
+            output.extend_from_slice(&block);
+        }
+        Ok(())
+    }
+
+    fn finish(&mut self) -> io::Result<Vec<u8>> {
+        Ok(Vec::new())
+    }
+
+    fn reset(&mut self) {
+        self.window.clear();
+    }
+}
+
+impl Decompressor for DeflateDecompressor {
+    fn decompress(&mut self, input: &[u8]) -> io::Result<Vec<u8>> {
+        let mut reader = BitReader::new(input);
+        self.window.clear();
+        self.decompress_block(&mut reader)
+    }
+
+    fn decompress_stream(&mut self, input: &[u8], output: &mut Vec<u8>) -> io::Result<()> {
+        let mut reader = BitReader::new(input);
+        let result = self.decompress_block(&mut reader)?;
+        output.extend_from_slice(&result);
+
+        Ok(())
+    }
+
+    fn finish(&mut self) -> io::Result<Vec<u8>> {
+        Ok(Vec::new())
+    }
+
+    fn reset(&mut self) {
+        self.window.clear();
+    }
+}
+
+impl Default for DeflateDecompressor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+pub fn compress(data: &[u8], level: CompressionLevel) -> io::Result<Vec<u8>> {
+    let mut compressor = DeflateCompressor::new(level);
+    compressor.compress(data)
+}
+
+pub fn decompress(data: &[u8]) -> io::Result<Vec<u8>> {
+    let mut decompressor = DeflateDecompressor::new();
+    decompressor.decompress(data)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_deflate_empty() {
+        let data = b"";
+        let compressed = compress(data, CompressionLevel::Default).unwrap();
+        let decompressed = decompress(&compressed).unwrap();
+        assert_eq!(data, decompressed.as_slice());
+    }
+
+    #[test]
+    fn test_deflate_small() {
+        let data = b"Hello, World!";
+        let compressed = compress(data, CompressionLevel::Default).unwrap();
+        let decompressed = decompress(&compressed).unwrap();
+        assert_eq!(data, decompressed.as_slice());
+    }
+
+    #[test]
+    fn test_deflate_repeated() {
+        let data = b"aaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let compressed = compress(data, CompressionLevel::Default).unwrap();
+        let decompressed = decompress(&compressed).unwrap();
+        assert_eq!(data, decompressed.as_slice());
+    }
+
+    #[test]
+    fn test_deflate_levels() {
+        let data = b"The quick brown fox jumps over the lazy dog";
+        
+        for &level in &[CompressionLevel::Fast, CompressionLevel::Default, CompressionLevel::Best] {
+            let compressed = compress(data, level).unwrap();
+            let decompressed = decompress(&compressed).unwrap();
+            assert_eq!(data, decompressed.as_slice());
+        }
+    }
+
+    #[test]
+    fn test_huffman_tree() {
+        let lengths = vec![3, 3, 3, 3, 3, 2, 4, 4];
+        let tree = HuffmanTree::build_from_lengths(&lengths);
+        assert!(!tree.codes.is_empty());
+    }
+}

@@ -14,6 +14,7 @@ pub mod chunked;
 pub mod trailer;
 pub mod server;
 pub mod negotiation;
+pub mod compression;
 
 pub use status::StatusCode;
 pub use headers::Headers;
