@@ -1,13 +1,18 @@
+use super::crypto::{CryptoKeys, CryptoState, EncryptionLevel};
 use super::error::{Error, ErrorCode, Result};
-use super::crypto::{CryptoState, EncryptionLevel, CryptoKeys};
 use super::packet::PacketNumberSpace;
-use crate::crypto::asymmetric::ecdh::{EcdhPrivateKey, EcdhPublicKey, EcdhCurve, EcdhKey};
-use crate::crypto::asymmetric::rsa::{RsaPublicKey, RsaPrivateKey};
-use crate::crypto::kdf::hkdf::Hkdf;
-use crate::crypto::hash::sha2::{sha256, sha384, sha512};
+use crate::crypto::asymmetric::ecdh::{EcdhCurve, EcdhKey, EcdhPrivateKey, EcdhPublicKey};
+use crate::crypto::asymmetric::rsa::{RsaPrivateKey, RsaPublicKey};
+use crate::crypto::constant_time_eq;
+use crate::crypto::encoding::pem;
 use crate::crypto::encoding::x509::Certificate;
+use crate::crypto::hash::hmac::hmac_sha256;
+use crate::crypto::hash::sha2::{sha256, sha384, sha512};
+use crate::crypto::kdf::hkdf::Hkdf;
 use crate::crypto::random;
-use std::collections::BTreeMap;
+use crate::net::http::compression::{self, CompressionAlgorithm, CompressionLevel};
+use std::collections::{BTreeMap, HashMap};
+use std::io;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 // TLS 1.3 Content Types
@@ -107,6 +112,172 @@ const MAX_CERT_CHAIN_LENGTH: usize = 10;
 
 // Handshake timeout
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+const QUIC_TLS_STATE_BLOB_MAGIC: &str = "SINGULARITY_HTTP3_QUIC_TLS_STATE_BLOB_V1";
+const QUIC_TLS_STATE_BLOB_CONTEXT: &str = "SINGULARITY_HTTP3_QUIC_TLS_STATE_BLOB_BINDING_V1";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SecureQuicTlsStateBlobMeta {
+    pub algorithm: CompressionAlgorithm,
+    pub nonce_b64: String,
+    pub digest_b64: String,
+    pub tag_b64: String,
+    pub raw_size: usize,
+    pub encoded_size: usize,
+    pub issued_at_unix: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuicTlsStateSnapshot {
+    pub role: String,
+    pub handshake_state: String,
+    pub cipher_suite: String,
+    pub verify_certificates: bool,
+    pub certificate_count: usize,
+    pub peer_certificate_count: usize,
+    pub negotiated_alpn: Option<String>,
+    pub has_peer_transport_params: bool,
+    pub key_update_generation: u64,
+    pub early_data_enabled: bool,
+    pub max_early_data_size: u32,
+    pub has_psk: bool,
+    pub has_session_ticket: bool,
+    pub has_early_secret: bool,
+    pub has_handshake_secret: bool,
+    pub has_master_secret: bool,
+    pub started: bool,
+    pub elapsed_ms: Option<u64>,
+}
+
+impl QuicTlsStateSnapshot {
+    pub fn to_secure_blob(&self, algorithm: CompressionAlgorithm) -> io::Result<(SecureQuicTlsStateBlobMeta, Vec<u8>)> {
+        let mut selected_algorithm = algorithm;
+        if !selected_algorithm.is_implemented() {
+            selected_algorithm = CompressionAlgorithm::Identity;
+        }
+
+        let raw_payload = serialize_quic_tls_state_snapshot(self);
+        let encoded_payload = if selected_algorithm == CompressionAlgorithm::Identity {
+            raw_payload.clone()
+        } else {
+            compression::compress(selected_algorithm, &raw_payload, CompressionLevel::Default)?
+        };
+
+        let nonce = random::generate_random(24).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::Other,
+                format!("failed to generate secure quic-tls-state nonce: {}", e),
+            )
+        })?;
+
+        let digest = sha256(&raw_payload);
+        let tag = compute_quic_tls_state_blob_tag(
+            &nonce,
+            selected_algorithm,
+            raw_payload.len(),
+            &encoded_payload,
+        );
+
+        let meta = SecureQuicTlsStateBlobMeta {
+            algorithm: selected_algorithm,
+            nonce_b64: pem::encode(&nonce),
+            digest_b64: pem::encode(&digest),
+            tag_b64: pem::encode(&tag),
+            raw_size: raw_payload.len(),
+            encoded_size: encoded_payload.len(),
+            issued_at_unix: SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
+        };
+
+        let header = format!(
+            "{magic}\ncontent-encoding={encoding}\nnonce={nonce}\ndigest=SHA-256={digest}\ntag=HMAC-SHA-256={tag}\nraw-size={raw_size}\nencoded-size={encoded_size}\nissued-at={issued_at}\n\n",
+            magic = QUIC_TLS_STATE_BLOB_MAGIC,
+            encoding = meta.algorithm.content_encoding(),
+            nonce = meta.nonce_b64,
+            digest = meta.digest_b64,
+            tag = meta.tag_b64,
+            raw_size = meta.raw_size,
+            encoded_size = meta.encoded_size,
+            issued_at = meta.issued_at_unix,
+        );
+
+        let mut blob = header.into_bytes();
+        blob.extend_from_slice(&encoded_payload);
+
+        Ok((meta, blob))
+    }
+
+    pub fn to_secure_blob_auto(&self, accept_encoding: &str) -> io::Result<(SecureQuicTlsStateBlobMeta, Vec<u8>)> {
+        self.to_secure_blob(select_secure_quic_tls_state_algorithm(accept_encoding))
+    }
+
+    pub fn from_secure_blob(data: &[u8]) -> io::Result<(SecureQuicTlsStateBlobMeta, QuicTlsStateSnapshot)> {
+        let (header, body) = split_header_body(data)?;
+        let meta = parse_secure_quic_tls_state_meta(&header, body.len())?;
+        let nonce = pem::decode(&meta.nonce_b64).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid quic-tls-state nonce encoding: {}", e),
+            )
+        })?;
+
+        let digest = pem::decode(&meta.digest_b64).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid quic-tls-state digest encoding: {}", e),
+            )
+        })?;
+
+        let tag = pem::decode(&meta.tag_b64).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid quic-tls-state tag encoding: {}", e),
+            )
+        })?;
+
+        if digest.len() != 32 || tag.len() != 32 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "quic-tls-state digest or tag has invalid length",
+            ));
+        }
+
+        let expected_tag = compute_quic_tls_state_blob_tag(&nonce, meta.algorithm, meta.raw_size, body);
+        if !constant_time_eq(&expected_tag, &tag) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "secure quic-tls-state blob tag verification failed",
+            ));
+        }
+
+        let raw_payload = if meta.algorithm == CompressionAlgorithm::Identity {
+            body.to_vec()
+        } else {
+            compression::decompress(meta.algorithm, body)?
+        };
+
+        if raw_payload.len() != meta.raw_size {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "quic-tls-state raw-size mismatch: expected {}, got {}",
+                    meta.raw_size,
+                    raw_payload.len()
+                ),
+            ));
+        }
+
+        let computed_digest = sha256(&raw_payload);
+        if !constant_time_eq(&computed_digest, &digest) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "secure quic-tls-state blob digest verification failed",
+            ));
+        }
+
+        let snapshot = deserialize_quic_tls_state_snapshot(&raw_payload)?;
+        Ok((meta, snapshot))
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HandshakeState {
@@ -268,7 +439,11 @@ impl QuicTlsState {
             early_data_enabled: false,
             max_early_data_size: 0,
             supported_versions: vec![TLS_VERSION_13],
-            supported_groups: vec![NAMED_GROUP_X25519, NAMED_GROUP_SECP256R1, NAMED_GROUP_SECP384R1],
+            supported_groups: vec![
+                NAMED_GROUP_X25519,
+                NAMED_GROUP_SECP256R1,
+                NAMED_GROUP_SECP384R1,
+            ],
         }
     }
     
@@ -323,7 +498,11 @@ impl QuicTlsState {
             early_data_enabled: false,
             max_early_data_size: 0,
             supported_versions: vec![TLS_VERSION_13],
-            supported_groups: vec![NAMED_GROUP_X25519, NAMED_GROUP_SECP256R1, NAMED_GROUP_SECP384R1],
+            supported_groups: vec![
+                NAMED_GROUP_X25519,
+                NAMED_GROUP_SECP256R1,
+                NAMED_GROUP_SECP384R1,
+            ],
         }
     }
     
@@ -367,13 +546,13 @@ impl QuicTlsState {
     
     pub fn start_handshake(&mut self, crypto_state: &mut CryptoState) -> Result<()> {
         if !self.is_client {
-            return Err(Error::InvalidOperation("Only clients can start handshake".to_string()));
+            return Err(Error::InvalidOperation(
+                "Only clients can start handshake".to_string(),
+            ));
         }
         
         self.started_at = Some(Instant::now());
-        
-        let private_key = EcdhPrivateKey::generate(EcdhCurve::X25519)
-            .map_err(|_| Error::CryptoError)?;
+        let private_key = EcdhPrivateKey::generate(EcdhCurve::X25519).map_err(|_| Error::CryptoError)?;
         let public_key = private_key.public_key();
         
         self.ecdh_private = Some(private_key);
@@ -385,7 +564,6 @@ impl QuicTlsState {
         let client_hello = self.build_client_hello()?;
         self.handshake_messages.extend_from_slice(&client_hello);
         self.crypto_send_buffer.push((PacketNumberSpace::Initial, client_hello));
-        
         self.state = HandshakeState::WaitServerHello;
         
         Ok(())
@@ -426,7 +604,12 @@ impl QuicTlsState {
             }
             
             let msg_type = full_data[offset];
-            let msg_len = u32::from_be_bytes([0, full_data[offset + 1], full_data[offset + 2], full_data[offset + 3]]) as usize;
+            let msg_len = u32::from_be_bytes([
+                0,
+                full_data[offset + 1],
+                full_data[offset + 2],
+                full_data[offset + 3],
+            ]) as usize;
             if offset + 4 + msg_len > full_data.len() {
                 self.partial_message = Some(full_data[offset..].to_vec());
                 break;
@@ -466,7 +649,10 @@ impl QuicTlsState {
             HANDSHAKE_CLIENT_HELLO => self.handle_client_hello(data, crypto_state),
             HANDSHAKE_NEW_SESSION_TICKET => self.handle_new_session_ticket(data),
             HANDSHAKE_KEY_UPDATE => self.handle_key_update(data, crypto_state),
-            _ => Err(Error::Tls(format!("Unexpected handshake message type: {}", msg_type))),
+            _ => Err(Error::Tls(format!(
+                "Unexpected handshake message type: {}",
+                msg_type
+            ))),
         }
     }
     
@@ -656,9 +842,9 @@ impl QuicTlsState {
         if offset + 2 > data.len() {
             return Err(Error::Tls("Invalid ServerHello".to_string()));
         }
+
         let cipher_suite_id = u16::from_be_bytes([data[offset], data[offset + 1]]);
-        self.cipher_suite = CipherSuite::from_u16(cipher_suite_id)
-            .ok_or_else(|| Error::Tls("Unsupported cipher suite".to_string()))?;
+        self.cipher_suite = CipherSuite::from_u16(cipher_suite_id).ok_or_else(|| Error::Tls("Unsupported cipher suite".to_string()))?;
         offset += 2;
         
         offset += 1;
@@ -674,32 +860,36 @@ impl QuicTlsState {
             if offset + 4 > data.len() {
                 break;
             }
-            
+
             let ext_type = u16::from_be_bytes([data[offset], data[offset + 1]]);
             let ext_data_len = u16::from_be_bytes([data[offset + 2], data[offset + 3]]) as usize;
             offset += 4;
             if offset + ext_data_len > data.len() {
                 return Err(Error::Tls("Invalid extension length".to_string()));
             }
-            
+
             match ext_type {
                 EXTENSION_KEY_SHARE => {
                     let group = u16::from_be_bytes([data[offset], data[offset + 1]]);
                     if group != NAMED_GROUP_X25519 {
                         return Err(Error::Tls("Unsupported key exchange group".to_string()));
                     }
-                    
+
                     let key_len = u16::from_be_bytes([data[offset + 2], data[offset + 3]]) as usize;
                     let key_data = &data[offset + 4..offset + 4 + key_len];
-                    
-                    self.server_public_key = Some(EcdhPublicKey::from_bytes(EcdhCurve::X25519, key_data)
-                        .map_err(|_| Error::CryptoError)?);
+
+                    self.server_public_key = Some(
+                        EcdhPublicKey::from_bytes(EcdhCurve::X25519, key_data)
+                            .map_err(|_| Error::CryptoError)?,
+                    );
                 }
                 EXTENSION_SUPPORTED_VERSIONS => {
                     if ext_data_len >= 2 {
                         let version = u16::from_be_bytes([data[offset], data[offset + 1]]);
                         if version != TLS_VERSION_13 {
-                            return Err(Error::Tls("Server selected unsupported TLS version".to_string()));
+                            return Err(Error::Tls(
+                                "Server selected unsupported TLS version".to_string(),
+                            ));
                         }
                     }
                 }
@@ -716,26 +906,30 @@ impl QuicTlsState {
                 }
                 _ => {}
             }
-            
+
             offset += ext_data_len;
         }
-        
+
         self.derive_handshake_secrets(crypto_state)?;
-        
+
         self.state = HandshakeState::WaitEncryptedExtensions;
-        
+
         Ok(vec![CryptoAction::InstallHandshakeKeys])
     }
-    
-    fn handle_hello_retry_request(&mut self, data: &[u8], crypto_state: &mut CryptoState) -> Result<Vec<CryptoAction>> {
+
+    fn handle_hello_retry_request(
+        &mut self,
+        data: &[u8],
+        crypto_state: &mut CryptoState,
+    ) -> Result<Vec<CryptoAction>> {
         let mut message_hash = Vec::new();
         message_hash.push(254);
-        message_hash.extend_from_slice(&[0, 0, (self.cipher_suite.hash_len() as u8)]);
+        message_hash.extend_from_slice(&[0, 0, self.cipher_suite.hash_len() as u8]);
         message_hash.extend(self.cipher_suite.hash(&self.handshake_messages));
-        
+
         self.handshake_messages.clear();
         self.handshake_messages.extend_from_slice(&message_hash);
-        
+
         let mut offset = 38;
         if offset >= data.len() {
             return Err(Error::Tls("Invalid HelloRetryRequest".to_string()));
@@ -743,7 +937,7 @@ impl QuicTlsState {
 
         let session_id_len = data[offset] as usize;
         offset += 1 + session_id_len;
-        
+
         offset += 2;
         offset += 1;
         if offset + 2 > data.len() {
@@ -752,7 +946,7 @@ impl QuicTlsState {
 
         let ext_len = u16::from_be_bytes([data[offset], data[offset + 1]]) as usize;
         offset += 2;
-        
+
         let exts_end = offset + ext_len;
         let mut selected_group = None;
         let mut cookie = None;
@@ -760,7 +954,7 @@ impl QuicTlsState {
             if offset + 4 > data.len() {
                 break;
             }
-            
+
             let ext_type = u16::from_be_bytes([data[offset], data[offset + 1]]);
             let ext_data_len = u16::from_be_bytes([data[offset + 2], data[offset + 3]]) as usize;
             offset += 4;
@@ -775,86 +969,95 @@ impl QuicTlsState {
                 }
                 _ => {}
             }
-            
+
             offset += ext_data_len;
         }
-        
+
         if let Some(group) = selected_group {
             if group != NAMED_GROUP_X25519 {
-                return Err(Error::Tls("Unsupported group in HelloRetryRequest".to_string()));
+                return Err(Error::Tls(
+                    "Unsupported group in HelloRetryRequest".to_string(),
+                ));
             }
         }
-        
+
         let client_hello = self.build_client_hello()?;
         self.handshake_messages.extend_from_slice(&client_hello);
-        self.crypto_send_buffer.push((PacketNumberSpace::Initial, client_hello));
-        
+        self.crypto_send_buffer
+            .push((PacketNumberSpace::Initial, client_hello));
+
         Ok(vec![CryptoAction::SendCryptoData])
     }
-    
+
     fn derive_handshake_secrets(&mut self, crypto_state: &mut CryptoState) -> Result<()> {
         let private_key = self.ecdh_private.as_ref().ok_or(Error::CryptoError)?;
         let server_pubkey = self.server_public_key.as_ref().ok_or(Error::CryptoError)?;
-        
-        let shared_secret = private_key.exchange(server_pubkey)
+
+        let shared_secret = private_key
+            .exchange(server_pubkey)
             .map_err(|_| Error::CryptoError)?;
-        
+
         let early_secret = self.early_secret.as_ref().unwrap();
-        
-        let derived = self.hkdf_expand_label(early_secret, b"derived", &self.cipher_suite.hash(&[]), self.cipher_suite.hash_len())?;
+
+        let derived = self.hkdf_expand_label(
+            early_secret,
+            b"derived",
+            &self.cipher_suite.hash(&[]),
+            self.cipher_suite.hash_len(),
+        )?;
         let handshake_secret = Hkdf::extract(Some(&derived), &shared_secret);
-        
+
         let transcript_hash = self.cipher_suite.hash(&self.handshake_messages);
-        
+
         let client_hs_secret = self.hkdf_expand_label(
             &handshake_secret,
             b"c hs traffic",
             &transcript_hash,
             self.cipher_suite.hash_len(),
         )?;
-        
+
         let server_hs_secret = self.hkdf_expand_label(
             &handshake_secret,
             b"s hs traffic",
             &transcript_hash,
             self.cipher_suite.hash_len(),
         )?;
-        
+
         self.handshake_secret = Some(handshake_secret);
         self.client_handshake_traffic_secret = Some(client_hs_secret.clone());
         self.server_handshake_traffic_secret = Some(server_hs_secret.clone());
-        
+
         crypto_state.install_handshake_keys(client_hs_secret, server_hs_secret)?;
-        
+
         Ok(())
     }
-    
+
     fn handle_encrypted_extensions(&mut self, data: &[u8]) -> Result<Vec<CryptoAction>> {
         if self.state != HandshakeState::WaitEncryptedExtensions {
             return Err(Error::Tls("Unexpected EncryptedExtensions".to_string()));
         }
-        
+
         let mut offset = 4;
         if offset + 2 > data.len() {
             return Err(Error::Tls("Invalid EncryptedExtensions".to_string()));
         }
-        
+
         let ext_len = u16::from_be_bytes([data[offset], data[offset + 1]]) as usize;
         offset += 2;
-        
+
         let exts_end = offset + ext_len;
         while offset < exts_end {
             if offset + 4 > data.len() {
                 break;
             }
-            
+
             let ext_type = u16::from_be_bytes([data[offset], data[offset + 1]]);
             let ext_data_len = u16::from_be_bytes([data[offset + 2], data[offset + 3]]) as usize;
             offset += 4;
             if offset + ext_data_len > data.len() {
                 return Err(Error::Tls("Invalid extension length".to_string()));
             }
-            
+
             match ext_type {
                 EXTENSION_ALPN => {
                     if offset + 2 <= data.len() {
@@ -862,11 +1065,15 @@ impl QuicTlsState {
                         if offset + 2 + list_len <= data.len() && list_len > 0 {
                             let proto_len = data[offset + 2] as usize;
                             if offset + 3 + proto_len <= data.len() {
-                                let proto = String::from_utf8_lossy(&data[offset + 3..offset + 3 + proto_len]).to_string();
+                                let proto =
+                                    String::from_utf8_lossy(&data[offset + 3..offset + 3 + proto_len])
+                                        .to_string();
                                 if !self.alpn_protocols.contains(&proto) {
-                                    return Err(Error::Tls("Server selected ALPN we didn't offer".to_string()));
+                                    return Err(Error::Tls(
+                                        "Server selected ALPN we didn't offer".to_string(),
+                                    ));
                                 }
-                                
+
                                 self.negotiated_alpn = Some(proto);
                             }
                         }
@@ -877,21 +1084,21 @@ impl QuicTlsState {
                 }
                 _ => {}
             }
-            
+
             offset += ext_data_len;
         }
-        
+
         self.state = HandshakeState::WaitCertificateRequest;
-        
+
         Ok(Vec::new())
     }
-    
+
     fn handle_certificate_request(&mut self, data: &[u8]) -> Result<Vec<CryptoAction>> {
         if self.state != HandshakeState::WaitCertificateRequest {
             self.state = HandshakeState::WaitCertificate;
             return self.handle_certificate(data);
         }
-        
+
         let mut offset = 4;
         if offset >= data.len() {
             return Err(Error::Tls("Invalid CertificateRequest".to_string()));
@@ -910,7 +1117,7 @@ impl QuicTlsState {
             if offset + 4 > data.len() {
                 break;
             }
-            
+
             let ext_type = u16::from_be_bytes([data[offset], data[offset + 1]]);
             let ext_data_len = u16::from_be_bytes([data[offset + 2], data[offset + 3]]) as usize;
             offset += 4;
@@ -931,25 +1138,25 @@ impl QuicTlsState {
                 }
                 _ => {}
             }
-            
+
             offset += ext_data_len;
         }
-        
+
         self.cert_requested = true;
         self.state = HandshakeState::WaitCertificate;
-        
+
         Ok(Vec::new())
     }
-    
+
     fn handle_certificate(&mut self, data: &[u8]) -> Result<Vec<CryptoAction>> {
         if self.state == HandshakeState::WaitCertificateRequest {
             self.state = HandshakeState::WaitCertificate;
         }
-        
+
         if self.state != HandshakeState::WaitCertificate {
             return Err(Error::Tls("Unexpected Certificate".to_string()));
         }
-        
+
         let mut offset = 4;
         if offset >= data.len() {
             return Err(Error::Tls("Invalid Certificate".to_string()));
@@ -961,22 +1168,24 @@ impl QuicTlsState {
             return Err(Error::Tls("Invalid Certificate".to_string()));
         }
 
-        let cert_list_len = u32::from_be_bytes([0, data[offset], data[offset + 1], data[offset + 2]]) as usize;
+        let cert_list_len =
+            u32::from_be_bytes([0, data[offset], data[offset + 1], data[offset + 2]]) as usize;
         offset += 3;
-        
+
         let cert_list_end = offset + cert_list_len;
         let mut cert_count = 0;
         while offset < cert_list_end {
             if offset + 3 > data.len() {
                 break;
             }
-            
-            let cert_data_len = u32::from_be_bytes([0, data[offset], data[offset + 1], data[offset + 2]]) as usize;
+
+            let cert_data_len =
+                u32::from_be_bytes([0, data[offset], data[offset + 1], data[offset + 2]]) as usize;
             offset += 3;
             if offset + cert_data_len > data.len() {
                 return Err(Error::Tls("Invalid certificate data length".to_string()));
             }
-            
+
             let cert_data = &data[offset..offset + cert_data_len];
             match Certificate::from_der(cert_data) {
                 Ok(cert) => {
@@ -999,43 +1208,47 @@ impl QuicTlsState {
                 return Err(Error::Tls("Certificate chain too long".to_string()));
             }
         }
-        
+
         if self.peer_certificates.is_empty() {
             return Err(Error::Tls("No certificates in Certificate message".to_string()));
         }
-        
+
         if self.verify_certificates {
             self.verify_certificate_chain()?;
         }
-        
+
         self.state = HandshakeState::WaitCertificateVerify;
-        
+
         Ok(Vec::new())
     }
-    
+
     fn verify_certificate_chain(&self) -> Result<()> {
         if self.peer_certificates.is_empty() {
             return Err(Error::Tls("No peer certificates to verify".to_string()));
         }
-        
+
         let leaf_cert = &self.peer_certificates[0];
         if !leaf_cert.is_valid_at_current_time() {
-            return Err(Error::Tls("Certificate has expired or is not yet valid".to_string()));
+            return Err(Error::Tls(
+                "Certificate has expired or is not yet valid".to_string(),
+            ));
         }
-        
+
         if let Some(ref server_name) = self.server_name {
             if !leaf_cert.matches_hostname(server_name) {
                 return Err(Error::Tls("Certificate hostname mismatch".to_string()));
             }
         }
-        
+
         if !self.trusted_roots.is_empty() {
             let mut verified = false;
             for (i, cert) in self.peer_certificates.iter().enumerate() {
                 if i + 1 < self.peer_certificates.len() {
                     let issuer_cert = &self.peer_certificates[i + 1];
                     if let Err(_) = cert.verify_signature(issuer_cert) {
-                        return Err(Error::Tls("Certificate signature verification failed".to_string()));
+                        return Err(Error::Tls(
+                            "Certificate signature verification failed".to_string(),
+                        ));
                     }
                 } else {
                     for root in &self.trusted_roots {
@@ -1046,7 +1259,7 @@ impl QuicTlsState {
                     }
                 }
             }
-            
+
             if !verified && self.peer_certificates.len() == 1 {
                 for root in &self.trusted_roots {
                     if leaf_cert.verify_signature(root).is_ok() {
@@ -1055,75 +1268,81 @@ impl QuicTlsState {
                     }
                 }
             }
-            
+
             if !verified {
-                return Err(Error::Tls("Certificate chain does not chain to trusted root".to_string()));
+                return Err(Error::Tls(
+                    "Certificate chain does not chain to trusted root".to_string(),
+                ));
             }
         }
-        
+
         Ok(())
     }
-    
+
     fn handle_certificate_verify(&mut self, data: &[u8]) -> Result<Vec<CryptoAction>> {
         if self.state != HandshakeState::WaitCertificateVerify {
             return Err(Error::Tls("Unexpected CertificateVerify".to_string()));
         }
-        
+
         let mut offset = 4;
         if offset + 2 > data.len() {
             return Err(Error::Tls("Invalid CertificateVerify".to_string()));
         }
-        
+
         let signature_algorithm = u16::from_be_bytes([data[offset], data[offset + 1]]);
         offset += 2;
         if offset + 2 > data.len() {
             return Err(Error::Tls("Invalid CertificateVerify".to_string()));
         }
-        
+
         let signature_len = u16::from_be_bytes([data[offset], data[offset + 1]]) as usize;
         offset += 2;
         if offset + signature_len > data.len() {
             return Err(Error::Tls("Invalid signature length".to_string()));
         }
-        
+
         let signature = &data[offset..offset + signature_len];
-        
+
         self.verify_certificate_verify_signature(signature_algorithm, signature)?;
-        
+
         self.state = HandshakeState::WaitFinished;
-        
+
         Ok(Vec::new())
     }
-    
+
     fn verify_certificate_verify_signature(&self, algorithm: u16, signature: &[u8]) -> Result<()> {
         if self.peer_certificates.is_empty() {
-            return Err(Error::Tls("No peer certificate for signature verification".to_string()));
+            return Err(Error::Tls(
+                "No peer certificate for signature verification".to_string(),
+            ));
         }
-        
+
         let mut signed_data = vec![0x20; 64];
         signed_data.extend_from_slice(b"TLS 1.3, server CertificateVerify");
         signed_data.push(0);
-        
+
         let transcript_hash = self.cipher_suite.hash(&self.handshake_messages);
         signed_data.extend_from_slice(&transcript_hash);
-        
+
         let message_hash = match algorithm {
             RSA_PSS_RSAE_SHA256 | ECDSA_SECP256R1_SHA256 => sha256(&signed_data).to_vec(),
             RSA_PSS_RSAE_SHA384 | ECDSA_SECP384R1_SHA384 => sha384(&signed_data).to_vec(),
             RSA_PSS_RSAE_SHA512 | ECDSA_SECP521R1_SHA512 => sha512(&signed_data).to_vec(),
             _ => return Err(Error::Tls("Unsupported signature algorithm".to_string())),
         };
-        
+
         let leaf_cert = &self.peer_certificates[0];
-        let public_key = leaf_cert.public_key()
+        let public_key = leaf_cert
+            .public_key()
             .ok_or_else(|| Error::Tls("No public key in certificate".to_string()))?;
-        
+
         match algorithm {
             RSA_PSS_RSAE_SHA256 | RSA_PSS_RSAE_SHA384 | RSA_PSS_RSAE_SHA512 => {
                 let rsa_key = RsaPublicKey::from_der(&public_key)
                     .map_err(|_| Error::Tls("Invalid RSA public key".to_string()))?;
-                
-                rsa_key.verify_pss(&message_hash, signature)
+
+                rsa_key
+                    .verify_pss(&message_hash, signature)
                     .map_err(|_| Error::Tls("RSA signature verification failed".to_string()))?;
             }
             ECDSA_SECP256R1_SHA256 | ECDSA_SECP384R1_SHA384 | ECDSA_SECP521R1_SHA512 => {
@@ -1134,31 +1353,36 @@ impl QuicTlsState {
             }
             _ => return Err(Error::Tls("Unsupported signature algorithm".to_string())),
         }
-        
+
         Ok(())
     }
-    
-    fn handle_finished(&mut self, data: &[u8], crypto_state: &mut CryptoState) -> Result<Vec<CryptoAction>> {
+
+    fn handle_finished(
+        &mut self,
+        data: &[u8],
+        crypto_state: &mut CryptoState,
+    ) -> Result<Vec<CryptoAction>> {
         if self.state != HandshakeState::WaitFinished {
             return Err(Error::Tls("Unexpected Finished".to_string()));
         }
-        
+
         let expected_verify_data = self.compute_finished_verify_data(false)?;
         let verify_data = &data[4..];
         if verify_data.len() != expected_verify_data.len() {
             return Err(Error::Tls("Invalid Finished message length".to_string()));
         }
-        
+
         if verify_data != &expected_verify_data[..] {
             return Err(Error::Tls("Finished verification failed".to_string()));
         }
-        
+
         self.derive_application_secrets(crypto_state)?;
-        
+
         let client_finished = self.build_finished_message()?;
         self.handshake_messages.extend_from_slice(&client_finished);
-        self.crypto_send_buffer.push((PacketNumberSpace::Handshake, client_finished));
-        
+        self.crypto_send_buffer
+            .push((PacketNumberSpace::Handshake, client_finished));
+
         let transcript_hash = self.cipher_suite.hash(&self.handshake_messages);
         let master_secret = self.master_secret.as_ref().unwrap();
         self.resumption_master_secret = Some(self.hkdf_expand_label(
@@ -1167,178 +1391,222 @@ impl QuicTlsState {
             &transcript_hash,
             self.cipher_suite.hash_len(),
         )?);
-        
+
         self.state = HandshakeState::Connected;
-        
+
         Ok(vec![
             CryptoAction::SendCryptoData,
             CryptoAction::InstallApplicationKeys,
             CryptoAction::HandshakeComplete,
         ])
     }
-    
-    fn handle_client_hello(&mut self, data: &[u8], crypto_state: &mut CryptoState) -> Result<Vec<CryptoAction>> {
-        Err(Error::InvalidOperation("Server handshake not yet fully implemented".to_string()))
+
+    fn handle_client_hello(
+        &mut self,
+        data: &[u8],
+        crypto_state: &mut CryptoState,
+    ) -> Result<Vec<CryptoAction>> {
+        Err(Error::InvalidOperation(
+            "Server handshake not yet fully implemented".to_string(),
+        ))
     }
-    
+
     fn handle_new_session_ticket(&mut self, data: &[u8]) -> Result<Vec<CryptoAction>> {
         let mut offset = 4;
         if offset + 4 > data.len() {
             return Err(Error::Tls("Invalid NewSessionTicket".to_string()));
         }
-        
-        let ticket_lifetime = u32::from_be_bytes([data[offset], data[offset + 1], data[offset + 2], data[offset + 3]]);
+
+        let ticket_lifetime =
+            u32::from_be_bytes([data[offset], data[offset + 1], data[offset + 2], data[offset + 3]]);
         offset += 4;
-        
-        let ticket_age_add = u32::from_be_bytes([data[offset], data[offset + 1], data[offset + 2], data[offset + 3]]);
+
+        let ticket_age_add =
+            u32::from_be_bytes([data[offset], data[offset + 1], data[offset + 2], data[offset + 3]]);
         offset += 4;
-        
+
         let nonce_len = data[offset] as usize;
         offset += 1 + nonce_len;
         if offset + 2 > data.len() {
             return Err(Error::Tls("Invalid NewSessionTicket".to_string()));
         }
-        
+
         let ticket_len = u16::from_be_bytes([data[offset], data[offset + 1]]) as usize;
         offset += 2;
         if offset + ticket_len > data.len() {
             return Err(Error::Tls("Invalid ticket length".to_string()));
         }
-        
+
         let ticket = data[offset..offset + ticket_len].to_vec();
         self.session_ticket = Some(ticket);
         if let Some(ref res_master) = self.resumption_master_secret {
             let nonce = &data[offset - nonce_len - 1..offset - 1];
-            let psk = self.hkdf_expand_label(res_master, b"resumption", nonce, self.cipher_suite.hash_len())?;
+            let psk =
+                self.hkdf_expand_label(res_master, b"resumption", nonce, self.cipher_suite.hash_len())?;
             self.psk = Some(psk);
         }
-        
+
         Ok(Vec::new())
     }
-    
-    fn handle_key_update(&mut self, data: &[u8], crypto_state: &mut CryptoState) -> Result<Vec<CryptoAction>> {
+
+    fn handle_key_update(
+        &mut self,
+        data: &[u8],
+        crypto_state: &mut CryptoState,
+    ) -> Result<Vec<CryptoAction>> {
         if data.len() < 5 {
             return Err(Error::Tls("Invalid KeyUpdate".to_string()));
         }
-        
+
         let update_requested = data[4] == 1;
         self.update_traffic_keys(false, crypto_state)?;
         if update_requested {
             let key_update = self.build_key_update_message(false)?;
-            self.crypto_send_buffer.push((PacketNumberSpace::ApplicationData, key_update));
-            
+            self.crypto_send_buffer
+                .push((PacketNumberSpace::ApplicationData, key_update));
+
             self.update_traffic_keys(true, crypto_state)?;
-            
+
             Ok(vec![CryptoAction::SendCryptoData])
         } else {
             Ok(Vec::new())
         }
     }
-    
+
     fn build_finished_message(&self) -> Result<Vec<u8>> {
         let verify_data = self.compute_finished_verify_data(true)?;
-        
+
         let mut msg = Vec::new();
         msg.push(HANDSHAKE_FINISHED);
-        
+
         let len = verify_data.len() as u32;
         msg.extend_from_slice(&len.to_be_bytes()[1..4]);
         msg.extend_from_slice(&verify_data);
-        
+
         Ok(msg)
     }
-    
+
     fn build_key_update_message(&self, request_update: bool) -> Result<Vec<u8>> {
         let mut msg = Vec::new();
         msg.push(HANDSHAKE_KEY_UPDATE);
         msg.extend_from_slice(&[0, 0, 1]);
         msg.push(if request_update { 1 } else { 0 });
-        
+
         Ok(msg)
     }
-    
+
     fn compute_finished_verify_data(&self, is_client: bool) -> Result<Vec<u8>> {
         let secret = if is_client {
             self.client_handshake_traffic_secret.as_ref()
         } else {
             self.server_handshake_traffic_secret.as_ref()
-        }.ok_or(Error::CryptoError)?;
-        
-        let finished_key = self.hkdf_expand_label(secret, b"finished", &[], self.cipher_suite.hash_len())?;
+        }
+        .ok_or(Error::CryptoError)?;
+
+        let finished_key =
+            self.hkdf_expand_label(secret, b"finished", &[], self.cipher_suite.hash_len())?;
         let transcript_hash = self.cipher_suite.hash(&self.handshake_messages);
-        
+
         let verify_data = Hkdf::extract(Some(&finished_key), &transcript_hash);
-        
+
         Ok(verify_data[..self.cipher_suite.hash_len()].to_vec())
     }
-    
+
     fn derive_application_secrets(&mut self, crypto_state: &mut CryptoState) -> Result<()> {
         let handshake_secret = self.handshake_secret.as_ref().ok_or(Error::CryptoError)?;
-        
-        let derived = self.hkdf_expand_label(handshake_secret, b"derived", &self.cipher_suite.hash(&[]), self.cipher_suite.hash_len())?;
+
+        let derived = self.hkdf_expand_label(
+            handshake_secret,
+            b"derived",
+            &self.cipher_suite.hash(&[]),
+            self.cipher_suite.hash_len(),
+        )?;
         let master_secret = Hkdf::extract(Some(&derived), &[]);
-        
+
         let transcript_hash = self.cipher_suite.hash(&self.handshake_messages);
-        
+
         let client_app_secret = self.hkdf_expand_label(
             &master_secret,
             b"c ap traffic",
             &transcript_hash,
             self.cipher_suite.hash_len(),
         )?;
-        
+
         let server_app_secret = self.hkdf_expand_label(
             &master_secret,
             b"s ap traffic",
             &transcript_hash,
             self.cipher_suite.hash_len(),
         )?;
-        
+
         let exporter_master = self.hkdf_expand_label(
             &master_secret,
             b"exp master",
             &transcript_hash,
             self.cipher_suite.hash_len(),
         )?;
-        
+
         self.master_secret = Some(master_secret);
         self.client_application_traffic_secret = Some(client_app_secret.clone());
         self.server_application_traffic_secret = Some(server_app_secret.clone());
         self.exporter_master_secret = Some(exporter_master);
-        
+
         let client_keys = self.derive_traffic_keys(&client_app_secret)?;
         let server_keys = self.derive_traffic_keys(&server_app_secret)?;
         if self.is_client {
-            crypto_state.client_keys.insert(EncryptionLevel::Application, client_keys);
-            crypto_state.server_keys.insert(EncryptionLevel::Application, server_keys);
+            crypto_state
+                .client_keys
+                .insert(EncryptionLevel::Application, client_keys);
+            crypto_state
+                .server_keys
+                .insert(EncryptionLevel::Application, server_keys);
         } else {
-            crypto_state.server_keys.insert(EncryptionLevel::Application, server_keys);
-            crypto_state.client_keys.insert(EncryptionLevel::Application, client_keys);
+            crypto_state
+                .server_keys
+                .insert(EncryptionLevel::Application, server_keys);
+            crypto_state
+                .client_keys
+                .insert(EncryptionLevel::Application, client_keys);
         }
-        
+
         Ok(())
     }
-    
-    fn update_traffic_keys(&mut self, send_keys: bool, crypto_state: &mut CryptoState) -> Result<()> {
+
+    fn update_traffic_keys(
+        &mut self,
+        send_keys: bool,
+        crypto_state: &mut CryptoState,
+    ) -> Result<()> {
         self.key_update_generation += 1;
-        
+
         let (secret, level) = if send_keys {
             if self.is_client {
-                (self.client_application_traffic_secret.as_ref(), EncryptionLevel::Application)
+                (
+                    self.client_application_traffic_secret.as_ref(),
+                    EncryptionLevel::Application,
+                )
             } else {
-                (self.server_application_traffic_secret.as_ref(), EncryptionLevel::Application)
+                (
+                    self.server_application_traffic_secret.as_ref(),
+                    EncryptionLevel::Application,
+                )
             }
+        } else if self.is_client {
+            (
+                self.server_application_traffic_secret.as_ref(),
+                EncryptionLevel::Application,
+            )
         } else {
-            if self.is_client {
-                (self.server_application_traffic_secret.as_ref(), EncryptionLevel::Application)
-            } else {
-                (self.client_application_traffic_secret.as_ref(), EncryptionLevel::Application)
-            }
+            (
+                self.client_application_traffic_secret.as_ref(),
+                EncryptionLevel::Application,
+            )
         };
-        
+
         let old_secret = secret.ok_or(Error::CryptoError)?;
-        let new_secret = self.hkdf_expand_label(old_secret, b"traffic upd", &[], self.cipher_suite.hash_len())?;
-        
+        let new_secret =
+            self.hkdf_expand_label(old_secret, b"traffic upd", &[], self.cipher_suite.hash_len())?;
+
         let new_keys = self.derive_traffic_keys(&new_secret)?;
         if send_keys {
             if self.is_client {
@@ -1348,69 +1616,88 @@ impl QuicTlsState {
                 self.server_application_traffic_secret = Some(new_secret);
                 crypto_state.server_keys.insert(level, new_keys);
             }
+        } else if self.is_client {
+            self.server_application_traffic_secret = Some(new_secret);
+            crypto_state.server_keys.insert(level, new_keys);
         } else {
-            if self.is_client {
-                self.server_application_traffic_secret = Some(new_secret);
-                crypto_state.server_keys.insert(level, new_keys);
-            } else {
-                self.client_application_traffic_secret = Some(new_secret);
-                crypto_state.client_keys.insert(level, new_keys);
-            }
+            self.client_application_traffic_secret = Some(new_secret);
+            crypto_state.client_keys.insert(level, new_keys);
         }
-        
+
         Ok(())
     }
-    
+
     fn derive_traffic_keys(&self, secret: &[u8]) -> Result<CryptoKeys> {
         let key_len = self.cipher_suite.key_len();
         let key = self.hkdf_expand_label(secret, b"quic key", &[], key_len)?;
         let iv = self.hkdf_expand_label(secret, b"quic iv", &[], 12)?;
         let hp = self.hkdf_expand_label(secret, b"quic hp", &[], key_len)?;
-        
+
         Ok(CryptoKeys::new(hp, key, iv))
     }
-    
-    fn hkdf_expand_label(&self, secret: &[u8], label: &[u8], context: &[u8], length: usize) -> Result<Vec<u8>> {
+
+    fn hkdf_expand_label(
+        &self,
+        secret: &[u8],
+        label: &[u8],
+        context: &[u8],
+        length: usize,
+    ) -> Result<Vec<u8>> {
         let full_label = [b"tls13 ", label].concat();
-        
+
         let mut hkdf_label = Vec::new();
         hkdf_label.extend_from_slice(&(length as u16).to_be_bytes());
         hkdf_label.push(full_label.len() as u8);
         hkdf_label.extend_from_slice(&full_label);
         hkdf_label.push(context.len() as u8);
         hkdf_label.extend_from_slice(context);
-        
+
         Hkdf::expand(secret, &hkdf_label, length).map_err(|_| Error::CryptoError)
     }
-    
+
     fn generate_random(&self) -> [u8; 32] {
         let mut random = [0u8; 32];
         if let Ok(bytes) = random::generate_random(32) {
             random.copy_from_slice(&bytes);
         } else {
-            let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64;
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos() as u64;
             for (i, chunk) in now.to_be_bytes().iter().enumerate() {
                 random[i] = *chunk;
             }
         }
-        
+
         random
     }
-    
+
     fn generate_session_id(&self) -> [u8; 32] {
         self.generate_random()
     }
-    
-    pub fn export_keying_material(&self, label: &[u8], context: &[u8], length: usize) -> Result<Vec<u8>> {
-        let exporter_secret = self.exporter_master_secret.as_ref()
+
+    pub fn export_keying_material(
+        &self,
+        label: &[u8],
+        context: &[u8],
+        length: usize,
+    ) -> Result<Vec<u8>> {
+        let exporter_secret = self
+            .exporter_master_secret
+            .as_ref()
             .ok_or_else(|| Error::InvalidOperation("Handshake not complete".to_string()))?;
-        
+
         let context_hash = self.cipher_suite.hash(context);
-        let secret = self.hkdf_expand_label(exporter_secret, label, &context_hash, self.cipher_suite.hash_len())?;
-        
+        let secret = self.hkdf_expand_label(
+            exporter_secret,
+            label,
+            &context_hash,
+            self.cipher_suite.hash_len(),
+        )?;
+
         self.hkdf_expand_label(&secret, b"exporter", &[], length)
     }
-    
+
     pub fn next_crypto_data(&mut self) -> Option<(PacketNumberSpace, Vec<u8>)> {
         if self.crypto_send_buffer.is_empty() {
             None
@@ -1418,31 +1705,31 @@ impl QuicTlsState {
             Some(self.crypto_send_buffer.remove(0))
         }
     }
-    
+
     pub fn is_complete(&self) -> bool {
         self.state == HandshakeState::Connected
     }
-    
+
     pub fn negotiated_alpn(&self) -> Option<&str> {
         self.negotiated_alpn.as_deref()
     }
-    
+
     pub fn peer_transport_params(&self) -> Option<&[u8]> {
         self.peer_transport_params.as_deref()
     }
-    
+
     pub fn handshake_state(&self) -> HandshakeState {
         self.state
     }
-    
+
     pub fn can_send_early_data(&self) -> bool {
         self.early_data_enabled && self.psk.is_some() && self.state == HandshakeState::WaitServerHello
     }
-    
+
     pub fn max_early_data_size(&self) -> u32 {
         self.max_early_data_size
     }
-    
+
     pub fn peer_certificates(&self) -> &[Certificate] {
         &self.peer_certificates
     }
@@ -1455,15 +1742,65 @@ impl QuicTlsState {
         if self.state != HandshakeState::Connected {
             return Err(Error::InvalidOperation("Handshake not complete".to_string()));
         }
-        
+
         let key_update = self.build_key_update_message(request_peer_update)?;
-        self.crypto_send_buffer.push((PacketNumberSpace::ApplicationData, key_update));
-        
+        self.crypto_send_buffer
+            .push((PacketNumberSpace::ApplicationData, key_update));
+
         Ok(())
     }
-    
+
     pub fn public_key(&self) -> Option<&EcdhPublicKey> {
         self.ecdh_public.as_ref()
+    }
+
+    pub fn snapshot(&self) -> QuicTlsStateSnapshot {
+        QuicTlsStateSnapshot {
+            role: if self.is_client {
+                "client".to_string()
+            } else {
+                "server".to_string()
+            },
+            handshake_state: handshake_state_to_text(self.state).to_string(),
+            cipher_suite: cipher_suite_to_text(self.cipher_suite).to_string(),
+            verify_certificates: self.verify_certificates,
+            certificate_count: self.certificates.len(),
+            peer_certificate_count: self.peer_certificates.len(),
+            negotiated_alpn: self.negotiated_alpn.clone(),
+            has_peer_transport_params: self.peer_transport_params.is_some(),
+            key_update_generation: self.key_update_generation,
+            early_data_enabled: self.early_data_enabled,
+            max_early_data_size: self.max_early_data_size,
+            has_psk: self.psk.is_some(),
+            has_session_ticket: self.session_ticket.is_some(),
+            has_early_secret: self.early_secret.is_some(),
+            has_handshake_secret: self.handshake_secret.is_some(),
+            has_master_secret: self.master_secret.is_some(),
+            started: self.started_at.is_some(),
+            elapsed_ms: self
+                .started_at
+                .map(|started| started.elapsed().as_millis() as u64),
+        }
+    }
+
+    pub fn encode_secure_state_snapshot(
+        &self,
+        algorithm: CompressionAlgorithm,
+    ) -> io::Result<(SecureQuicTlsStateBlobMeta, Vec<u8>)> {
+        self.snapshot().to_secure_blob(algorithm)
+    }
+
+    pub fn encode_secure_state_snapshot_auto(
+        &self,
+        accept_encoding: &str,
+    ) -> io::Result<(SecureQuicTlsStateBlobMeta, Vec<u8>)> {
+        self.snapshot().to_secure_blob_auto(accept_encoding)
+    }
+
+    pub fn decode_secure_state_snapshot(
+        data: &[u8],
+    ) -> io::Result<(SecureQuicTlsStateBlobMeta, QuicTlsStateSnapshot)> {
+        QuicTlsStateSnapshot::from_secure_blob(data)
     }
 }
 
@@ -1476,10 +1813,519 @@ pub enum CryptoAction {
     UpdateKeys,
 }
 
+pub fn select_secure_quic_tls_state_algorithm(accept_encoding: &str) -> CompressionAlgorithm {
+    let accepted = compression::parse_accept_encoding(accept_encoding);
+    for (algorithm, quality) in accepted {
+        if quality > 0.0
+            && algorithm.is_implemented()
+            && algorithm != CompressionAlgorithm::Identity
+        {
+            return algorithm;
+        }
+    }
+
+    CompressionAlgorithm::Identity
+}
+
+pub fn encode_secure_quic_tls_state_snapshot(
+    state: &QuicTlsState,
+    algorithm: CompressionAlgorithm,
+) -> io::Result<(SecureQuicTlsStateBlobMeta, Vec<u8>)> {
+    state.encode_secure_state_snapshot(algorithm)
+}
+
+pub fn encode_secure_quic_tls_state_snapshot_auto(
+    state: &QuicTlsState,
+    accept_encoding: &str,
+) -> io::Result<(SecureQuicTlsStateBlobMeta, Vec<u8>)> {
+    state.encode_secure_state_snapshot_auto(accept_encoding)
+}
+
+pub fn decode_secure_quic_tls_state_snapshot(
+    data: &[u8],
+) -> io::Result<(SecureQuicTlsStateBlobMeta, QuicTlsStateSnapshot)> {
+    QuicTlsState::decode_secure_state_snapshot(data)
+}
+
+fn serialize_quic_tls_state_snapshot(snapshot: &QuicTlsStateSnapshot) -> Vec<u8> {
+    format!(
+        "role={}\nhandshake-state={}\ncipher-suite={}\nverify-certificates={}\ncertificate-count={}\npeer-certificate-count={}\nnegotiated-alpn={}\nhas-peer-transport-params={}\nkey-update-generation={}\nearly-data-enabled={}\nmax-early-data-size={}\nhas-psk={}\nhas-session-ticket={}\nhas-early-secret={}\nhas-handshake-secret={}\nhas-master-secret={}\nstarted={}\nelapsed-ms={}\n",
+        snapshot.role,
+        snapshot.handshake_state,
+        snapshot.cipher_suite,
+        snapshot.verify_certificates,
+        snapshot.certificate_count,
+        snapshot.peer_certificate_count,
+        encode_opt_b64(snapshot.negotiated_alpn.as_deref()),
+        snapshot.has_peer_transport_params,
+        snapshot.key_update_generation,
+        snapshot.early_data_enabled,
+        snapshot.max_early_data_size,
+        snapshot.has_psk,
+        snapshot.has_session_ticket,
+        snapshot.has_early_secret,
+        snapshot.has_handshake_secret,
+        snapshot.has_master_secret,
+        snapshot.started,
+        opt_u64_to_text(snapshot.elapsed_ms),
+    )
+    .into_bytes()
+}
+
+fn deserialize_quic_tls_state_snapshot(raw_payload: &[u8]) -> io::Result<QuicTlsStateSnapshot> {
+    let payload = std::str::from_utf8(raw_payload).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "quic-tls-state payload is not valid utf-8",
+        )
+    })?;
+
+    let mut map = HashMap::new();
+    for line in payload.lines() {
+        let (key, value) = line.split_once('=').ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid quic-tls-state payload line '{}'", line),
+            )
+        })?;
+
+        map.insert(key.trim().to_string(), value.trim().to_string());
+    }
+
+    let parse_u64 = |key: &str| -> io::Result<u64> {
+        map.get(key)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("missing '{}' in quic-tls-state payload", key),
+                )
+            })?
+            .parse::<u64>()
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("invalid '{}' in quic-tls-state payload", key),
+                )
+            })
+    };
+
+    let parse_usize = |key: &str| -> io::Result<usize> {
+        map.get(key)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("missing '{}' in quic-tls-state payload", key),
+                )
+            })?
+            .parse::<usize>()
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("invalid '{}' in quic-tls-state payload", key),
+                )
+            })
+    };
+
+    let parse_u32 = |key: &str| -> io::Result<u32> {
+        map.get(key)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("missing '{}' in quic-tls-state payload", key),
+                )
+            })?
+            .parse::<u32>()
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("invalid '{}' in quic-tls-state payload", key),
+                )
+            })
+    };
+
+    let parse_text = |key: &str| -> io::Result<String> {
+        map.get(key).cloned().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("missing '{}' in quic-tls-state payload", key),
+            )
+        })
+    };
+
+    Ok(QuicTlsStateSnapshot {
+        role: parse_text("role")?,
+        handshake_state: parse_text("handshake-state")?,
+        cipher_suite: parse_text("cipher-suite")?,
+        verify_certificates: parse_bool(
+            map.get("verify-certificates").ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "missing verify-certificates in quic-tls-state payload",
+                )
+            })?,
+        )?,
+        certificate_count: parse_usize("certificate-count")?,
+        peer_certificate_count: parse_usize("peer-certificate-count")?,
+        negotiated_alpn: decode_opt_b64(
+            map.get("negotiated-alpn").ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "missing negotiated-alpn in quic-tls-state payload",
+                )
+            })?,
+        )?,
+        has_peer_transport_params: parse_bool(
+            map.get("has-peer-transport-params").ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "missing has-peer-transport-params in quic-tls-state payload",
+                )
+            })?,
+        )?,
+        key_update_generation: parse_u64("key-update-generation")?,
+        early_data_enabled: parse_bool(
+            map.get("early-data-enabled").ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "missing early-data-enabled in quic-tls-state payload",
+                )
+            })?,
+        )?,
+        max_early_data_size: parse_u32("max-early-data-size")?,
+        has_psk: parse_bool(
+            map.get("has-psk").ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "missing has-psk in quic-tls-state payload",
+                )
+            })?,
+        )?,
+        has_session_ticket: parse_bool(
+            map.get("has-session-ticket").ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "missing has-session-ticket in quic-tls-state payload",
+                )
+            })?,
+        )?,
+        has_early_secret: parse_bool(
+            map.get("has-early-secret").ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "missing has-early-secret in quic-tls-state payload",
+                )
+            })?,
+        )?,
+        has_handshake_secret: parse_bool(
+            map.get("has-handshake-secret").ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "missing has-handshake-secret in quic-tls-state payload",
+                )
+            })?,
+        )?,
+        has_master_secret: parse_bool(
+            map.get("has-master-secret").ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "missing has-master-secret in quic-tls-state payload",
+                )
+            })?,
+        )?,
+        started: parse_bool(
+            map.get("started").ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "missing started in quic-tls-state payload",
+                )
+            })?,
+        )?,
+        elapsed_ms: parse_opt_u64(
+            map.get("elapsed-ms").ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "missing elapsed-ms in quic-tls-state payload",
+                )
+            })?,
+        )?,
+    })
+}
+
+fn parse_bool(v: &str) -> io::Result<bool> {
+    match v.trim().to_ascii_lowercase().as_str() {
+        "true" | "1" | "yes" | "on" => Ok(true),
+        "false" | "0" | "no" | "off" => Ok(false),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid boolean value '{}'", v),
+        )),
+    }
+}
+
+fn opt_u64_to_text(value: Option<u64>) -> String {
+    value
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "-".to_string())
+}
+
+fn parse_opt_u64(value: &str) -> io::Result<Option<u64>> {
+    if value.trim() == "-" {
+        return Ok(None);
+    }
+
+    let parsed = value.trim().parse::<u64>().map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid optional u64 value '{}'", value),
+        )
+    })?;
+
+    Ok(Some(parsed))
+}
+
+fn encode_opt_b64(value: Option<&str>) -> String {
+    match value {
+        Some(v) => pem::encode(v.as_bytes()),
+        None => "-".to_string(),
+    }
+}
+
+fn decode_opt_b64(value: &str) -> io::Result<Option<String>> {
+    if value.trim() == "-" {
+        return Ok(None);
+    }
+
+    let decoded = pem::decode(value.trim()).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid optional base64 value '{}': {}", value, e),
+        )
+    })?;
+
+    let text = String::from_utf8(decoded).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "optional base64 value is not valid utf-8",
+        )
+    })?;
+
+    Ok(Some(text))
+}
+
+fn compute_quic_tls_state_blob_tag(
+    nonce: &[u8],
+    algorithm: CompressionAlgorithm,
+    raw_size: usize,
+    encoded_payload: &[u8],
+) -> [u8; 32] {
+    let mut mac_input = Vec::new();
+    mac_input.extend_from_slice(QUIC_TLS_STATE_BLOB_CONTEXT.as_bytes());
+    mac_input.extend_from_slice(algorithm.content_encoding().as_bytes());
+    mac_input.extend_from_slice(&(raw_size as u64).to_be_bytes());
+    mac_input.extend_from_slice(nonce);
+    mac_input.extend_from_slice(encoded_payload);
+    hmac_sha256(QUIC_TLS_STATE_BLOB_CONTEXT.as_bytes(), &mac_input)
+}
+
+fn split_header_body(data: &[u8]) -> io::Result<(String, &[u8])> {
+    if let Some(pos) = data.windows(2).position(|w| w == b"\n\n") {
+        let header = std::str::from_utf8(&data[..pos]).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "quic-tls-state header is not valid utf-8",
+            )
+        })?;
+
+        return Ok((header.to_string(), &data[pos + 2..]));
+    }
+
+    if let Some(pos) = data.windows(4).position(|w| w == b"\r\n\r\n") {
+        let header = std::str::from_utf8(&data[..pos]).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "quic-tls-state header is not valid utf-8",
+            )
+        })?;
+
+        return Ok((header.to_string(), &data[pos + 4..]));
+    }
+
+    Err(io::Error::new(
+        io::ErrorKind::InvalidData,
+        "quic-tls-state blob missing header/body separator",
+    ))
+}
+
+fn parse_secure_quic_tls_state_meta(
+    header: &str,
+    body_len: usize,
+) -> io::Result<SecureQuicTlsStateBlobMeta> {
+    let mut lines = header.lines();
+    let magic = lines.next().unwrap_or_default();
+    if magic != QUIC_TLS_STATE_BLOB_MAGIC {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid secure quic-tls-state blob magic",
+        ));
+    }
+
+    let mut algorithm = CompressionAlgorithm::Identity;
+    let mut nonce_b64 = None;
+    let mut digest_b64 = None;
+    let mut tag_b64 = None;
+    let mut raw_size = None;
+    let mut encoded_size = None;
+    let mut issued_at_unix = None;
+
+    for line in lines {
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        let (k, v) = line.split_once('=').ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid secure quic-tls-state header line '{}'", line),
+            )
+        })?;
+
+        match k.trim() {
+            "content-encoding" => {
+                algorithm = CompressionAlgorithm::from_content_encoding(v.trim()).ok_or_else(
+                    || {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("unsupported content-encoding '{}'", v.trim()),
+                        )
+                    },
+                )?;
+            }
+            "nonce" => nonce_b64 = Some(v.trim().to_string()),
+            "digest" => {
+                let parsed = v
+                    .trim()
+                    .strip_prefix("SHA-256=")
+                    .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid digest header"))?
+                    .to_string();
+
+                digest_b64 = Some(parsed);
+            }
+            "tag" => {
+                let parsed = v
+                    .trim()
+                    .strip_prefix("HMAC-SHA-256=")
+                    .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid tag header"))?
+                    .to_string();
+
+                tag_b64 = Some(parsed);
+            }
+            "raw-size" => {
+                raw_size = Some(v.trim().parse::<usize>().map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "invalid raw-size in quic-tls-state blob",
+                    )
+                })?);
+            }
+            "encoded-size" => {
+                encoded_size = Some(v.trim().parse::<usize>().map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "invalid encoded-size in quic-tls-state blob",
+                    )
+                })?);
+            }
+            "issued-at" => {
+                issued_at_unix = Some(v.trim().parse::<u64>().map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "invalid issued-at in quic-tls-state blob",
+                    )
+                })?);
+            }
+            _ => {}
+        }
+    }
+
+    let meta = SecureQuicTlsStateBlobMeta {
+        algorithm,
+        nonce_b64: nonce_b64.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "missing nonce in secure quic-tls-state blob header",
+            )
+        })?,
+        digest_b64: digest_b64.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "missing digest in secure quic-tls-state blob header",
+            )
+        })?,
+        tag_b64: tag_b64.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "missing tag in secure quic-tls-state blob header",
+            )
+        })?,
+        raw_size: raw_size.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "missing raw-size in secure quic-tls-state blob header",
+            )
+        })?,
+        encoded_size: encoded_size.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "missing encoded-size in secure quic-tls-state blob header",
+            )
+        })?,
+        issued_at_unix: issued_at_unix.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "missing issued-at in secure quic-tls-state blob header",
+            )
+        })?,
+    };
+
+    if meta.encoded_size != body_len {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "quic-tls-state encoded-size mismatch: expected {}, got {}",
+                meta.encoded_size, body_len
+            ),
+        ));
+    }
+
+    Ok(meta)
+}
+
+fn handshake_state_to_text(state: HandshakeState) -> &'static str {
+    match state {
+        HandshakeState::Initial => "initial",
+        HandshakeState::WaitServerHello => "wait-server-hello",
+        HandshakeState::WaitEncryptedExtensions => "wait-encrypted-extensions",
+        HandshakeState::WaitCertificateRequest => "wait-certificate-request",
+        HandshakeState::WaitCertificate => "wait-certificate",
+        HandshakeState::WaitCertificateVerify => "wait-certificate-verify",
+        HandshakeState::WaitFinished => "wait-finished",
+        HandshakeState::Connected => "connected",
+        HandshakeState::Failed => "failed",
+    }
+}
+
+fn cipher_suite_to_text(cipher_suite: CipherSuite) -> &'static str {
+    match cipher_suite {
+        CipherSuite::Aes128GcmSha256 => "TLS_AES_128_GCM_SHA256",
+        CipherSuite::Aes256GcmSha384 => "TLS_AES_256_GCM_SHA384",
+        CipherSuite::ChaCha20Poly1305Sha256 => "TLS_CHACHA20_POLY1305_SHA256",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_quic_tls_client_creation() {
         let tls = QuicTlsState::new_client(Some("example.com".to_string()));
@@ -1488,26 +2334,26 @@ mod tests {
         assert_eq!(tls.server_name, Some("example.com".to_string()));
         assert!(tls.verify_certificates);
     }
-    
+
     #[test]
     fn test_quic_tls_server_creation() {
         let tls = QuicTlsState::new_server();
         assert!(!tls.is_client);
         assert_eq!(tls.state, HandshakeState::Initial);
     }
-    
+
     #[test]
     fn test_alpn_protocols() {
         let mut tls = QuicTlsState::new_client(None);
         tls.set_alpn_protocols(vec!["h3".to_string(), "h2".to_string()]);
         assert_eq!(tls.alpn_protocols.len(), 2);
     }
-    
+
     #[test]
     fn test_start_handshake() {
         let mut tls = QuicTlsState::new_client(None);
         let mut crypto = CryptoState::new(true);
-        
+
         let result = tls.start_handshake(&mut crypto);
         assert!(result.is_ok());
         assert_eq!(tls.state, HandshakeState::WaitServerHello);
@@ -1515,15 +2361,21 @@ mod tests {
         assert!(tls.ecdh_public.is_some());
         assert!(tls.client_random.is_some());
     }
-    
+
     #[test]
     fn test_cipher_suite_conversion() {
-        assert_eq!(CipherSuite::from_u16(TLS_AES_128_GCM_SHA256), Some(CipherSuite::Aes128GcmSha256));
-        assert_eq!(CipherSuite::Aes128GcmSha256.to_u16(), TLS_AES_128_GCM_SHA256);
+        assert_eq!(
+            CipherSuite::from_u16(TLS_AES_128_GCM_SHA256),
+            Some(CipherSuite::Aes128GcmSha256)
+        );
+        assert_eq!(
+            CipherSuite::Aes128GcmSha256.to_u16(),
+            TLS_AES_128_GCM_SHA256
+        );
         assert_eq!(CipherSuite::Aes128GcmSha256.hash_len(), 32);
         assert_eq!(CipherSuite::Aes128GcmSha256.key_len(), 16);
     }
-    
+
     #[test]
     fn test_hkdf_expand_label() {
         let tls = QuicTlsState::new_client(None);
@@ -1532,7 +2384,7 @@ mod tests {
         assert!(result.is_ok());
         assert_eq!(result.unwrap().len(), 16);
     }
-    
+
     #[test]
     fn test_early_data_config() {
         let mut tls = QuicTlsState::new_client(None);
@@ -1540,7 +2392,7 @@ mod tests {
         assert!(tls.early_data_enabled);
         assert_eq!(tls.max_early_data_size, 4096);
     }
-    
+
     #[test]
     fn test_psk_configuration() {
         let mut tls = QuicTlsState::new_client(None);
@@ -1550,20 +2402,81 @@ mod tests {
         assert_eq!(tls.psk, Some(psk));
         assert_eq!(tls.session_ticket, Some(ticket));
     }
-    
+
     #[test]
     fn test_handshake_timeout() {
         let mut tls = QuicTlsState::new_client(None);
         assert!(!tls.has_timed_out());
-        
+
         tls.started_at = Some(Instant::now() - Duration::from_secs(15));
         assert!(tls.has_timed_out());
     }
-    
+
     #[test]
     fn test_export_keying_material_not_ready() {
         let tls = QuicTlsState::new_client(None);
         let result = tls.export_keying_material(b"test", b"context", 32);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_secure_quic_tls_snapshot_roundtrip_identity() {
+        let mut tls = QuicTlsState::new_client(Some("example.com".to_string()));
+        tls.negotiated_alpn = Some("h3".to_string());
+        tls.enable_early_data(4096);
+        tls.set_psk(vec![1, 2, 3], vec![4, 5, 6, 7]);
+        tls.started_at = Some(Instant::now() - Duration::from_millis(120));
+
+        let (meta, blob) = tls
+            .encode_secure_state_snapshot(CompressionAlgorithm::Identity)
+            .unwrap();
+        assert_eq!(meta.algorithm, CompressionAlgorithm::Identity);
+
+        let (_decoded_meta, snapshot) = QuicTlsState::decode_secure_state_snapshot(&blob).unwrap();
+        assert_eq!(snapshot.role, "client");
+        assert_eq!(snapshot.handshake_state, "initial");
+        assert_eq!(snapshot.cipher_suite, "TLS_AES_128_GCM_SHA256");
+        assert_eq!(snapshot.negotiated_alpn.as_deref(), Some("h3"));
+        assert!(snapshot.early_data_enabled);
+        assert_eq!(snapshot.max_early_data_size, 4096);
+        assert!(snapshot.has_psk);
+        assert!(snapshot.has_session_ticket);
+        assert!(snapshot.started);
+        assert!(snapshot.elapsed_ms.is_some());
+    }
+
+    #[test]
+    fn test_secure_quic_tls_snapshot_roundtrip_compressed() {
+        let mut tls = QuicTlsState::new_server();
+        tls.state = HandshakeState::Connected;
+        tls.key_update_generation = 3;
+        tls.verify_certificates = false;
+        tls.started_at = Some(Instant::now() - Duration::from_millis(42));
+
+        let (_meta, blob) = tls
+            .encode_secure_state_snapshot(CompressionAlgorithm::Gzip)
+            .unwrap();
+
+        let (_decoded_meta, snapshot) = decode_secure_quic_tls_state_snapshot(&blob).unwrap();
+        assert_eq!(snapshot.role, "server");
+        assert_eq!(snapshot.handshake_state, "connected");
+        assert_eq!(snapshot.key_update_generation, 3);
+        assert!(!snapshot.verify_certificates);
+    }
+
+    #[test]
+    fn test_secure_quic_tls_snapshot_tamper_detection() {
+        let tls = QuicTlsState::new_client(None);
+        let (_meta, mut blob) = encode_secure_quic_tls_state_snapshot(
+            &tls,
+            CompressionAlgorithm::Identity,
+        )
+        .unwrap();
+
+        if let Some(last) = blob.last_mut() {
+            *last ^= 0xA5;
+        }
+
+        assert!(decode_secure_quic_tls_state_snapshot(&blob).is_err());
     }
 }

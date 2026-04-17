@@ -27,10 +27,22 @@ pub use response::HttpResponse;
 pub use server::{HttpServer, HttpServerCfg};
 pub use negotiation::{ContentNegotiator, MediaType, LanguageTag, EncodingPreference};
 pub use http3_client::Http3Client;
+pub use crate::crypto as crypto;
+
+pub use compression::{
+    CompressionAlgorithm,
+    CompressionConfig,
+    CompressionLevel,
+    compress as compress_body,
+    decompress as decompress_body,
+    detect_algorithm as detect_compression_algorithm,
+    parse_accept_encoding,
+};
 
 pub const DEFAULT_USER_AGENT: &str = "Singularity/0.0.1";
 pub const MAX_REDIRECTS: usize = 10;
 pub const DEFAULT_TIMEOUT_SECS: u64 = 30;
+pub const DEFAULT_ACCEPT_ENCODING: &str = "br, zstd, gzip, deflate, identity";
 
 #[cfg(test)]
 mod tests;

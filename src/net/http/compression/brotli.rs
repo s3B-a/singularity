@@ -1,6 +1,12 @@
-use super::{Compressor, Decompressor, CompressionLevel};
 use super::utils::{BitReader, BitWriter, SlidingWindow};
+use super::{CompressionAlgorithm, CompressionLevel, Compressor, Decompressor};
+use crate::crypto::constant_time_eq;
+use crate::crypto::encoding::pem;
+use crate::crypto::hash::hmac::hmac_sha256;
+use crate::crypto::hash::sha2::sha256;
+use crate::crypto::random;
 use std::io;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const BROTLI_MIN_WINDOW_SIZE: usize = 16;
 const BROTLI_MAX_WINDOW_SIZE: usize = 24;
@@ -8,6 +14,20 @@ const BROTLI_WINDOW_BITS: usize = 24;
 const BROTLI_MAX_DISTANCE: usize = 1 << BROTLI_WINDOW_BITS;
 const BROTLI_MAX_LENGTH: usize = 262144;
 const BROTLI_MIN_LENGTH: usize = 4;
+
+const BROTLI_BLOB_MAGIC: &str = "SINGULARITY_HTTP_BROTLI_BLOB_V1";
+const BROTLI_BLOB_CONTEXT: &str = "SINGULARITY_HTTP_BROTLI_BLOB_BINDING_V1";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SecureBrotliBlobMeta {
+    pub algorithm: CompressionAlgorithm,
+    pub nonce_b64: String,
+    pub digest_b64: String,
+    pub tag_b64: String,
+    pub raw_size: usize,
+    pub encoded_size: usize,
+    pub issued_at_unix: u64,
+}
 
 #[derive(Debug, Clone)]
 struct HuffmanCode {
@@ -99,7 +119,7 @@ impl BrotliDict {
         } else {
             None
         }
-    } 
+    }
 }
 
 #[derive(Debug)]
@@ -139,7 +159,7 @@ impl BrotliCompressor {
     fn compress_metablock(&mut self, data: &[u8], is_last: bool) -> io::Result<Vec<u8>> {
         let mut writer = BitWriter::new();
         writer.write_bits(if is_last { 1 } else { 0 }, 1);
-        
+
         let mlen = data.len();
         let mnibbles = if mlen == 0 {
             0
@@ -165,7 +185,7 @@ impl BrotliCompressor {
         result.extend_from_slice(data);
 
         self.window.push_slice(data);
-        
+
         Ok(result)
     }
 
@@ -191,7 +211,7 @@ impl BrotliCompressor {
             None
         }
     }
-    
+
     fn write_bits(&self, output: &mut Vec<u8>, value: u32, nbits: u32) -> io::Result<()> {
         let mut current_byte = 0u8;
         let mut bits_filled = 0;
@@ -260,8 +280,8 @@ impl BrotliDecompressor {
         let mut reader = BitReader::new(&input[*offset..]);
         let islast = reader.read_bits(1)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "EOF reading ISLAST"))?;
-        let islast_flag = islast != 0;
         
+        let islast_flag = islast != 0;
         let mnibbles = reader.read_bits(2)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "EOF reading MNIBBLES"))?;
 
@@ -270,8 +290,10 @@ impl BrotliDecompressor {
             for i in 0..mnibbles {
                 let byte = reader.read_bits(8)
                     .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "EOF reading MLEN"))?;
+                
                 len |= (byte as usize) << (i * 8);
             }
+
             len
         } else {
             0
@@ -287,7 +309,7 @@ impl BrotliDecompressor {
                     format!(
                         "Metablock data extends beyond input: need {} bytes at offset {}, have {} total",
                         mlen, *offset, input.len()
-                    )
+                    ),
                 ));
             }
             
@@ -303,11 +325,155 @@ impl BrotliDecompressor {
     }
 }
 
+pub fn select_secure_brotli_algorithm(accept_encoding: &str) -> CompressionAlgorithm {
+    let parsed = super::parse_accept_encoding(accept_encoding);
+    for (algorithm, quality) in &parsed {
+        if *quality > 0.0 && *algorithm == CompressionAlgorithm::Brotli && algorithm.is_implemented() {
+            return *algorithm;
+        }
+    }
+
+    parsed.into_iter().find_map(|(algorithm, quality)| {
+        if quality > 0.0 && algorithm.is_implemented() {
+            Some(algorithm)
+        } else {
+            None
+        }
+    }).unwrap_or(CompressionAlgorithm::Identity)
+}
+
+pub fn encode_secure_brotli_payload(data: &[u8], algorithm: CompressionAlgorithm) -> io::Result<(SecureBrotliBlobMeta, Vec<u8>)> {
+    let mut selected_algorithm = algorithm;
+    if !selected_algorithm.is_implemented() {
+        selected_algorithm = CompressionAlgorithm::Identity;
+    }
+
+    let raw_payload = data.to_vec();
+    let encoded_payload = if selected_algorithm == CompressionAlgorithm::Identity {
+        raw_payload.clone()
+    } else {
+        super::compress(selected_algorithm, &raw_payload, CompressionLevel::Default)?
+    };
+
+    let nonce = random::generate_random(24).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::Other,
+            format!("failed to generate brotli blob nonce: {}", e),
+        )
+    })?;
+
+    let digest = sha256(&raw_payload);
+    let tag = compute_brotli_blob_tag(&nonce, selected_algorithm, raw_payload.len(), &encoded_payload);
+    let digest_b64 = pem::encode(&digest);
+    let tag_b64 = pem::encode(&tag);
+    let nonce_b64 = pem::encode(&nonce);
+    let issued_at_unix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    let header = format!(
+        "{magic}\ncontent-encoding={encoding}\nnonce={nonce}\ndigest=SHA-256={digest}\ntag=HMAC-SHA-256={tag}\nraw-size={raw_size}\nencoded-size={encoded_size}\nissued-at={issued_at}\n\n",
+        magic = BROTLI_BLOB_MAGIC,
+        encoding = selected_algorithm.content_encoding(),
+        nonce = nonce_b64,
+        digest = digest_b64,
+        tag = tag_b64,
+        raw_size = raw_payload.len(),
+        encoded_size = encoded_payload.len(),
+        issued_at = issued_at_unix
+    );
+
+    let mut blob = header.into_bytes();
+    blob.extend_from_slice(&encoded_payload);
+
+    Ok((
+        SecureBrotliBlobMeta {
+            algorithm: selected_algorithm,
+            nonce_b64,
+            digest_b64,
+            tag_b64,
+            raw_size: raw_payload.len(),
+            encoded_size: encoded_payload.len(),
+            issued_at_unix,
+        },
+        blob,
+    ))
+}
+
+pub fn encode_secure_brotli_payload_auto(data: &[u8], accept_encoding: &str) -> io::Result<(SecureBrotliBlobMeta, Vec<u8>)> {
+    let selected = select_secure_brotli_algorithm(accept_encoding);
+    encode_secure_brotli_payload(data, selected)
+}
+
+pub fn decode_secure_brotli_payload(data: &[u8]) -> io::Result<(SecureBrotliBlobMeta, Vec<u8>)> {
+    let (header, body) = split_header_body(data)?;
+    let meta = parse_secure_brotli_blob_meta(&header, body.len())?;
+    let nonce = pem::decode(&meta.nonce_b64).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid brotli nonce encoding: {}", e),
+        )
+    })?;
+
+    let expected_digest = pem::decode(&meta.digest_b64).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid brotli digest encoding: {}", e),
+        )
+    })?;
+
+    let provided_tag = pem::decode(&meta.tag_b64).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid brotli tag encoding: {}", e),
+        )
+    })?;
+
+    if expected_digest.len() != 32 || provided_tag.len() != 32 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "brotli digest or tag has invalid length",
+        ));
+    }
+
+    let expected_tag = compute_brotli_blob_tag(&nonce, meta.algorithm, meta.raw_size, body);
+    if !constant_time_eq(&expected_tag, &provided_tag) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "brotli blob HMAC mismatch",
+        ));
+    }
+
+    let raw_payload = if meta.algorithm == CompressionAlgorithm::Identity {
+        body.to_vec()
+    } else {
+        super::decompress(meta.algorithm, body)?
+    };
+
+    if raw_payload.len() != meta.raw_size {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "brotli raw-size mismatch: expected {}, got {}",
+                meta.raw_size,
+                raw_payload.len()
+            ),
+        ));
+    }
+
+    let actual_digest = sha256(&raw_payload);
+    if !constant_time_eq(&actual_digest, &expected_digest) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "brotli blob digest mismatch",
+        ));
+    }
+
+    Ok((meta, raw_payload))
+}
+
 impl Compressor for BrotliCompressor {
     fn compress(&mut self, input: &[u8]) -> io::Result<Vec<u8>> {
         self.window.clear();
         let mut output = Vec::new();
-        output.extend_from_slice(&[0xce, 0xb2, 0xcf, 0x81]);        
+        output.extend_from_slice(&[0xce, 0xb2, 0xcf, 0x81]);
         let block_size = match self.quality {
             1..=3 => 8 * 1024,
             4..=8 => 16 * 1024,
@@ -345,10 +511,10 @@ impl Compressor for BrotliCompressor {
 
 impl Decompressor for BrotliDecompressor {
     fn decompress(&mut self, input: &[u8]) -> io::Result<Vec<u8>> {
-        if input.len() < 4 || &input[0..4] != &[0xce, 0xb2, 0xcf, 0x81] {
+        if input.len() < 4 || &input[0..4] != [0xce, 0xb2, 0xcf, 0x81] {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "Invalid Brotli magic number"
+                "Invalid Brotli magic number",
             ));
         }
 
@@ -401,6 +567,180 @@ pub fn compress(data: &[u8], level: CompressionLevel) -> io::Result<Vec<u8>> {
 pub fn decompress(data: &[u8]) -> io::Result<Vec<u8>> {
     let mut decompressor = BrotliDecompressor::new();
     decompressor.decompress(data)
+}
+
+fn compute_brotli_blob_tag(nonce: &[u8], algorithm: CompressionAlgorithm, raw_size: usize, encoded_payload: &[u8]) -> [u8; 32] {
+    let mut mac_input = Vec::new();
+    mac_input.extend_from_slice(BROTLI_BLOB_CONTEXT.as_bytes());
+    mac_input.extend_from_slice(algorithm.content_encoding().as_bytes());
+    mac_input.extend_from_slice(&(raw_size as u64).to_be_bytes());
+    mac_input.extend_from_slice(nonce);
+    mac_input.extend_from_slice(encoded_payload);
+    hmac_sha256(BROTLI_BLOB_CONTEXT.as_bytes(), &mac_input)
+}
+
+fn split_header_body(data: &[u8]) -> io::Result<(String, &[u8])> {
+    if let Some(pos) = data.windows(2).position(|w| w == b"\n\n") {
+        let header = std::str::from_utf8(&data[..pos]).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "brotli blob header is not valid UTF-8",
+            )
+        })?;
+
+        return Ok((header.to_string(), &data[pos + 2..]));
+    }
+
+    if let Some(pos) = data.windows(4).position(|w| w == b"\r\n\r\n") {
+        let header = std::str::from_utf8(&data[..pos]).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "brotli blob header is not valid UTF-8",
+            )
+        })?;
+
+        return Ok((header.to_string(), &data[pos + 4..]));
+    }
+
+    Err(io::Error::new(
+        io::ErrorKind::InvalidData,
+        "brotli blob missing header/body separator",
+    ))
+}
+
+fn parse_secure_brotli_blob_meta(header: &str, body_len: usize) -> io::Result<SecureBrotliBlobMeta> {
+    let mut lines = header.lines();
+    let magic = lines.next().unwrap_or_default();
+    if magic != BROTLI_BLOB_MAGIC {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid brotli blob magic",
+        ));
+    }
+
+    let mut algorithm = CompressionAlgorithm::Identity;
+    let mut nonce_b64 = None;
+    let mut digest_b64 = None;
+    let mut tag_b64 = None;
+    let mut raw_size = None::<usize>;
+    let mut encoded_size = None::<usize>;
+    let mut issued_at_unix = None::<u64>;
+    for line in lines {
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        let (k, v) = line.split_once('=').ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid brotli header line '{}'", line),
+            )
+        })?;
+
+        match k.trim() {
+            "content-encoding" => {
+                algorithm = CompressionAlgorithm::from_content_encoding(v.trim()).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("unsupported content-encoding '{}'", v.trim()),
+                    )
+                })?;
+            }
+            "nonce" => nonce_b64 = Some(v.trim().to_string()),
+            "digest" => {
+                let parsed = v.trim().strip_prefix("SHA-256=").ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "invalid digest header")
+                })?.to_string();
+
+                digest_b64 = Some(parsed);
+            }
+            "tag" => {
+                let parsed = v.trim().strip_prefix("HMAC-SHA-256=").ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "invalid tag header")
+                })?.to_string();
+
+                tag_b64 = Some(parsed);
+            }
+            "raw-size" => {
+                raw_size = Some(v.trim().parse::<usize>().map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidData, "invalid raw-size")
+                })?);
+            }
+            "encoded-size" => {
+                encoded_size = Some(v.trim().parse::<usize>().map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidData, "invalid encoded-size")
+                })?);
+            }
+            "issued-at" => {
+                issued_at_unix = Some(v.trim().parse::<u64>().map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidData, "invalid issued-at")
+                })?);
+            }
+            _ => {}
+        }
+    }
+
+    let nonce_b64 = nonce_b64.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "missing nonce in brotli blob header",
+        )
+    })?;
+
+    let digest_b64 = digest_b64.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "missing digest in brotli blob header",
+        )
+    })?;
+
+    let tag_b64 = tag_b64.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "missing tag in brotli blob header",
+        )
+    })?;
+
+    let raw_size = raw_size.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "missing raw-size in brotli blob header",
+        )
+    })?;
+
+    let encoded_size = encoded_size.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "missing encoded-size in brotli blob header",
+        )
+    })?;
+
+    let issued_at_unix = issued_at_unix.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "missing issued-at in brotli blob header",
+        )
+    })?;
+
+    if encoded_size != body_len {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "brotli encoded-size mismatch: expected {}, got {}",
+                encoded_size, body_len
+            ),
+        ));
+    }
+
+    Ok(SecureBrotliBlobMeta {
+        algorithm,
+        nonce_b64,
+        digest_b64,
+        tag_b64,
+        raw_size,
+        encoded_size,
+        issued_at_unix,
+    })
 }
 
 #[cfg(test)]
@@ -480,9 +820,13 @@ mod tests {
         assert_eq!(&compressed[0..4], &[0xce, 0xb2, 0xcf, 0x81]);
 
         let decompressed = decompress(&compressed).unwrap();
-        assert_eq!(data.len(), decompressed.len(), 
-            "Length mismatch: expected {}, got {}", 
-            data.len(), decompressed.len());
+        assert_eq!(
+            data.len(),
+            decompressed.len(),
+            "Length mismatch: expected {}, got {}",
+            data.len(),
+            decompressed.len()
+        );
         assert_eq!(data, decompressed, "Data mismatch");
     }
 
@@ -505,5 +849,44 @@ mod tests {
 
         assert_eq!(data1.to_vec(), decompressed1);
         assert_eq!(data2.to_vec(), decompressed2);
+    }
+
+    #[test]
+    fn test_secure_brotli_blob_roundtrip_identity() {
+        let payload = b"brotli secure payload identity".to_vec();
+        let (meta, blob) =
+            encode_secure_brotli_payload(&payload, CompressionAlgorithm::Identity).unwrap();
+
+        assert_eq!(meta.algorithm, CompressionAlgorithm::Identity);
+
+        let (decoded_meta, restored) = decode_secure_brotli_payload(&blob).unwrap();
+        assert_eq!(decoded_meta.algorithm, CompressionAlgorithm::Identity);
+        assert_eq!(restored, payload);
+    }
+
+    #[test]
+    fn test_secure_brotli_blob_roundtrip_brotli() {
+        let payload = b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_vec();
+        let (meta, blob) =
+            encode_secure_brotli_payload(&payload, CompressionAlgorithm::Brotli).unwrap();
+
+        assert_eq!(meta.algorithm, CompressionAlgorithm::Brotli);
+
+        let (decoded_meta, restored) = decode_secure_brotli_payload(&blob).unwrap();
+        assert_eq!(decoded_meta.algorithm, CompressionAlgorithm::Brotli);
+        assert_eq!(restored, payload);
+    }
+
+    #[test]
+    fn test_secure_brotli_blob_tamper_detection() {
+        let payload = b"tamper".to_vec();
+        let (_, mut blob) =
+            encode_secure_brotli_payload(&payload, CompressionAlgorithm::Identity).unwrap();
+
+        let idx = blob.len() - 1;
+        blob[idx] ^= 0x01;
+
+        let err = decode_secure_brotli_payload(&blob).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 }

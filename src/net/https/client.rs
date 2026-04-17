@@ -35,10 +35,10 @@ pub struct HttpsClientCfg {
     pub default_headers: Headers,
 }
 
-impl Default for HttpsClientCfg {
+impl Default for HttpsClientCfg {   
     fn default() -> Self {
         let mut default_headers = Headers::new();
-        default_headers.insert("User-Agent", "singularity-https-client/1.0");
+        default_headers.insert("User-Agent", "singularity-https-client/0.1.0");
         default_headers.insert("Accept", "*/*");
         default_headers.insert("Accept-Encoding", "identity");
         default_headers.insert("Connection", "keep-alive");
@@ -48,7 +48,7 @@ impl Default for HttpsClientCfg {
             timeout: Duration::from_secs(30),
             follow_redirect: true,
             max_redirects: 5,
-            user_agent: "singularity-https-client/1.0".to_string(),
+            user_agent: "singularity-https-client/0.1.0".to_string(),
             default_headers,
         }
     }

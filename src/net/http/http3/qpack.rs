@@ -1,5 +1,13 @@
 use super::error::{Error, Result};
+use crate::crypto::constant_time_eq;
+use crate::crypto::encoding::pem;
+use crate::crypto::hash::hmac::hmac_sha256;
+use crate::crypto::hash::sha2::sha256;
+use crate::crypto::random;
+use crate::net::http::compression::{self, CompressionAlgorithm, CompressionLevel};
 use std::collections::VecDeque;
+use std::io;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const STATIC_TABLE: &[(&str, &str)] = &[
     (":authority", ""),
@@ -94,6 +102,20 @@ const STATIC_TABLE: &[(&str, &str)] = &[
     ("x-frame-options", "sameorigin"),
 ];
 
+const QPACK_BLOB_MAGIC: &str = "SINGULARITY_HTTP3_QPACK_BLOB_V1";
+const QPACK_BLOB_CONTEXT: &str = "SINGULARITY_HTTP3_QPACK_BLOB_BINDING_V1";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SecureQpackBlobMeta {
+    pub algorithm: CompressionAlgorithm,
+    pub nonce_b64: String,
+    pub digest_b64: String,
+    pub tag_b64: String,
+    pub raw_size: usize,
+    pub encoded_size: usize,
+    pub issued_at_unix: u64,
+}
+
 #[derive(Debug, Clone)]
 struct DynamicTableEntry {
     name: String,
@@ -167,7 +189,7 @@ impl QpackEncoder {
 
     fn encode_indexed_field_line(buffer: &mut Vec<u8>, index: usize, dynamic: bool) {
         let prefix = if dynamic { 0x80 } else { 0xC0 };
-        let prefix_bits = if dynamic { 6 } else { 6 };
+        let prefix_bits = 6;
         let mut first_byte = prefix;
         if index < (1 << prefix_bits) {
             first_byte |= index as u8;
@@ -239,7 +261,7 @@ impl QpackEncoder {
             buffer.push(value as u8);
         } else {
             buffer.push(max_prefix as u8);
-            let mut remaining = value - max_prefix;    
+            let mut remaining = value - max_prefix;
             while remaining >= 128 {
                 buffer.push(0x80 | (remaining & 0x7F) as u8);
                 remaining >>= 7;
@@ -261,7 +283,9 @@ impl QpackEncoder {
         let entry = DynamicTableEntry::new(name, value);
         let entry_size = entry.size();
         if entry_size > self.max_table_capacity {
-            return Err(Error::InvalidOperation("Entry too large for table".to_string()));
+            return Err(Error::InvalidOperation(
+                "Entry too large for table".to_string(),
+            ));
         }
         
         while self.current_table_size + entry_size > self.max_table_capacity {
@@ -324,7 +348,9 @@ impl QpackDecoder {
         } else {
             0
         };
-        
+
+        let _ = base;
+
         while cursor < data.len() {
             let first_byte = data[cursor];
             if first_byte & 0xC0 == 0xC0 {
@@ -456,10 +482,11 @@ impl QpackDecoder {
         consumed += length;
         
         let s = if huffman {
-            return Err(Error::InvalidOperation("Huffman encoding not yet supported".to_string()));
+            return Err(Error::InvalidOperation(
+                "Huffman encoding not yet supported".to_string(),
+            ));
         } else {
-            String::from_utf8(string_data.to_vec())
-                .map_err(|_| Error::InvalidFrame)?
+            String::from_utf8(string_data.to_vec()).map_err(|_| Error::InvalidFrame)?
         };
         
         Ok((s, consumed))
@@ -477,7 +504,9 @@ impl QpackDecoder {
         let entry = DynamicTableEntry::new(name, value);
         let entry_size = entry.size();
         if entry_size > self.max_table_capacity {
-            return Err(Error::InvalidOperation("Entry too large for table".to_string()));
+            return Err(Error::InvalidOperation(
+                "Entry too large for table".to_string(),
+            ));
         }
         
         while self.current_table_size + entry_size > self.max_table_capacity {
@@ -507,6 +536,323 @@ impl QpackDecoder {
         
         Ok(())
     }
+}
+
+pub fn select_secure_qpack_algorithm(accept_encoding: &str) -> CompressionAlgorithm {
+    let accepted = compression::parse_accept_encoding(accept_encoding);
+    for (algorithm, quality) in accepted {
+        if quality > 0.0 && algorithm.is_implemented() && algorithm != CompressionAlgorithm::Identity {
+            return algorithm;
+        }
+    }
+
+    CompressionAlgorithm::Identity
+}
+
+pub fn encode_secure_qpack_headers(headers: &[(String, String)], algorithm: CompressionAlgorithm) -> io::Result<(SecureQpackBlobMeta, Vec<u8>)> {
+    let mut selected_algorithm = algorithm;
+    if !selected_algorithm.is_implemented() {
+        selected_algorithm = CompressionAlgorithm::Identity;
+    }
+
+    let mut encoder = QpackEncoder::new(4096);
+    let raw_payload = encoder.encode(headers).map_err(|e| io::Error::new(io::ErrorKind::Other, format!("qpack encode failed: {}", e)))?;
+    let encoded_payload = if selected_algorithm == CompressionAlgorithm::Identity {
+        raw_payload.clone()
+    } else {
+        compression::compress(selected_algorithm, &raw_payload, CompressionLevel::Default)?
+    };
+
+    let nonce = random::generate_random(24).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::Other,
+            format!("failed to generate secure qpack nonce: {}", e),
+        )
+    })?;
+
+    let digest = sha256(&raw_payload);
+    let tag = compute_qpack_blob_tag(
+        &nonce,
+        selected_algorithm,
+        raw_payload.len(),
+        &encoded_payload,
+    );
+
+    let meta = SecureQpackBlobMeta {
+        algorithm: selected_algorithm,
+        nonce_b64: pem::encode(&nonce),
+        digest_b64: pem::encode(&digest),
+        tag_b64: pem::encode(&tag),
+        raw_size: raw_payload.len(),
+        encoded_size: encoded_payload.len(),
+        issued_at_unix: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+    };
+
+    let header = format!(
+        "{magic}\ncontent-encoding={encoding}\nnonce={nonce}\ndigest=SHA-256={digest}\ntag=HMAC-SHA-256={tag}\nraw-size={raw_size}\nencoded-size={encoded_size}\nissued-at={issued_at}\n\n",
+        magic = QPACK_BLOB_MAGIC,
+        encoding = meta.algorithm.content_encoding(),
+        nonce = meta.nonce_b64,
+        digest = meta.digest_b64,
+        tag = meta.tag_b64,
+        raw_size = meta.raw_size,
+        encoded_size = meta.encoded_size,
+        issued_at = meta.issued_at_unix,
+    );
+
+    let mut out = header.into_bytes();
+    out.extend_from_slice(&encoded_payload);
+
+    Ok((meta, out))
+}
+
+pub fn encode_secure_qpack_headers_auto(headers: &[(String, String)], accept_encoding: &str) -> io::Result<(SecureQpackBlobMeta, Vec<u8>)> {
+    encode_secure_qpack_headers(headers, select_secure_qpack_algorithm(accept_encoding))
+}
+
+pub fn decode_secure_qpack_headers(data: &[u8]) -> io::Result<(SecureQpackBlobMeta, Vec<(String, String)>)> {
+    let (header, body) = split_header_body(data)?;
+    let meta = parse_secure_qpack_meta(&header, body.len())?;
+    let nonce = pem::decode(&meta.nonce_b64).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid qpack nonce encoding: {}", e),
+        )
+    })?;
+
+    let expected_digest = pem::decode(&meta.digest_b64).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid qpack digest encoding: {}", e),
+        )
+    })?;
+
+    let expected_tag = pem::decode(&meta.tag_b64).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid qpack tag encoding: {}", e),
+        )
+    })?;
+
+    if expected_digest.len() != 32 || expected_tag.len() != 32 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "qpack digest or tag has invalid length",
+        ));
+    }
+
+    let computed_tag = compute_qpack_blob_tag(&nonce, meta.algorithm, meta.raw_size, body);
+    if !constant_time_eq(&expected_tag, &computed_tag) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "secure qpack blob tag verification failed",
+        ));
+    }
+
+    let raw_payload = if meta.algorithm == CompressionAlgorithm::Identity {
+        body.to_vec()
+    } else {
+        compression::decompress(meta.algorithm, body)?
+    };
+
+    if raw_payload.len() != meta.raw_size {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "qpack raw-size mismatch: expected {}, got {}",
+                meta.raw_size,
+                raw_payload.len()
+            ),
+        ));
+    }
+
+    let computed_digest = sha256(&raw_payload);
+    if !constant_time_eq(&expected_digest, &computed_digest) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "secure qpack blob digest verification failed",
+        ));
+    }
+
+    let mut decoder = QpackDecoder::new(4096);
+    let headers = decoder.decode(&raw_payload).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("qpack decode failed: {}", e),
+        )
+    })?;
+
+    Ok((meta, headers))
+}
+
+fn compute_qpack_blob_tag(nonce: &[u8], algorithm: CompressionAlgorithm, raw_size: usize, encoded_payload: &[u8]) -> [u8; 32] {
+    let mut mac_input = Vec::new();
+    mac_input.extend_from_slice(QPACK_BLOB_CONTEXT.as_bytes());
+    mac_input.extend_from_slice(algorithm.content_encoding().as_bytes());
+    mac_input.extend_from_slice(&(raw_size as u64).to_be_bytes());
+    mac_input.extend_from_slice(nonce);
+    mac_input.extend_from_slice(encoded_payload);
+    hmac_sha256(QPACK_BLOB_CONTEXT.as_bytes(), &mac_input)
+}
+
+fn split_header_body(data: &[u8]) -> io::Result<(String, &[u8])> {
+    if let Some(pos) = data.windows(2).position(|w| w == b"\n\n") {
+        let header = std::str::from_utf8(&data[..pos]).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "qpack secure blob header is not valid utf-8",
+            )
+        })?;
+
+        return Ok((header.to_string(), &data[pos + 2..]));
+    }
+
+    if let Some(pos) = data.windows(4).position(|w| w == b"\r\n\r\n") {
+        let header = std::str::from_utf8(&data[..pos]).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "qpack secure blob header is not valid utf-8",
+            )
+        })?;
+
+        return Ok((header.to_string(), &data[pos + 4..]));
+    }
+
+    Err(io::Error::new(
+        io::ErrorKind::InvalidData,
+        "qpack secure blob missing header/body separator",
+    ))
+}
+
+fn parse_secure_qpack_meta(header: &str, body_len: usize) -> io::Result<SecureQpackBlobMeta> {
+    let mut lines = header.lines();
+    let magic = lines.next().unwrap_or_default();
+    if magic != QPACK_BLOB_MAGIC {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid qpack secure blob magic",
+        ));
+    }
+
+    let mut algorithm = CompressionAlgorithm::Identity;
+    let mut nonce_b64 = None;
+    let mut digest_b64 = None;
+    let mut tag_b64 = None;
+    let mut raw_size = None;
+    let mut encoded_size = None;
+    let mut issued_at_unix = None;
+    for line in lines {
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        let (k, v) = line.split_once('=').ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid qpack secure header line '{}'", line),
+            )
+        })?;
+
+        match k.trim() {
+            "content-encoding" => {
+                algorithm = CompressionAlgorithm::from_content_encoding(v.trim()).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("unsupported content-encoding '{}'", v.trim()),
+                    )
+                })?;
+            }
+            "nonce" => nonce_b64 = Some(v.trim().to_string()),
+            "digest" => {
+                let parsed = v.trim().strip_prefix("SHA-256=").ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "invalid digest header")
+                })?.to_string();
+
+                digest_b64 = Some(parsed);
+            }
+            "tag" => {
+                let parsed = v.trim().strip_prefix("HMAC-SHA-256=").ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "invalid tag header")
+                })?.to_string();
+
+                tag_b64 = Some(parsed);
+            }
+            "raw-size" => {
+                raw_size = Some(v.trim().parse::<usize>().map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidData, "invalid raw-size in qpack blob")
+                })?);
+            }
+            "encoded-size" => {
+                encoded_size = Some(v.trim().parse::<usize>().map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "invalid encoded-size in qpack blob",
+                    )
+                })?);
+            }
+            "issued-at" => {
+                issued_at_unix = Some(v.trim().parse::<u64>().map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidData, "invalid issued-at in qpack blob")
+                })?);
+            }
+            _ => {}
+        }
+    }
+
+    let meta = SecureQpackBlobMeta {
+        algorithm,
+        nonce_b64: nonce_b64.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "missing nonce in qpack secure blob header",
+            )
+        })?,
+        digest_b64: digest_b64.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "missing digest in qpack secure blob header",
+            )
+        })?,
+        tag_b64: tag_b64.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "missing tag in qpack secure blob header",
+            )
+        })?,
+        raw_size: raw_size.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "missing raw-size in qpack secure blob header",
+            )
+        })?,
+        encoded_size: encoded_size.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "missing encoded-size in qpack secure blob header",
+            )
+        })?,
+        issued_at_unix: issued_at_unix.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "missing issued-at in qpack secure blob header",
+            )
+        })?,
+    };
+
+    if meta.encoded_size != body_len {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "qpack encoded-size mismatch: expected {}, got {}",
+                meta.encoded_size, body_len
+            ),
+        ));
+    }
+
+    Ok(meta)
 }
 
 #[cfg(test)]
@@ -649,5 +995,56 @@ mod tests {
         buffer.clear();
         QpackEncoder::encode_prefix_int(&mut buffer, 100, 5);
         assert!(buffer.len() > 1);
+    }
+
+    #[test]
+    fn test_secure_qpack_roundtrip_identity() {
+        let headers = vec![
+            (":method".to_string(), "GET".to_string()),
+            (":path".to_string(), "/".to_string()),
+            (":scheme".to_string(), "https".to_string()),
+            (":authority".to_string(), "example.com".to_string()),
+        ];
+
+        let (meta, blob) =
+            encode_secure_qpack_headers(&headers, CompressionAlgorithm::Identity).unwrap();
+        assert_eq!(meta.algorithm, CompressionAlgorithm::Identity);
+
+        let (decoded_meta, decoded_headers) = decode_secure_qpack_headers(&blob).unwrap();
+        assert_eq!(decoded_meta.raw_size, meta.raw_size);
+        assert_eq!(decoded_headers.len(), headers.len());
+    }
+
+    #[test]
+    fn test_secure_qpack_roundtrip_compressed() {
+        let headers = vec![
+            (":method".to_string(), "POST".to_string()),
+            (":path".to_string(), "/upload".to_string()),
+            ("content-type".to_string(), "application/json".to_string()),
+            ("accept-encoding".to_string(), "gzip, br".to_string()),
+        ];
+
+        let (_meta, blob) =
+            encode_secure_qpack_headers(&headers, CompressionAlgorithm::Gzip).unwrap();
+
+        let (_decoded_meta, decoded_headers) = decode_secure_qpack_headers(&blob).unwrap();
+        assert_eq!(decoded_headers.len(), headers.len());
+    }
+
+    #[test]
+    fn test_secure_qpack_tamper_detected() {
+        let headers = vec![
+            (":method".to_string(), "GET".to_string()),
+            (":path".to_string(), "/tamper".to_string()),
+        ];
+
+        let (_meta, mut blob) =
+            encode_secure_qpack_headers(&headers, CompressionAlgorithm::Identity).unwrap();
+
+        let idx = blob.len().checked_sub(1).unwrap();
+        blob[idx] ^= 0x01;
+
+        let result = decode_secure_qpack_headers(&blob);
+        assert!(result.is_err());
     }
 }

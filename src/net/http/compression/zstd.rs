@@ -1,6 +1,12 @@
-use super::{Compressor, Decompressor, CompressionLevel};
 use super::utils::SlidingWindow;
+use super::{CompressionAlgorithm, CompressionLevel, Compressor, Decompressor};
+use crate::crypto::constant_time_eq;
+use crate::crypto::encoding::pem;
+use crate::crypto::hash::hmac::hmac_sha256;
+use crate::crypto::hash::sha2::sha256;
+use crate::crypto::random;
 use std::io;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const ZSTD_MAGIC: u32 = 0x28B52FFD;
 const ZSTD_MIN_WINDOW_SIZE: u32 = 1024;
@@ -8,6 +14,20 @@ const ZSTD_MAX_WINDOW_SIZE: u32 = 1 << 31;
 const ZSTD_DEFAULT_BLOCK_SIZE: usize = 128 * 1024;
 const ZSTD_MIN_MATCH_LENGTH: usize = 3;
 const ZSTD_MAX_MATCH_LENGTH: usize = 131072;
+
+const ZSTD_BLOB_MAGIC: &str = "SINGULARITY_HTTP_ZSTD_BLOB_V1";
+const ZSTD_BLOB_CONTEXT: &str = "SINGULARITY_HTTP_ZSTD_BLOB_BINDING_V1";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SecureZstdBlobMeta {
+    pub algorithm: CompressionAlgorithm,
+    pub nonce_b64: String,
+    pub digest_b64: String,
+    pub tag_b64: String,
+    pub raw_size: usize,
+    pub encoded_size: usize,
+    pub issued_at_unix: u64,
+}
 
 #[derive(Debug, Clone, Copy)]
 struct FrameHeader {
@@ -259,21 +279,18 @@ impl ZstdDecompressor {
             let header_byte1 = data[offset] as u32;
             let header_byte2 = data[offset + 1] as u32;
             let header_byte3 = data[offset + 2] as u32;
-            
             let header = header_byte1 | (header_byte2 << 8) | (header_byte3 << 16);
             offset += 3;
 
             last_block = (header & 1) != 0;
             let block_type = (header >> 1) & 0x3;
             let block_size = (((header >> 3) & 0x1FFFFF) + 1) as usize;
-            
             if offset + block_size > data.len() {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    format!("Block data truncated: need {} bytes at offset {}, have {} total bytes", 
-                        block_size, 
-                        offset,
-                        data.len())
+                    format!("Block data truncated: need {} bytes at offset {}, have {} total bytes",
+                        block_size, offset, data.len()
+                    ),
                 ));
             }
 
@@ -311,6 +328,150 @@ impl ZstdDecompressor {
     }
 }
 
+pub fn select_secure_zstd_algorithm(accept_encoding: &str) -> CompressionAlgorithm {
+    let parsed = super::parse_accept_encoding(accept_encoding);
+    for (algorithm, quality) in &parsed {
+        if *quality > 0.0 && *algorithm == CompressionAlgorithm::Zstd && algorithm.is_implemented() {
+            return *algorithm;
+        }
+    }
+
+    parsed.into_iter().find_map(|(algorithm, quality)| {
+        if quality > 0.0 && algorithm.is_implemented() {
+            Some(algorithm)
+        } else {
+            None
+        }
+    }).unwrap_or(CompressionAlgorithm::Identity)
+}
+
+pub fn encode_secure_zstd_payload(data: &[u8], algorithm: CompressionAlgorithm) -> io::Result<(SecureZstdBlobMeta, Vec<u8>)> {
+    let mut selected_algorithm = algorithm;
+    if !selected_algorithm.is_implemented() {
+        selected_algorithm = CompressionAlgorithm::Identity;
+    }
+
+    let raw_payload = data.to_vec();
+    let encoded_payload = if selected_algorithm == CompressionAlgorithm::Identity {
+        raw_payload.clone()
+    } else {
+        super::compress(selected_algorithm, &raw_payload, CompressionLevel::Default)?
+    };
+
+    let nonce = random::generate_random(24).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::Other,
+            format!("failed to generate zstd blob nonce: {}", e),
+        )
+    })?;
+
+    let digest = sha256(&raw_payload);
+    let tag = compute_zstd_blob_tag(&nonce, selected_algorithm, raw_payload.len(), &encoded_payload);
+    let digest_b64 = pem::encode(&digest);
+    let tag_b64 = pem::encode(&tag);
+    let nonce_b64 = pem::encode(&nonce);
+    let issued_at_unix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    let header = format!(
+        "{magic}\ncontent-encoding={encoding}\nnonce={nonce}\ndigest=SHA-256={digest}\ntag=HMAC-SHA-256={tag}\nraw-size={raw_size}\nencoded-size={encoded_size}\nissued-at={issued_at}\n\n",
+        magic = ZSTD_BLOB_MAGIC,
+        encoding = selected_algorithm.content_encoding(),
+        nonce = nonce_b64,
+        digest = digest_b64,
+        tag = tag_b64,
+        raw_size = raw_payload.len(),
+        encoded_size = encoded_payload.len(),
+        issued_at = issued_at_unix
+    );
+
+    let mut blob = header.into_bytes();
+    blob.extend_from_slice(&encoded_payload);
+
+    Ok((
+        SecureZstdBlobMeta {
+            algorithm: selected_algorithm,
+            nonce_b64,
+            digest_b64,
+            tag_b64,
+            raw_size: raw_payload.len(),
+            encoded_size: encoded_payload.len(),
+            issued_at_unix,
+        },
+        blob,
+    ))
+}
+
+pub fn encode_secure_zstd_payload_auto(data: &[u8], accept_encoding: &str) -> io::Result<(SecureZstdBlobMeta, Vec<u8>)> {
+    let selected = select_secure_zstd_algorithm(accept_encoding);
+    encode_secure_zstd_payload(data, selected)
+}
+
+pub fn decode_secure_zstd_payload(data: &[u8]) -> io::Result<(SecureZstdBlobMeta, Vec<u8>)> {
+    let (header, body) = split_header_body(data)?;
+    let meta = parse_secure_zstd_blob_meta(&header, body.len())?;
+    let nonce = pem::decode(&meta.nonce_b64).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid zstd nonce encoding: {}", e),
+        )
+    })?;
+
+    let expected_digest = pem::decode(&meta.digest_b64).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid zstd digest encoding: {}", e),
+        )
+    })?;
+
+    let provided_tag = pem::decode(&meta.tag_b64).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid zstd tag encoding: {}", e),
+        )
+    })?;
+
+    if expected_digest.len() != 32 || provided_tag.len() != 32 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "zstd digest or tag has invalid length",
+        ));
+    }
+
+    let expected_tag = compute_zstd_blob_tag(&nonce, meta.algorithm, meta.raw_size, body);
+    if !constant_time_eq(&expected_tag, &provided_tag) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "zstd blob HMAC mismatch",
+        ));
+    }
+
+    let raw_payload = if meta.algorithm == CompressionAlgorithm::Identity {
+        body.to_vec()
+    } else {
+        super::decompress(meta.algorithm, body)?
+    };
+
+    if raw_payload.len() != meta.raw_size {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "zstd raw-size mismatch: expected {}, got {}",
+                meta.raw_size,
+                raw_payload.len()
+            ),
+        ));
+    }
+
+    let actual_digest = sha256(&raw_payload);
+    if !constant_time_eq(&actual_digest, &expected_digest) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "zstd blob digest mismatch",
+        ));
+    }
+
+    Ok((meta, raw_payload))
+}
+
 pub fn compress(data: &[u8], level: CompressionLevel) -> io::Result<Vec<u8>> {
     let mut compressor = ZstdCompressor::new(level);
     compressor.compress(data)
@@ -324,6 +485,9 @@ pub fn decompress(data: &[u8]) -> io::Result<Vec<u8>> {
 impl Compressor for ZstdCompressor {
     fn compress(&mut self, input: &[u8]) -> io::Result<Vec<u8>> {
         self.window.clear();
+        let _ = self.level;
+        let _ = ZSTD_MIN_MATCH_LENGTH;
+        let _ = ZSTD_MAX_MATCH_LENGTH;
         let mut output = Vec::new();
         output.extend_from_slice(&ZSTD_MAGIC.to_le_bytes());
         let frame_header = FrameHeader {
@@ -376,12 +540,13 @@ impl Decompressor for ZstdDecompressor {
 
         self.window.clear();
 
-        let (_frame_header, header_size) = FrameHeader::parse(&input[4..])?;
+        let (frame_header, header_size) = FrameHeader::parse(&input[4..])?;
+        let _ = frame_header.version;
         let data_start = 4 + header_size;
         if data_start > input.len() {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "Frame header exceeds input"));
         }
-        
+
         if data_start == input.len() {
             return Ok(Vec::new());
         }
@@ -408,6 +573,180 @@ impl Default for ZstdDecompressor {
     fn default() -> Self {
         Self::new()
     }
+}
+
+fn compute_zstd_blob_tag(nonce: &[u8], algorithm: CompressionAlgorithm, raw_size: usize, encoded_payload: &[u8]) -> [u8; 32] {
+    let mut mac_input = Vec::new();
+    mac_input.extend_from_slice(ZSTD_BLOB_CONTEXT.as_bytes());
+    mac_input.extend_from_slice(algorithm.content_encoding().as_bytes());
+    mac_input.extend_from_slice(&(raw_size as u64).to_be_bytes());
+    mac_input.extend_from_slice(nonce);
+    mac_input.extend_from_slice(encoded_payload);
+    hmac_sha256(ZSTD_BLOB_CONTEXT.as_bytes(), &mac_input)
+}
+
+fn split_header_body(data: &[u8]) -> io::Result<(String, &[u8])> {
+    if let Some(pos) = data.windows(2).position(|w| w == b"\n\n") {
+        let header = std::str::from_utf8(&data[..pos]).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "zstd blob header is not valid UTF-8",
+            )
+        })?;
+
+        return Ok((header.to_string(), &data[pos + 2..]));
+    }
+
+    if let Some(pos) = data.windows(4).position(|w| w == b"\r\n\r\n") {
+        let header = std::str::from_utf8(&data[..pos]).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "zstd blob header is not valid UTF-8",
+            )
+        })?;
+
+        return Ok((header.to_string(), &data[pos + 4..]));
+    }
+
+    Err(io::Error::new(
+        io::ErrorKind::InvalidData,
+        "zstd blob missing header/body separator",
+    ))
+}
+
+fn parse_secure_zstd_blob_meta(header: &str, body_len: usize) -> io::Result<SecureZstdBlobMeta> {
+    let mut lines = header.lines();
+    let magic = lines.next().unwrap_or_default();
+    if magic != ZSTD_BLOB_MAGIC {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid zstd blob magic",
+        ));
+    }
+
+    let mut algorithm = CompressionAlgorithm::Identity;
+    let mut nonce_b64 = None;
+    let mut digest_b64 = None;
+    let mut tag_b64 = None;
+    let mut raw_size = None::<usize>;
+    let mut encoded_size = None::<usize>;
+    let mut issued_at_unix = None::<u64>;
+    for line in lines {
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        let (k, v) = line.split_once('=').ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid zstd header line '{}'", line),
+            )
+        })?;
+
+        match k.trim() {
+            "content-encoding" => {
+                algorithm = CompressionAlgorithm::from_content_encoding(v.trim()).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("unsupported content-encoding '{}'", v.trim()),
+                    )
+                })?;
+            }
+            "nonce" => nonce_b64 = Some(v.trim().to_string()),
+            "digest" => {
+                let parsed = v.trim().strip_prefix("SHA-256=").ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "invalid digest header")
+                })?.to_string();
+
+                digest_b64 = Some(parsed);
+            }
+            "tag" => {
+                let parsed = v.trim().strip_prefix("HMAC-SHA-256=").ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "invalid tag header")
+                })?.to_string();
+                
+                tag_b64 = Some(parsed);
+            }
+            "raw-size" => {
+                raw_size = Some(v.trim().parse::<usize>().map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidData, "invalid raw-size")
+                })?);
+            }
+            "encoded-size" => {
+                encoded_size = Some(v.trim().parse::<usize>().map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidData, "invalid encoded-size")
+                })?);
+            }
+            "issued-at" => {
+                issued_at_unix = Some(v.trim().parse::<u64>().map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidData, "invalid issued-at")
+                })?);
+            }
+            _ => {}
+        }
+    }
+
+    let nonce_b64 = nonce_b64.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "missing nonce in zstd blob header",
+        )
+    })?;
+
+    let digest_b64 = digest_b64.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "missing digest in zstd blob header",
+        )
+    })?;
+
+    let tag_b64 = tag_b64.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "missing tag in zstd blob header",
+        )
+    })?;
+
+    let raw_size = raw_size.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "missing raw-size in zstd blob header",
+        )
+    })?;
+
+    let encoded_size = encoded_size.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "missing encoded-size in zstd blob header",
+        )
+    })?;
+
+    let issued_at_unix = issued_at_unix.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "missing issued-at in zstd blob header",
+        )
+    })?;
+
+    if encoded_size != body_len {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "zstd encoded-size mismatch: expected {}, got {}",
+                encoded_size, body_len
+            ),
+        ));
+    }
+
+    Ok(SecureZstdBlobMeta {
+        algorithm,
+        nonce_b64,
+        digest_b64,
+        tag_b64,
+        raw_size,
+        encoded_size,
+        issued_at_unix,
+    })
 }
 
 mod tests {
@@ -442,7 +781,11 @@ mod tests {
     fn test_zstd_levels() {
         let data = b"The quick brown fox jumps over the lazy dog";
 
-        for &level in &[CompressionLevel::Fast, CompressionLevel::Default, CompressionLevel::Best] {
+        for &level in &[
+            CompressionLevel::Fast,
+            CompressionLevel::Default,
+            CompressionLevel::Best,
+        ] {
             let compressed = compress(data, level).unwrap();
             let decompressed = decompress(&compressed).unwrap();
             assert_eq!(data, decompressed.as_slice());
@@ -487,12 +830,7 @@ mod tests {
         let data = b"test";
         let compressed = compress(data, CompressionLevel::Default).unwrap();
         assert!(compressed.len() >= 4);
-        let magic = u32::from_le_bytes([
-            compressed[0],
-            compressed[1],
-            compressed[2],
-            compressed[3],
-        ]);
+        let magic = u32::from_le_bytes([compressed[0], compressed[1], compressed[2], compressed[3]]);
         assert_eq!(magic, ZSTD_MAGIC);
     }
 
@@ -590,5 +928,43 @@ mod tests {
         let compressed = compress(data, CompressionLevel::Default).unwrap();
         let decompressed = decompress(&compressed).unwrap();
         assert_eq!(data, decompressed.as_slice());
+    }
+
+    #[test]
+    fn test_secure_zstd_blob_roundtrip_identity() {
+        let payload = b"zstd secure payload identity".to_vec();
+        let (meta, blob) =
+            encode_secure_zstd_payload(&payload, CompressionAlgorithm::Identity).unwrap();
+
+        assert_eq!(meta.algorithm, CompressionAlgorithm::Identity);
+
+        let (decoded_meta, restored) = decode_secure_zstd_payload(&blob).unwrap();
+        assert_eq!(decoded_meta.algorithm, CompressionAlgorithm::Identity);
+        assert_eq!(restored, payload);
+    }
+
+    #[test]
+    fn test_secure_zstd_blob_roundtrip_zstd() {
+        let payload = b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_vec();
+        let (meta, blob) = encode_secure_zstd_payload(&payload, CompressionAlgorithm::Zstd).unwrap();
+
+        assert_eq!(meta.algorithm, CompressionAlgorithm::Zstd);
+
+        let (decoded_meta, restored) = decode_secure_zstd_payload(&blob).unwrap();
+        assert_eq!(decoded_meta.algorithm, CompressionAlgorithm::Zstd);
+        assert_eq!(restored, payload);
+    }
+
+    #[test]
+    fn test_secure_zstd_blob_tamper_detection() {
+        let payload = b"tamper".to_vec();
+        let (_, mut blob) =
+            encode_secure_zstd_payload(&payload, CompressionAlgorithm::Identity).unwrap();
+
+        let idx = blob.len() - 1;
+        blob[idx] ^= 0x01;
+
+        let err = decode_secure_zstd_payload(&blob).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 }

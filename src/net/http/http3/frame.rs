@@ -1,6 +1,28 @@
 use super::error::{Error, ErrorCode, Result};
 use super::{decode_varint, encode_varint, ConnectionId};
+use crate::crypto::constant_time_eq;
+use crate::crypto::encoding::pem;
+use crate::crypto::hash::hmac::hmac_sha256;
+use crate::crypto::hash::sha2::sha256;
+use crate::crypto::random;
+use crate::net::http::compression::{self, CompressionAlgorithm, CompressionLevel};
 use std::fmt;
+use std::io;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+const FRAME_BLOB_MAGIC: &str = "SINGULARITY_HTTP3_FRAME_BLOB_V1";
+const FRAME_BLOB_CONTEXT: &str = "SINGULARITY_HTTP3_FRAME_BLOB_BINDING_V1";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SecureFrameBlobMeta {
+    pub algorithm: CompressionAlgorithm,
+    pub nonce_b64: String,
+    pub digest_b64: String,
+    pub tag_b64: String,
+    pub raw_size: usize,
+    pub encoded_size: usize,
+    pub issued_at_unix: u64,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FrameType {
@@ -738,6 +760,349 @@ impl Frame {
         self.encode(&mut buffer).ok();
         buffer.len()
     }
+
+    pub fn to_secure_blob(&self, algorithm: CompressionAlgorithm) -> io::Result<(SecureFrameBlobMeta, Vec<u8>)> {
+        let mut selected_algorithm = algorithm;
+        if !selected_algorithm.is_implemented() {
+            selected_algorithm = CompressionAlgorithm::Identity;
+        }
+
+        let raw_payload = serialize_frame(self)?;
+        let encoded_payload = if selected_algorithm == CompressionAlgorithm::Identity {
+            raw_payload.clone()
+        } else {
+            compression::compress(selected_algorithm, &raw_payload, CompressionLevel::Default)?
+        };
+
+        let nonce = random::generate_random(24).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::Other,
+                format!("failed to generate secure frame nonce: {}", e),
+            )
+        })?;
+
+        let digest = sha256(&raw_payload);
+        let tag = compute_frame_blob_tag(
+            &nonce,
+            selected_algorithm,
+            raw_payload.len(),
+            &encoded_payload,
+        );
+
+        let meta = SecureFrameBlobMeta {
+            algorithm: selected_algorithm,
+            nonce_b64: pem::encode(&nonce),
+            digest_b64: pem::encode(&digest),
+            tag_b64: pem::encode(&tag),
+            raw_size: raw_payload.len(),
+            encoded_size: encoded_payload.len(),
+            issued_at_unix: SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
+        };
+
+        let header = format!(
+            "{magic}\ncontent-encoding={encoding}\nnonce={nonce}\ndigest=SHA-256={digest}\ntag=HMAC-SHA-256={tag}\nraw-size={raw_size}\nencoded-size={encoded_size}\nissued-at={issued_at}\n\n",
+            magic = FRAME_BLOB_MAGIC,
+            encoding = meta.algorithm.content_encoding(),
+            nonce = meta.nonce_b64,
+            digest = meta.digest_b64,
+            tag = meta.tag_b64,
+            raw_size = meta.raw_size,
+            encoded_size = meta.encoded_size,
+            issued_at = meta.issued_at_unix,
+        );
+
+        let mut blob = header.into_bytes();
+        blob.extend_from_slice(&encoded_payload);
+
+        Ok((meta, blob))
+    }
+
+    pub fn to_secure_blob_auto(&self, accept_encoding: &str) -> io::Result<(SecureFrameBlobMeta, Vec<u8>)> {
+        self.to_secure_blob(select_secure_frame_algorithm(accept_encoding))
+    }
+
+    pub fn from_secure_blob(data: &[u8]) -> io::Result<(SecureFrameBlobMeta, Self)> {
+        let (header, body) = split_header_body(data)?;
+        let meta = parse_secure_frame_meta(&header, body.len())?;
+        let nonce = pem::decode(&meta.nonce_b64).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid frame nonce encoding: {}", e),
+            )
+        })?;
+
+        let digest = pem::decode(&meta.digest_b64).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid frame digest encoding: {}", e),
+            )
+        })?;
+
+        let tag = pem::decode(&meta.tag_b64).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid frame tag encoding: {}", e),
+            )
+        })?;
+
+        if digest.len() != 32 || tag.len() != 32 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "frame digest or tag has invalid length",
+            ));
+        }
+
+        let expected_tag = compute_frame_blob_tag(&nonce, meta.algorithm, meta.raw_size, body);
+        if !constant_time_eq(&expected_tag, &tag) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "secure frame blob tag verification failed",
+            ));
+        }
+
+        let raw_payload = if meta.algorithm == CompressionAlgorithm::Identity {
+            body.to_vec()
+        } else {
+            compression::decompress(meta.algorithm, body)?
+        };
+
+        if raw_payload.len() != meta.raw_size {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "frame raw-size mismatch: expected {}, got {}",
+                    meta.raw_size,
+                    raw_payload.len()
+                ),
+            ));
+        }
+
+        let computed_digest = sha256(&raw_payload);
+        if !constant_time_eq(&computed_digest, &digest) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "secure frame blob digest verification failed",
+            ));
+        }
+
+        let frame = deserialize_frame(&raw_payload)?;
+        Ok((meta, frame))
+    }
+}
+
+pub fn select_secure_frame_algorithm(accept_encoding: &str) -> CompressionAlgorithm {
+    let accepted = compression::parse_accept_encoding(accept_encoding);
+    for (algorithm, quality) in accepted {
+        if quality > 0.0 && algorithm.is_implemented() && algorithm != CompressionAlgorithm::Identity {
+            return algorithm;
+        }
+    }
+
+    CompressionAlgorithm::Identity
+}
+
+pub fn encode_secure_frame(frame: &Frame, algorithm: CompressionAlgorithm) -> io::Result<(SecureFrameBlobMeta, Vec<u8>)> {
+    frame.to_secure_blob(algorithm)
+}
+
+pub fn encode_secure_frame_auto(frame: &Frame, accept_encoding: &str) -> io::Result<(SecureFrameBlobMeta, Vec<u8>)> {
+    frame.to_secure_blob_auto(accept_encoding)
+}
+
+pub fn decode_secure_frame(data: &[u8]) -> io::Result<(SecureFrameBlobMeta, Frame)> {
+    Frame::from_secure_blob(data)
+}
+
+fn serialize_frame(frame: &Frame) -> io::Result<Vec<u8>> {
+    let mut buffer = Vec::new();
+    frame.encode(&mut buffer).map_err(|e| {
+        io::Error::new(io::ErrorKind::Other, format!("frame encode failed: {}", e))
+    })?;
+    
+    Ok(buffer)
+}
+
+fn deserialize_frame(raw_payload: &[u8]) -> io::Result<Frame> {
+    let (frame, consumed) = Frame::parse(raw_payload).map_err(|e| {
+        io::Error::new(io::ErrorKind::InvalidData, format!("frame parse failed: {}", e))
+    })?;
+    
+    if consumed != raw_payload.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "frame payload has trailing data: consumed {}, total {}",
+                consumed,
+                raw_payload.len()
+            ),
+        ));
+    }
+
+    Ok(frame)
+}
+
+fn compute_frame_blob_tag(nonce: &[u8], algorithm: CompressionAlgorithm, raw_size: usize, encoded_payload: &[u8]) -> [u8; 32] {
+    let mut mac_input = Vec::new();
+    mac_input.extend_from_slice(FRAME_BLOB_CONTEXT.as_bytes());
+    mac_input.extend_from_slice(algorithm.content_encoding().as_bytes());
+    mac_input.extend_from_slice(&(raw_size as u64).to_be_bytes());
+    mac_input.extend_from_slice(nonce);
+    mac_input.extend_from_slice(encoded_payload);
+    hmac_sha256(FRAME_BLOB_CONTEXT.as_bytes(), &mac_input)
+}
+
+fn split_header_body(data: &[u8]) -> io::Result<(String, &[u8])> {
+    if let Some(pos) = data.windows(2).position(|w| w == b"\n\n") {
+        let header = std::str::from_utf8(&data[..pos]).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "frame secure blob header is not valid utf-8",
+            )
+        })?;
+
+        return Ok((header.to_string(), &data[pos + 2..]));
+    }
+
+    if let Some(pos) = data.windows(4).position(|w| w == b"\r\n\r\n") {
+        let header = std::str::from_utf8(&data[..pos]).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "frame secure blob header is not valid utf-8",
+            )
+        })?;
+
+        return Ok((header.to_string(), &data[pos + 4..]));
+    }
+
+    Err(io::Error::new(
+        io::ErrorKind::InvalidData,
+        "frame secure blob missing header/body separator",
+    ))
+}
+
+fn parse_secure_frame_meta(header: &str, body_len: usize) -> io::Result<SecureFrameBlobMeta> {
+    let mut lines = header.lines();
+    let magic = lines.next().unwrap_or_default();
+    if magic != FRAME_BLOB_MAGIC {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid frame secure blob magic",
+        ));
+    }
+
+    let mut algorithm = CompressionAlgorithm::Identity;
+    let mut nonce_b64 = None;
+    let mut digest_b64 = None;
+    let mut tag_b64 = None;
+    let mut raw_size = None;
+    let mut encoded_size = None;
+    let mut issued_at_unix = None;
+    for line in lines {
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        let (k, v) = line.split_once('=').ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid frame secure header line '{}'", line),
+            )
+        })?;
+
+        match k.trim() {
+            "content-encoding" => {
+                algorithm = CompressionAlgorithm::from_content_encoding(v.trim()).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("unsupported content-encoding '{}'", v.trim()),
+                    )
+                })?;
+            }
+            "nonce" => nonce_b64 = Some(v.trim().to_string()),
+            "digest" => {
+                let parsed = v.trim().strip_prefix("SHA-256=").ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "invalid digest header")
+                })?.to_string();
+
+                digest_b64 = Some(parsed);
+            }
+            "tag" => {
+                let parsed = v.trim().strip_prefix("HMAC-SHA-256=").ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "invalid tag header")
+                })?.to_string();
+                
+                tag_b64 = Some(parsed);
+            }
+            "raw-size" => {
+                raw_size = Some(v.trim().parse::<usize>().map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidData, "invalid raw-size in frame blob")
+                })?);
+            }
+            "encoded-size" => {
+                encoded_size = Some(v.trim().parse::<usize>().map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidData, "invalid encoded-size in frame blob")
+                })?);
+            }
+            "issued-at" => {
+                issued_at_unix = Some(v.trim().parse::<u64>().map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidData, "invalid issued-at in frame blob")
+                })?);
+            }
+            _ => {}
+        }
+    }
+
+    let meta = SecureFrameBlobMeta {
+        algorithm,
+        nonce_b64: nonce_b64.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "missing nonce in frame secure blob header",
+            )
+        })?,
+        digest_b64: digest_b64.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "missing digest in frame secure blob header",
+            )
+        })?,
+        tag_b64: tag_b64.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "missing tag in frame secure blob header",
+            )
+        })?,
+        raw_size: raw_size.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "missing raw-size in frame secure blob header",
+            )
+        })?,
+        encoded_size: encoded_size.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "missing encoded-size in frame secure blob header",
+            )
+        })?,
+        issued_at_unix: issued_at_unix.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "missing issued-at in frame secure blob header",
+            )
+        })?,
+    };
+
+    if meta.encoded_size != body_len {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "frame encoded-size mismatch: expected {}, got {}",
+                meta.encoded_size, body_len
+            ),
+        ));
+    }
+
+    Ok(meta)
 }
 
 impl fmt::Display for FrameType {
@@ -922,5 +1287,47 @@ mod tests {
             }
             _ => panic!("Expected MaxData frame"),
         }
+    }
+
+    #[test]
+    fn test_secure_frame_roundtrip_identity() {
+        let frame = Frame::Ping;
+        let raw = serialize_frame(&frame).unwrap();
+
+        let (meta, blob) = encode_secure_frame(&frame, CompressionAlgorithm::Identity).unwrap();
+        assert_eq!(meta.algorithm, CompressionAlgorithm::Identity);
+
+        let (_decoded_meta, decoded) = decode_secure_frame(&blob).unwrap();
+        let decoded_raw = serialize_frame(&decoded).unwrap();
+        assert_eq!(decoded_raw, raw);
+    }
+
+    #[test]
+    fn test_secure_frame_roundtrip_compressed() {
+        let frame = Frame::Stream {
+            stream_id: 8,
+            offset: 55,
+            data: vec![1, 2, 3, 4, 5, 6, 7, 8, 9],
+            fin: false,
+        };
+        let raw = serialize_frame(&frame).unwrap();
+
+        let (_meta, blob) = encode_secure_frame(&frame, CompressionAlgorithm::Gzip).unwrap();
+        let (_decoded_meta, decoded) = decode_secure_frame(&blob).unwrap();
+        let decoded_raw = serialize_frame(&decoded).unwrap();
+        assert_eq!(decoded_raw, raw);
+    }
+
+    #[test]
+    fn test_secure_frame_tamper_detection() {
+        let frame = Frame::MaxData { max: 424242 };
+        let (_meta, blob) = encode_secure_frame(&frame, CompressionAlgorithm::Identity).unwrap();
+
+        let mut tampered = blob.clone();
+        if let Some(last) = tampered.last_mut() {
+            *last ^= 0xAA;
+        }
+
+        assert!(decode_secure_frame(&tampered).is_err());
     }
 }

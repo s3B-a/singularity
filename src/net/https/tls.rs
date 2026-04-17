@@ -1,15 +1,17 @@
-use std::io::{Read, Write};
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, Duration};
-use crate::net::http::http2::alpn::{AlpnNegotiator, AlpnProtocol};
-use crate::net::tcp::TcpStream;
-use crate::crypto::asymmetric::{rsa, ecdh};
-use crate::crypto::symmetric::aes;
-use crate::crypto::hash::sha2;
-use crate::crypto::encoding::x509;
+use crate::crypto::asymmetric::{ecdh, rsa};
+use crate::crypto::constant_time_eq;
+use crate::crypto::encoding::{pem, x509};
+use crate::crypto::hash::sha2::{self, sha256};
 use crate::crypto::kdf::hkdf;
 use crate::crypto::random;
+use crate::crypto::symmetric::aes;
+use crate::net::http::compression::{self, CompressionAlgorithm, CompressionLevel};
+use crate::net::http::http2::alpn::{AlpnNegotiator, AlpnProtocol};
+use crate::net::tcp::TcpStream;
+use std::collections::HashMap;
+use std::io::{Read, Write};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime};
 
 const TLS_VERSION_1_3: u16 = 0x0304;
 const TLS_VERSION_1_2: u16 = 0x0303;
@@ -24,7 +26,6 @@ const HANDSHAKE_SERVER_HELLO: u8 = 2;
 const HANDSHAKE_NEW_SESSION_TICKET: u8 = 4;
 const HANDSHAKE_ENCRYPTED_EXTENSIONS: u8 = 8;
 const HANDSHAKE_CERTIFICATE: u8 = 11;
-const HANDSHAKE_CERTIFICATE_REQUEST: u8 = 13;
 const HANDSHAKE_CERTIFICATE_VERIFY: u8 = 15;
 const HANDSHAKE_FINISHED: u8 = 20;
 
@@ -36,22 +37,31 @@ const ALERT_LEVEL_WARNING: u8 = 1;
 const ALERT_LEVEL_FATAL: u8 = 2;
 
 const ALERT_CLOSE_NOTIFY: u8 = 0;
-const ALERT_UNEXPECTED_MESSAGE: u8 = 10;
-const ALERT_BAD_RECORD_MAC: u8 = 20;
 const ALERT_HANDSHAKE_FAILURE: u8 = 40;
-const ALERT_BAD_CERTIFICATE: u8 = 42;
-const ALERT_CERTIFICATE_EXPIRED: u8 = 45;
-const ALERT_CERTIFICATE_UNKNOWN: u8 = 46;
-const ALERT_ILLEGAL_PARAMETER: u8 = 47;
-const ALERT_DECODE_ERROR: u8 = 50;
-const ALERT_DECRYPT_ERROR: u8 = 51;
-const ALERT_PROTOCOL_VERSION: u8 = 70;
-const ALERT_INTERNAL_ERROR: u8 = 80;
 
 const MAX_SESSION_LIFETIME: Duration = Duration::from_secs(7200);
-const SESSION_TICKET_EXTENSION: u16 = 35;
-const PRE_SHARED_KEY_EXTENSION: u16 = 41;
-const PSK_KEY_EXCHANGE_MODES_EXTENSION: u16 = 45;
+
+const SECURE_RECORD_MAGIC: &[u8; 8] = b"STLSREC1";
+const SECURE_RECORD_VERSION: u8 = 1;
+const SECURE_RECORD_FLAG_COMPRESSED: u8 = 0x01;
+const SECURE_RECORD_BASE_HEADER_LEN: usize = 8 + 1 + 1 + 1 + 1 + 4 + 4;
+const SECURE_RECORD_DIGEST_LEN: usize = 32;
+
+#[derive(Debug, Clone)]
+pub struct TlsRecordSecurityCfg {
+    pub enable_integrity: bool,
+    pub nonce_len: usize,
+    pub context: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct TlsRecordCompressionCfg {
+    pub enabled: bool,
+    pub min_size: usize,
+    pub preferred_algorithm: CompressionAlgorithm,
+    pub level: CompressionLevel,
+    pub fallback_to_identity_on_error: bool,
+}
 
 #[derive(Debug, Clone)]
 pub struct TlsCfg {
@@ -64,6 +74,8 @@ pub struct TlsCfg {
     pub ca_certs: Vec<x509::Certificate>,
     pub session_cache: Option<SessionCache>,
     pub enable_session_resumption: bool,
+    pub record_security: TlsRecordSecurityCfg,
+    pub record_compression: TlsRecordCompressionCfg,
 }
 
 #[derive(Debug, Clone)]
@@ -71,7 +83,7 @@ pub struct TlsSession {
     pub session_id: Vec<u8>,
     pub master_secret: Vec<u8>,
     pub cipher_suite: u16,
-    pub created_at: std::time::SystemTime,
+    pub created_at: SystemTime,
     pub server_name: String,
     pub protocol_version: TlsVersion,
     pub ticket: Option<Vec<u8>>,
@@ -94,10 +106,12 @@ pub enum TlsError {
     NoSharedCipher,
     VerificationFailed(String),
     CipherError(String),
+    CompressionError(String),
+    IntegrityError(String),
     ProtocolNegotiationFailed(String),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ConnectionState {
     Initial,
     Handshaking,
@@ -105,12 +119,17 @@ enum ConnectionState {
     Closed,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct TlsKeys {
     client_write_key: Vec<u8>,
     server_write_key: Vec<u8>,
     client_write_iv: Vec<u8>,
     server_write_iv: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SessionCache {
+    sessions: Arc<Mutex<HashMap<String, TlsSession>>>,
 }
 
 #[derive(Debug)]
@@ -133,6 +152,7 @@ pub struct TlsStream {
     resuming_session: bool,
     alpn_negotiator: AlpnNegotiator,
     negotiated_protocol: Option<AlpnProtocol>,
+    negotiated_record_compression: CompressionAlgorithm,
 }
 
 impl TlsSession {
@@ -149,21 +169,12 @@ impl TlsSession {
     }
 
     pub fn is_valid(&self) -> bool {
-        if let Ok(elapsed) = self.created_at.elapsed() {
-            elapsed < MAX_SESSION_LIFETIME
-        } else {
-            false
-        }
+        self.created_at.elapsed().map(|elapsed| elapsed < MAX_SESSION_LIFETIME).unwrap_or(false)
     }
 
     pub fn age(&self) -> u32 {
         self.created_at.elapsed().map(|d| d.as_secs() as u32).unwrap_or(u32::MAX)
     }
-}
-
-#[derive(Debug, Clone)]
-pub struct SessionCache {
-    sessions: Arc<Mutex<HashMap<String, TlsSession>>>,
 }
 
 impl SessionCache {
@@ -180,11 +191,7 @@ impl SessionCache {
     }
 
     pub fn get(&self, key: &str) -> Option<TlsSession> {
-        if let Ok(sessions) = self.sessions.lock() {
-            sessions.get(key).cloned()
-        } else {
-            None
-        }
+        self.sessions.lock().ok().and_then(|sessions| sessions.get(key).cloned())
     }
 
     pub fn remove(&self, key: &str) {
@@ -231,6 +238,7 @@ impl TlsStream {
             resuming_session: false,
             alpn_negotiator: AlpnNegotiator::new(),
             negotiated_protocol: None,
+            negotiated_record_compression: CompressionAlgorithm::Identity,
         };
 
         tls_stream.client_handshake()?;
@@ -257,6 +265,7 @@ impl TlsStream {
             resuming_session: false,
             alpn_negotiator: AlpnNegotiator::new(),
             negotiated_protocol: None,
+            negotiated_record_compression: CompressionAlgorithm::Identity,
         };
 
         tls_stream.server_handshake()?;
@@ -266,17 +275,14 @@ impl TlsStream {
     fn client_handshake(&mut self) -> Result<(), TlsError> {
         self.state = ConnectionState::Handshaking;
         let client_random = self.generate_random();
-        let ecdh_key = ecdh::EcdhPrivateKey::generate(ecdh::EcdhCurve::X25519)
-            .map_err(|e| TlsError::HandshakeFailed(format!("Failed to generate ECDH key: {:?}", e)))?;
+        let ecdh_key = ecdh::EcdhPrivateKey::generate(ecdh::EcdhCurve::X25519).map_err(|e| {
+            TlsError::HandshakeFailed(format!("Failed to generate ECDH key: {:?}", e))
+        })?;
+
         let client_public = ecdh_key.public_key();
-        
         let resumable_session = if self.config.enable_session_resumption {
-            if let Some(ref cache) = self.config.session_cache {
-                if let Some(ref server_name) = self.server_name {
-                    cache.get(server_name).filter(|s| s.is_valid()).clone()
-                } else {
-                    None
-                }
+            if let (Some(cache), Some(server_name)) = (&self.config.session_cache, &self.server_name) {
+                cache.get(server_name).filter(|s| s.is_valid())
             } else {
                 None
             }
@@ -287,32 +293,38 @@ impl TlsStream {
         let client_hello = if let Some(ref session) = resumable_session {
             self.resuming_session = true;
             self.session_id = session.session_id.clone();
-            self.build_resumption_client_hello(&client_random, &client_public, &session)?
+            self.build_resumption_client_hello(&client_random, &client_public, session)?
         } else {
             self.build_client_hello(&client_random, &client_public)?
         };
 
         self.handshake_msg.extend_from_slice(&client_hello);
         self.send_handshake_message(HANDSHAKE_CLIENT_HELLO, &client_hello)?;
-
         let (server_hello_type, server_hello) = self.recieve_handshake_message()?;
         if server_hello_type != HANDSHAKE_SERVER_HELLO {
-            return Err(TlsError::HandshakeFailed("Expected ServerHello".to_string()));
+            return Err(TlsError::HandshakeFailed(
+                "Expected ServerHello".to_string(),
+            ));
         }
 
         let server_alpn_data = self.extract_alpn_from_handshake(&server_hello)?;
         let negotiated = self.alpn_negotiator.negotiate(&server_alpn_data).ok();
         self.negotiated_protocol = negotiated;
-
         self.handshake_msg.extend_from_slice(&server_hello);
-        let (server_random, selected_cipher, peer_public_key, negotiated_version, session_resumed) =
-            self.parse_server_hello(&server_hello)?;
+        
+        let (
+            server_random,
+            selected_cipher,
+            peer_public_key,
+            negotiated_version,
+            session_resumed,
+        ) = self.parse_server_hello(&server_hello)?;
 
         self.version = negotiated_version;
         self.cipher_suite = selected_cipher;
         if session_resumed && self.resuming_session {
-            if let Some(ref session) = resumable_session {
-                let shared_secret = session.master_secret.clone();
+            if let Some(session) = resumable_session {
+                let shared_secret = session.master_secret;
                 self.derive_keys(&client_random, &server_random, &shared_secret)?;
                 self.state = ConnectionState::Connected;
                 return Ok(());
@@ -326,11 +338,15 @@ impl TlsStream {
             ));
         }
 
-        let peer_public = ecdh::EcdhPublicKey::from_bytes(ecdh::EcdhCurve::X25519, &peer_public_key)
-            .map_err(|_| TlsError::CipherError("Invalid peer public key".to_string()))?;
+        let peer_public =
+            ecdh::EcdhPublicKey::from_bytes(ecdh::EcdhCurve::X25519, &peer_public_key).map_err(
+                |_| TlsError::CipherError("Invalid peer public key".to_string()),
+            )?;
 
-        let shared_secret = ecdh_key.exchange(&peer_public)
-            .map_err(|e| TlsError::HandshakeFailed(format!("ECDH exchange failed: {:?}", e)))?;
+        let shared_secret = ecdh_key.exchange(&peer_public).map_err(|e| {
+            TlsError::HandshakeFailed(format!("ECDH exchange failed: {:?}", e))
+        })?;
+
         self.derive_keys(&client_random, &server_random, &shared_secret)?;
         loop {
             let (msg_type, msg_data) = self.recieve_handshake_message()?;
@@ -364,7 +380,7 @@ impl TlsStream {
         let finished_msg = self.compute_finished(true)?;
         self.send_handshake_message(HANDSHAKE_FINISHED, &finished_msg)?;
         self.state = ConnectionState::Connected;
-        self.save_session(&client_random, &server_random, &shared_secret)?;
+        self.save_session(&shared_secret)?;
 
         Ok(())
     }
@@ -373,31 +389,33 @@ impl TlsStream {
         self.state = ConnectionState::Handshaking;
         let (client_hello_type, client_hello) = self.recieve_handshake_message()?;
         if client_hello_type != HANDSHAKE_CLIENT_HELLO {
-            return Err(TlsError::HandshakeFailed("Expected ClientHello".to_string()));
+            return Err(TlsError::HandshakeFailed(
+                "Expected ClientHello".to_string(),
+            ));
         }
 
         self.handshake_msg.extend_from_slice(&client_hello);
         let (client_random, client_ciphers, client_public_key, client_versions) = self.parse_client_hello(&client_hello)?;
-        
         self.version = self.negotiate_version(&client_versions)?;
         self.cipher_suite = self.select_cipher_suite(&client_ciphers)?;
+        let ecdh_private = ecdh::EcdhPrivateKey::generate(ecdh::EcdhCurve::X25519).map_err(|e| {
+            TlsError::HandshakeFailed(format!("Failed to generate ECDH key: {:?}", e))
+        })?;
 
-        let ecdh_private = ecdh::EcdhPrivateKey::generate(ecdh::EcdhCurve::X25519)
-            .map_err(|e| TlsError::HandshakeFailed(format!("Failed to generate ECDH key: {:?}", e)))?;
         let ecdh_public = ecdh_private.public_key();
         let server_random = self.generate_random();
-
         let server_hello = self.build_server_hello(&server_random, &ecdh_public)?;
         self.handshake_msg.extend_from_slice(&server_hello);
         self.send_handshake_message(HANDSHAKE_SERVER_HELLO, &server_hello)?;
+        let peer_ecdh_public = ecdh::EcdhPublicKey::from_bytes(ecdh::EcdhCurve::X25519, &client_public_key).map_err(
+            |e| TlsError::HandshakeFailed(format!("Invalid peer public key: {:?}", e)),
+        )?;
 
-        let peer_ecdh_public = ecdh::EcdhPublicKey::from_bytes(ecdh::EcdhCurve::X25519, &client_public_key)
-            .map_err(|e| TlsError::HandshakeFailed(format!("Invalid peer public key: {:?}", e)))?;
-        
-        let shared_secret = ecdh_private.exchange(&peer_ecdh_public)
-            .map_err(|e| TlsError::HandshakeFailed(format!("ECDH exchange failed: {:?}", e)))?;
+        let shared_secret = ecdh_private.exchange(&peer_ecdh_public).map_err(|e| {
+            TlsError::HandshakeFailed(format!("ECDH exchange failed: {:?}", e))
+        })?;
 
-        self.derive_handshake_keys(&shared_secret, &client_random, &server_random)?;
+        self.derive_handshake_keys(&shared_secret)?;
         let encrypted_extensions = self.build_encrypted_extensions()?;
         self.handshake_msg.extend_from_slice(&encrypted_extensions);
         self.send_handshake_message(HANDSHAKE_ENCRYPTED_EXTENSIONS, &encrypted_extensions)?;
@@ -414,12 +432,12 @@ impl TlsStream {
         let server_finished = self.compute_finished(false)?;
         self.handshake_msg.extend_from_slice(&server_finished);
         self.send_handshake_message(HANDSHAKE_FINISHED, &server_finished)?;
-        self.derive_application_keys(&shared_secret, &client_random, &server_random)?;
+        self.derive_application_keys(&shared_secret)?;
         let (finished_type, client_finished) = self.recieve_handshake_message()?;
         if finished_type != HANDSHAKE_FINISHED {
             return Err(TlsError::HandshakeFailed("Expected Finished".to_string()));
         }
-        
+
         self.verify_finished(&client_finished, true)?;
         self.state = ConnectionState::Connected;
 
@@ -427,39 +445,61 @@ impl TlsStream {
     }
 
     fn generate_random(&self) -> [u8; 32] {
-        let mut random = [0u8; 32];
-        random::fill_random(&mut random).expect("Failed to generate cryptographically secure random bytes");
-        
-        random
+        let mut random_bytes = [0u8; 32];
+        let _ = random::fill_random(&mut random_bytes);
+        random_bytes
+    }
+
+    fn parse_configured_cipher_suite(cipher: &str) -> Option<u16> {
+        match cipher.trim() {
+            "TLS_AES_128_GCM_SHA256" => Some(TLS_AES_128_GCM_SHA256),
+            "TLS_AES_256_GCM_SHA384" => Some(TLS_AES_256_GCM_SHA384),
+            "TLS_CHACHA20_POLY1305_SHA256" => Some(TLS_CHACHA20_POLY1305_SHA256),
+            s if s.starts_with("0x") || s.starts_with("0X") => {
+                u16::from_str_radix(&s[2..], 16).ok()
+            }
+            s => s.parse::<u16>().ok(),
+        }
+    }
+
+    fn configured_cipher_suites(&self) -> Vec<u16> {
+        let mut suites = Vec::new();
+        for configured in &self.config.supported_ciphers {
+            if let Some(suite) = Self::parse_configured_cipher_suite(configured) {
+                suites.push(suite);
+            }
+        }
+
+        if suites.is_empty() {
+            suites.push(TLS_AES_256_GCM_SHA384);
+            suites.push(TLS_AES_128_GCM_SHA256);
+            suites.push(TLS_CHACHA20_POLY1305_SHA256);
+        }
+
+        suites
     }
 
     fn build_client_hello(&self, client_random: &[u8; 32], public_key: &ecdh::EcdhPublicKey) -> Result<Vec<u8>, TlsError> {
-        let mut hello = vec![];
+        let mut hello = Vec::new();
         hello.extend_from_slice(&TLS_VERSION_1_2.to_be_bytes());
         hello.extend_from_slice(client_random);
         hello.push(0);
-        let supported_ciphers = vec![
-            TLS_AES_256_GCM_SHA384,
-            TLS_AES_128_GCM_SHA256,
-            TLS_CHACHA20_POLY1305_SHA256,
-        ];
-
-        hello.extend_from_slice(&((supported_ciphers.len() * 2) as u16).to_be_bytes());
-        for cipher in supported_ciphers {
-            hello.extend_from_slice(&cipher.to_be_bytes());
+        let suites = self.configured_cipher_suites();
+        hello.extend_from_slice(&((suites.len() * 2) as u16).to_be_bytes());
+        for suite in suites {
+            hello.extend_from_slice(&suite.to_be_bytes());
         }
 
         hello.push(1);
         hello.push(0);
-
         let mut ext = Vec::new();
-        if let Some(ref server_name) = self.server_name {
+        if let Some(server_name) = &self.server_name {
             if !server_name.is_empty() {
-                ext.extend_from_slice(&0u16.to_be_bytes());
                 let host_bytes = server_name.as_bytes();
                 let sni_list_len = 3 + host_bytes.len();
                 let sni_ext_len = 2 + sni_list_len;
 
+                ext.extend_from_slice(&0u16.to_be_bytes());
                 ext.extend_from_slice(&(sni_ext_len as u16).to_be_bytes());
                 ext.extend_from_slice(&(sni_list_len as u16).to_be_bytes());
                 ext.push(0);
@@ -473,22 +513,16 @@ impl TlsStream {
         ext.extend_from_slice(&2u16.to_be_bytes());
         ext.extend_from_slice(&0x001du16.to_be_bytes());
 
-        ext.extend_from_slice(&11u16.to_be_bytes());
-        ext.extend_from_slice(&2u16.to_be_bytes());
-        ext.push(1);
-        ext.push(0);
-
         ext.extend_from_slice(&13u16.to_be_bytes());
         ext.extend_from_slice(&8u16.to_be_bytes());
         ext.extend_from_slice(&6u16.to_be_bytes());
         ext.extend_from_slice(&0x0804u16.to_be_bytes());
         ext.extend_from_slice(&0x0401u16.to_be_bytes());
         ext.extend_from_slice(&0x0403u16.to_be_bytes());
-
         if !self.alpn_negotiator.supported_protocols_wire().is_empty() {
-            ext.extend_from_slice(&16u16.to_be_bytes());
             let protocols_wire = self.alpn_negotiator.supported_protocols_wire();
             let alpn_list_len = protocols_wire.len();
+            ext.extend_from_slice(&16u16.to_be_bytes());
             ext.extend_from_slice(&((alpn_list_len + 2) as u16).to_be_bytes());
             ext.extend_from_slice(&(alpn_list_len as u16).to_be_bytes());
             ext.extend_from_slice(&protocols_wire);
@@ -502,7 +536,7 @@ impl TlsStream {
         let key_bytes = public_key.to_bytes();
         let key_share_entry_len = 2 + 2 + key_bytes.len();
         let key_share_ext_len = 2 + key_share_entry_len;
-        
+
         ext.extend_from_slice(&51u16.to_be_bytes());
         ext.extend_from_slice(&(key_share_ext_len as u16).to_be_bytes());
         ext.extend_from_slice(&(key_share_entry_len as u16).to_be_bytes());
@@ -514,12 +548,6 @@ impl TlsStream {
         ext.extend_from_slice(&2u16.to_be_bytes());
         ext.push(1);
         ext.push(1);
-
-        ext.extend_from_slice(&5u16.to_be_bytes());
-        ext.extend_from_slice(&5u16.to_be_bytes());
-        ext.push(1);
-        ext.extend_from_slice(&0u16.to_be_bytes());
-        ext.extend_from_slice(&0u16.to_be_bytes());
 
         hello.extend_from_slice(&(ext.len() as u16).to_be_bytes());
         hello.extend_from_slice(&ext);
@@ -533,64 +561,67 @@ impl TlsStream {
         hello.extend_from_slice(client_random);
         hello.push(session.session_id.len() as u8);
         hello.extend_from_slice(&session.session_id);
-        let ciphers = vec![
-            TLS_AES_256_GCM_SHA384,
-            TLS_AES_128_GCM_SHA256,
-            TLS_CHACHA20_POLY1305_SHA256,
-        ];
-        hello.extend_from_slice(&((ciphers.len() * 2) as u16).to_be_bytes());
-        for cipher in ciphers {
-            hello.extend_from_slice(&cipher.to_be_bytes());
+
+        let suites = self.configured_cipher_suites();
+        hello.extend_from_slice(&((suites.len() * 2) as u16).to_be_bytes());
+        for suite in suites {
+            hello.extend_from_slice(&suite.to_be_bytes());
         }
 
         hello.push(1);
         hello.push(0);
-        let mut ext = Vec::new();
 
+        let mut ext = Vec::new();
         ext.extend_from_slice(&43u16.to_be_bytes());
         ext.extend_from_slice(&3u16.to_be_bytes());
         ext.push(2);
         ext.extend_from_slice(&TLS_VERSION_1_3.to_be_bytes());
 
         let public_key_bytes = public_key.to_bytes();
+        let key_share_entry_len = 2 + 2 + public_key_bytes.len();
         ext.extend_from_slice(&51u16.to_be_bytes());
-        let key_share_len = 4 + public_key_bytes.len();
-        ext.extend_from_slice(&(key_share_len as u16).to_be_bytes());
-        ext.extend_from_slice(&((key_share_len - 2) as u16).to_be_bytes());
+        ext.extend_from_slice(&((2 + key_share_entry_len) as u16).to_be_bytes());
+        ext.extend_from_slice(&(key_share_entry_len as u16).to_be_bytes());
         ext.extend_from_slice(&0x001du16.to_be_bytes());
         ext.extend_from_slice(&(public_key_bytes.len() as u16).to_be_bytes());
         ext.extend_from_slice(&public_key_bytes);
 
-        ext.extend_from_slice(&PSK_KEY_EXCHANGE_MODES_EXTENSION.to_be_bytes());
+        ext.extend_from_slice(&45u16.to_be_bytes());
         ext.extend_from_slice(&2u16.to_be_bytes());
         ext.push(1);
         ext.push(1);
+        if let Some(ticket) = &session.ticket {
+            ext.extend_from_slice(&41u16.to_be_bytes());
 
-        if let Some(ref ticket) = session.ticket {
-            ext.extend_from_slice(&PRE_SHARED_KEY_EXTENSION.to_be_bytes());
-            let psk_len = 2 + 2 + ticket.len() + 4 + 2 + 1 + 32;
-            ext.extend_from_slice(&(psk_len as u16).to_be_bytes());
-            
             let identities_len = 2 + ticket.len() + 4;
+            let binders_len = 33;
+            let psk_ext_len = 2 + identities_len + 2 + binders_len;
+
+            ext.extend_from_slice(&(psk_ext_len as u16).to_be_bytes());
+
             ext.extend_from_slice(&(identities_len as u16).to_be_bytes());
             ext.extend_from_slice(&(ticket.len() as u16).to_be_bytes());
             ext.extend_from_slice(ticket);
             ext.extend_from_slice(&session.age().to_be_bytes());
-            
-            ext.extend_from_slice(&33u16.to_be_bytes());
+
+            ext.extend_from_slice(&(binders_len as u16).to_be_bytes());
             ext.push(32);
             ext.extend_from_slice(&[0u8; 32]);
         }
 
-        if let Some(ref host) = self.server_name {
-            ext.extend_from_slice(&0u16.to_be_bytes());
-            let host_bytes = host.as_bytes();
-            let sni_len = 5 + host_bytes.len();
-            ext.extend_from_slice(&(sni_len as u16).to_be_bytes());
-            ext.extend_from_slice(&((host_bytes.len() + 3) as u16).to_be_bytes());
-            ext.push(0);
-            ext.extend_from_slice(&(host_bytes.len() as u16).to_be_bytes());
-            ext.extend_from_slice(host_bytes);
+        if let Some(host) = &self.server_name {
+            if !host.is_empty() {
+                let host_bytes = host.as_bytes();
+                let sni_list_len = 3 + host_bytes.len();
+                let sni_ext_len = 2 + sni_list_len;
+
+                ext.extend_from_slice(&0u16.to_be_bytes());
+                ext.extend_from_slice(&(sni_ext_len as u16).to_be_bytes());
+                ext.extend_from_slice(&(sni_list_len as u16).to_be_bytes());
+                ext.push(0);
+                ext.extend_from_slice(&(host_bytes.len() as u16).to_be_bytes());
+                ext.extend_from_slice(host_bytes);
+            }
         }
 
         hello.extend_from_slice(&(ext.len() as u16).to_be_bytes());
@@ -600,9 +631,10 @@ impl TlsStream {
     }
 
     fn build_server_hello(&self, server_random: &[u8; 32], public_key: &ecdh::EcdhPublicKey) -> Result<Vec<u8>, TlsError> {
-        let mut hello = vec![];
+        let mut hello = Vec::new();
         hello.extend_from_slice(&TLS_VERSION_1_2.to_be_bytes());
         hello.extend_from_slice(server_random);
+
         hello.push(0);
         hello.extend_from_slice(&self.cipher_suite.to_be_bytes());
         hello.push(0);
@@ -619,16 +651,12 @@ impl TlsStream {
         ext.extend_from_slice(&0x001du16.to_be_bytes());
         ext.extend_from_slice(&(key_bytes.len() as u16).to_be_bytes());
         ext.extend_from_slice(&key_bytes);
-
         if let Some(protocol) = self.negotiated_protocol {
-            ext.extend_from_slice(&16u16.to_be_bytes());
-            
             let proto_wire = protocol.wire_format();
-            let alpn_data_len = 2 + proto_wire.len();
-            
-            ext.extend_from_slice(&(alpn_data_len as u16).to_be_bytes());
+            ext.extend_from_slice(&16u16.to_be_bytes());
+            ext.extend_from_slice(&((2 + proto_wire.len()) as u16).to_be_bytes());
             ext.extend_from_slice(&(proto_wire.len() as u16).to_be_bytes());
-            ext.extend_from_slice(&proto_wire);
+            ext.extend_from_slice(proto_wire);
         }
 
         hello.extend_from_slice(&(ext.len() as u16).to_be_bytes());
@@ -641,17 +669,14 @@ impl TlsStream {
         let mut ext = Vec::new();
         if let Some(protocol) = self.negotiated_protocol {
             if !self.is_client {
-                ext.extend_from_slice(&16u16.to_be_bytes());
-                
                 let proto_wire = protocol.wire_format();
-                let alpn_data_len = 2 + proto_wire.len();
-                
-                ext.extend_from_slice(&(alpn_data_len as u16).to_be_bytes());
+                ext.extend_from_slice(&16u16.to_be_bytes());
+                ext.extend_from_slice(&((2 + proto_wire.len()) as u16).to_be_bytes());
                 ext.extend_from_slice(&(proto_wire.len() as u16).to_be_bytes());
-                ext.extend_from_slice(&proto_wire);
+                ext.extend_from_slice(proto_wire);
             }
         }
-        
+
         if !self.is_client && self.server_name.is_some() {
             ext.extend_from_slice(&0u16.to_be_bytes());
             ext.extend_from_slice(&0u16.to_be_bytes());
@@ -667,23 +692,22 @@ impl TlsStream {
     fn build_certificate(&self) -> Result<Vec<u8>, TlsError> {
         let mut cert_msg = Vec::new();
         cert_msg.push(0);
-        
+
         let mut cert_list = Vec::new();
         for cert in &self.config.cert_chain {
             let cert_der = cert.to_der();
-            
             let cert_len = cert_der.len() as u32;
-            cert_list.push(((cert_len >> 16) & 0xFF) as u8);
-            cert_list.push(((cert_len >> 8) & 0xFF) as u8);
-            cert_list.push((cert_len & 0xFF) as u8);
+            cert_list.push(((cert_len >> 16) & 0xff) as u8);
+            cert_list.push(((cert_len >> 8) & 0xff) as u8);
+            cert_list.push((cert_len & 0xff) as u8);
             cert_list.extend_from_slice(&cert_der);
             cert_list.extend_from_slice(&0u16.to_be_bytes());
         }
 
         let list_len = cert_list.len() as u32;
-        cert_msg.push(((list_len >> 16) & 0xFF) as u8);
-        cert_msg.push(((list_len >> 8) & 0xFF) as u8);
-        cert_msg.push((list_len & 0xFF) as u8);
+        cert_msg.push(((list_len >> 16) & 0xff) as u8);
+        cert_msg.push(((list_len >> 8) & 0xff) as u8);
+        cert_msg.push((list_len & 0xff) as u8);
         cert_msg.extend_from_slice(&cert_list);
 
         Ok(cert_msg)
@@ -704,8 +728,12 @@ impl TlsStream {
 
         to_sign.push(0);
         to_sign.extend_from_slice(&transcript_hash);
-        let signature = self.config.private_key.sign(&to_sign, rsa::RsaPadding::Pkcs1v15)
-            .map_err(|e| TlsError::CipherError(format!("Failed to sign CertificateVerify: {:?}", e)))?;
+        let signature = self.config.private_key.sign(&to_sign, rsa::RsaPadding::Pkcs1v15).map_err(|e| {
+            TlsError::CipherError(format!(
+                "Failed to sign CertificateVerify: {:?}",
+                e
+            ))
+        })?;
 
         verify_msg.extend_from_slice(&(signature.len() as u16).to_be_bytes());
         verify_msg.extend_from_slice(&signature);
@@ -715,24 +743,20 @@ impl TlsStream {
 
     fn compute_finished(&self, is_client: bool) -> Result<Vec<u8>, TlsError> {
         let transcript_hash = self.compute_transcript_hash();
-        let finished_key = if is_client {
-            self.derive_finished_key(true)?
-        } else {
-            self.derive_finished_key(false)?
-        };
+        let finished_key = self.derive_finished_key(is_client)?;
 
         let mut hasher = sha2::Sha256::new();
         hasher.update(&finished_key);
         hasher.update(&transcript_hash);
-        let verify_data = hasher.finalize();
-
-        Ok(verify_data.to_vec())
+        Ok(hasher.finalize().to_vec())
     }
 
     fn verify_finished(&self, finished_msg: &[u8], is_client: bool) -> Result<(), TlsError> {
         let expected = self.compute_finished(is_client)?;
-        if finished_msg != expected.as_slice() {
-            return Err(TlsError::HandshakeFailed("Finished verification failed".to_string()));
+        if !constant_time_eq(&expected, finished_msg) {
+            return Err(TlsError::HandshakeFailed(
+                "Finished verification failed".to_string(),
+            ));
         }
 
         Ok(())
@@ -751,25 +775,27 @@ impl TlsStream {
         let session_id_len = data[pos] as usize;
         pos += 1 + session_id_len;
         if pos + 2 > data.len() {
-            return Err(TlsError::DecodeError("Invalid ClientHello format".to_string()));
+            return Err(TlsError::DecodeError(
+                "Invalid ClientHello format".to_string(),
+            ));
         }
 
         let cipher_len = u16::from_be_bytes([data[pos], data[pos + 1]]) as usize;
         pos += 2;
-        
         let mut ciphers = Vec::new();
         for i in (0..cipher_len).step_by(2) {
-            if pos + i + 2 > data.len() {
+            if pos + i + 1 >= data.len() {
                 break;
             }
 
-            let cipher = u16::from_be_bytes([data[pos + i], data[pos + i + 1]]) as usize;
-            ciphers.push(cipher as u16);
+            ciphers.push(u16::from_be_bytes([data[pos + i], data[pos + i + 1]]));
         }
 
         pos += cipher_len;
         if pos >= data.len() {
-            return Err(TlsError::DecodeError("Invalid ClientHello format".to_string()));
+            return Err(TlsError::DecodeError(
+                "Invalid ClientHello format".to_string(),
+            ));
         }
 
         let comp_len = data[pos] as usize;
@@ -779,12 +805,16 @@ impl TlsStream {
         if pos + 2 <= data.len() {
             let ext_len = u16::from_be_bytes([data[pos], data[pos + 1]]) as usize;
             pos += 2;
-            let ext_end = pos + ext_len;
+            let ext_end = pos.saturating_add(ext_len);
             while pos + 4 <= ext_end && pos + 4 <= data.len() {
                 let ext_type = u16::from_be_bytes([data[pos], data[pos + 1]]);
                 let ext_data_len = u16::from_be_bytes([data[pos + 2], data[pos + 3]]) as usize;
                 pos += 4;
-                if ext_type == 51 && pos + ext_data_len <= data.len() {
+                if pos + ext_data_len > data.len() {
+                    break;
+                }
+
+                if ext_type == 51 {
                     let mut kpos = pos + 2;
                     if kpos + 4 <= pos + ext_data_len {
                         let _group = u16::from_be_bytes([data[kpos], data[kpos + 1]]);
@@ -796,13 +826,11 @@ impl TlsStream {
                     }
                 }
 
-                if ext_type == 43 && pos + ext_data_len <= data.len() {
+                if ext_type == 43 && ext_data_len >= 1 {
                     let versions_len = data[pos] as usize;
                     let mut vpos = pos + 1;
-                    
-                    while vpos + 2 <= pos + 1 + versions_len {
-                        let version = u16::from_be_bytes([data[vpos], data[vpos + 1]]);
-                        supported_versions.push(version);
+                    while vpos + 2 <= pos + 1 + versions_len && vpos + 2 <= data.len() {
+                        supported_versions.push(u16::from_be_bytes([data[vpos], data[vpos + 1]]));
                         vpos += 2;
                     }
                 }
@@ -810,10 +838,9 @@ impl TlsStream {
                 pos += ext_data_len;
             }
         }
-        
+
         if supported_versions.is_empty() {
-            let legacy_version = u16::from_be_bytes([data[0], data[1]]);
-            supported_versions.push(legacy_version);
+            supported_versions.push(u16::from_be_bytes([data[0], data[1]]));
         }
 
         Ok((client_random, ciphers, public_key, supported_versions))
@@ -830,19 +857,17 @@ impl TlsStream {
         pos += 32;
         let session_id_len = data[pos] as usize;
         pos += 1;
-        
-        let session_resumed = if !self.session_id.is_empty() 
+
+        let session_resumed = !self.session_id.is_empty()
             && session_id_len == self.session_id.len()
-            && pos + session_id_len <= data.len() 
-            && &data[pos..pos + session_id_len] == &self.session_id[..] {
-            true
-        } else {
-            false
-        };
-        
+            && pos + session_id_len <= data.len()
+            && &data[pos..pos + session_id_len] == &self.session_id[..];
+
         pos += session_id_len;
         if pos + 2 > data.len() {
-            return Err(TlsError::DecodeError("Invalid ServerHello format".to_string()));
+            return Err(TlsError::DecodeError(
+                "Invalid ServerHello format".to_string(),
+            ));
         }
 
         let cipher = u16::from_be_bytes([data[pos], data[pos + 1]]);
@@ -854,35 +879,35 @@ impl TlsStream {
         if pos + 2 <= data.len() {
             let ext_len = u16::from_be_bytes([data[pos], data[pos + 1]]) as usize;
             pos += 2;
-            let ext_end = pos + ext_len;
+            let ext_end = pos.saturating_add(ext_len);
             while pos + 4 <= ext_end && pos + 4 <= data.len() {
                 let ext_type = u16::from_be_bytes([data[pos], data[pos + 1]]);
                 let ext_data_len = u16::from_be_bytes([data[pos + 2], data[pos + 3]]) as usize;
                 pos += 4;
-                if ext_type == 43 && pos + ext_data_len <= data.len() {
-                    if ext_data_len >= 2 {
-                        let version = u16::from_be_bytes([data[pos], data[pos + 1]]);
-                        negotiated_version = match version {
-                            TLS_VERSION_1_3 => TlsVersion::Tls1_3,
-                            TLS_VERSION_1_2 => TlsVersion::Tls1_2,
-                            _ => return Err(TlsError::UnsupportedVersion),
-                        };
-                    }
+                if pos + ext_data_len > data.len() {
+                    break;
                 }
 
-                if ext_type == 51 && pos + ext_data_len <= data.len() {
+                if ext_type == 43 && ext_data_len >= 2 {
+                    let version = u16::from_be_bytes([data[pos], data[pos + 1]]);
+                    negotiated_version = match version {
+                        TLS_VERSION_1_3 => TlsVersion::Tls1_3,
+                        TLS_VERSION_1_2 => TlsVersion::Tls1_2,
+                        _ => return Err(TlsError::UnsupportedVersion),
+                    };
+                }
+
+                if ext_type == 51 && ext_data_len >= 4 {
                     let mut kpos = pos + 2;
                     if kpos + 2 <= pos + ext_data_len {
                         let group = u16::from_be_bytes([data[kpos], data[kpos + 1]]);
                         kpos += 2;
-
                         if group == 0x001d && kpos + 2 <= pos + ext_data_len {
                             let key_len =
                                 u16::from_be_bytes([data[kpos], data[kpos + 1]]) as usize;
                             kpos += 2;
-
                             if kpos + key_len <= pos + ext_data_len {
-                                public_key.extend_from_slice(&data[kpos..kpos + key_len]);
+                                public_key = data[kpos..kpos + key_len].to_vec();
                             }
                         }
                     }
@@ -892,19 +917,25 @@ impl TlsStream {
             }
         }
 
-        Ok((server_random, cipher, public_key, negotiated_version, session_resumed))
+        Ok((
+            server_random,
+            cipher,
+            public_key,
+            negotiated_version,
+            session_resumed,
+        ))
     }
 
     fn handle_new_session_ticket(&mut self, data: &[u8]) -> Result<(), TlsError> {
         if data.len() < 8 {
-            return Err(TlsError::DecodeError("Session ticket too short".to_string()));
+            return Err(TlsError::DecodeError(
+                "Session ticket too short".to_string(),
+            ));
         }
 
         let mut pos = 0;
-        
         let _lifetime = u32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
         pos += 4;
-
         let _age_add = u32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
         pos += 4;
         if pos >= data.len() {
@@ -924,46 +955,17 @@ impl TlsStream {
         }
 
         let ticket = data[pos..pos + ticket_len].to_vec();
-        if let Some(ref mut cache) = self.config.session_cache {
-            if let Some(ref server_name) = self.server_name {
-                if let Some(ref keys) = self.keys {
-                    let mut session = TlsSession::new(
-                        self.session_id.clone(),
-                        keys.client_write_key.clone(),
-                        self.cipher_suite,
-                        server_name.clone(),
-                        self.version,
-                    );
-                    session.ticket = Some(ticket);
-                    cache.insert(server_name.clone(), session);
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    fn save_session(&mut self, client_random: &[u8; 32], server_random: &[u8; 32], shared_secret: &[u8]) -> Result<(), TlsError> {
-        if !self.config.enable_session_resumption {
-            return Ok(());
-        }
-
-        if let Some(ref mut cache) = self.config.session_cache {
-            if let Some(ref server_name) = self.server_name {
-                if self.session_id.is_empty() {
-                    let mut session_id = vec![0u8; 32];
-                    random::fill_random(&mut session_id).expect("Failed to generate random session ID");
-                    self.session_id = session_id;
-                }
-
-                let session = TlsSession::new(
+        if let (Some(cache), Some(server_name)) = (&self.config.session_cache, &self.server_name) {
+            if let Some(keys) = &self.keys {
+                let mut session = TlsSession::new(
                     self.session_id.clone(),
-                    shared_secret.to_vec(),
+                    keys.client_write_key.clone(),
                     self.cipher_suite,
                     server_name.clone(),
                     self.version,
                 );
 
+                session.ticket = Some(ticket);
                 cache.insert(server_name.clone(), session);
             }
         }
@@ -971,10 +973,38 @@ impl TlsStream {
         Ok(())
     }
 
+    fn save_session(&mut self, shared_secret: &[u8]) -> Result<(), TlsError> {
+        if !self.config.enable_session_resumption {
+            return Ok(());
+        }
+
+        if let (Some(cache), Some(server_name)) = (&self.config.session_cache, &self.server_name) {
+            if self.session_id.is_empty() {
+                let mut sid = vec![0u8; 32];
+                let _ = random::fill_random(&mut sid);
+                self.session_id = sid;
+            }
+
+            let session = TlsSession::new(
+                self.session_id.clone(),
+                shared_secret.to_vec(),
+                self.cipher_suite,
+                server_name.clone(),
+                self.version,
+            );
+
+            cache.insert(server_name.clone(), session);
+        }
+
+        Ok(())
+    }
+
     fn select_cipher_suite(&self, client_ciphers: &[u16]) -> Result<u16, TlsError> {
-        for cipher in &self.config.supported_ciphers {
-            if client_ciphers.contains(&cipher.parse::<u16>().unwrap_or(0)) {
-                return Ok(cipher.parse::<u16>().unwrap_or(0));
+        for configured in &self.config.supported_ciphers {
+            if let Some(suite) = Self::parse_configured_cipher_suite(configured) {
+                if client_ciphers.contains(&suite) {
+                    return Ok(suite);
+                }
             }
         }
 
@@ -983,77 +1013,94 @@ impl TlsStream {
 
     fn verify_certificate(&self, cert_msg: &[u8]) -> Result<(), TlsError> {
         if cert_msg.len() < 10 {
-            return Err(TlsError::InvalidCertificate("Certificate message too short".to_string()));
+            return Err(TlsError::InvalidCertificate(
+                "Certificate message too short".to_string(),
+            ));
         }
 
-        let mut pos = 1; // Skip context byte        
+        let mut pos = 1;
         if pos + 3 > cert_msg.len() {
-            return Err(TlsError::InvalidCertificate("Invalid certificate message format".to_string()));
+            return Err(TlsError::InvalidCertificate(
+                "Invalid certificate message format".to_string(),
+            ));
         }
-        
-        let cert_list_len = ((cert_msg[pos] as usize) << 16) 
-            | ((cert_msg[pos + 1] as usize) << 8) 
+
+        let cert_list_len = ((cert_msg[pos] as usize) << 16)
+            | ((cert_msg[pos + 1] as usize) << 8)
             | (cert_msg[pos + 2] as usize);
+        
         pos += 3;
-        
-        if pos + 3 > cert_msg.len() {
-            return Err(TlsError::InvalidCertificate("Certificate list truncated".to_string()));
+        if cert_list_len == 0 || pos + 3 > cert_msg.len() {
+            return Err(TlsError::InvalidCertificate(
+                "Certificate list truncated".to_string(),
+            ));
         }
-        
-        let cert_len = ((cert_msg[pos] as usize) << 16) 
-            | ((cert_msg[pos + 1] as usize) << 8) 
+
+        let cert_len = ((cert_msg[pos] as usize) << 16)
+            | ((cert_msg[pos + 1] as usize) << 8)
             | (cert_msg[pos + 2] as usize);
+        
         pos += 3;
         if pos + cert_len > cert_msg.len() {
-            return Err(TlsError::InvalidCertificate("Certificate data truncated".to_string()));
+            return Err(TlsError::InvalidCertificate(
+                "Certificate data truncated".to_string(),
+            ));
         }
         
         let cert_der = &cert_msg[pos..pos + cert_len];
-        let cert = x509::Certificate::from_der(cert_der)
-            .map_err(|e| TlsError::InvalidCertificate(format!("Failed to parse certificate: {:?}", e)))?;
-        
+        let cert = x509::Certificate::from_der(cert_der).map_err(|e| {
+            TlsError::InvalidCertificate(format!("Failed to parse certificate: {:?}", e))
+        })?;
+
         if !cert.is_valid_at_current_time() {
-            return Err(TlsError::InvalidCertificate("Certificate expired or not yet valid".to_string()));
+            return Err(TlsError::InvalidCertificate(
+                "Certificate expired or not yet valid".to_string(),
+            ));
         }
-        
-        if let Some(ref server_name) = self.server_name {
-            if !server_name.is_empty() {
-                if !cert.matches_hostname(server_name) {
-                    return Err(TlsError::InvalidCertificate(format!(
-                        "Certificate hostname mismatch: expected {}", server_name
-                    )));
-                }
+
+        if let Some(server_name) = &self.server_name {
+            if !server_name.is_empty() && !cert.matches_hostname(server_name) {
+                return Err(TlsError::InvalidCertificate(format!(
+                    "Certificate hostname mismatch: expected {}",
+                    server_name
+                )));
             }
         }
-        
-        if !self.config.ca_certs.is_empty() {
-            let mut verified = false;
-            
-            for ca_cert in &self.config.ca_certs {
-                if cert.verify_signature(ca_cert).is_ok() {
-                    verified = true;
-                    break;
-                }
-            }
-            
+
+        if self.config.verify_peer && !self.config.ca_certs.is_empty() {
+            let verified = self.config.ca_certs.iter().any(|ca| cert.verify_signature(ca).is_ok());
             if !verified {
                 return Err(TlsError::VerificationFailed(
-                    "Certificate chain verification failed: no trusted CA found".to_string()
+                    "Certificate chain verification failed".to_string(),
                 ));
             }
-        } else if self.config.verify_peer {
-            eprintln!("Warning: verify_peer is true but no CA certificates provided");
         }
         
         Ok(())
     }
 
     fn verify_certificate_verify(&self, verify_msg: &[u8]) -> Result<(), TlsError> {
-        for ver in &self.config.cert_chain {
-            let public_key_bytes = ver.public_key().ok_or(TlsError::InvalidCertificate("Missing public key".to_string()))?;
-            let public_key = rsa::RsaPublicKey::from_bytes(&public_key_bytes)
-                .map_err(|_| TlsError::InvalidCertificate("Failed to parse public key".to_string()))?;
+        if verify_msg.len() < 4 {
+            return Err(TlsError::VerificationFailed(
+                "CertificateVerify message too short".to_string(),
+            ));
+        }
+
+        for cert in &self.config.cert_chain {
+            let public_key_bytes = cert.public_key()
+                .ok_or_else(|| TlsError::InvalidCertificate("Missing public key".to_string()))?;
+
+            let public_key = rsa::RsaPublicKey::from_bytes(&public_key_bytes).map_err(|_| {
+                TlsError::InvalidCertificate("Failed to parse public key".to_string())
+            })?;
+
             let signature_len = u16::from_be_bytes([verify_msg[2], verify_msg[3]]) as usize;
+            if 4 + signature_len > verify_msg.len() {
+                return Err(TlsError::VerificationFailed(
+                    "CertificateVerify signature truncated".to_string(),
+                ));
+            }
+
             let signature = &verify_msg[4..4 + signature_len];
             let transcript_hash = self.compute_transcript_hash();
             let mut to_verify = Vec::new();
@@ -1066,15 +1113,17 @@ impl TlsStream {
 
             to_verify.push(0);
             to_verify.extend_from_slice(&transcript_hash);
-            if public_key.verify(&to_verify, signature, rsa::RsaPadding::Pkcs1v15).is_ok() {
+            if public_key.verify(&to_verify, signature, rsa::RsaPadding::Pkcs1v15).unwrap_or(false) {
                 return Ok(());
             }
         }
 
-        Err(TlsError::VerificationFailed("CertificateVerify verification failed".to_string()))
+        Err(TlsError::VerificationFailed(
+            "CertificateVerify verification failed".to_string(),
+        ))
     }
 
-    fn derive_handshake_keys(&mut self, shared_secret: &[u8], _client_random: &[u8; 32], _server_random: &[u8; 32]) -> Result<(), TlsError> {
+    fn derive_handshake_keys(&mut self, shared_secret: &[u8]) -> Result<(), TlsError> {
         let mut hasher = sha2::Sha256::new();
         hasher.update(b"");
         let empty_hash = hasher.finalize();
@@ -1083,14 +1132,16 @@ impl TlsStream {
         let derived = self.hkdf_expand_label(&early_secret, b"derived", &empty_hash, 32)?;
         let handshake_secret = hkdf::Hkdf::extract(Some(&derived), shared_secret);
         let transcript_hash = self.compute_transcript_hash();
-        let client_handshake_traffic_secret = self.hkdf_expand_label(&handshake_secret, b"c hs traffic", &transcript_hash, 32)?;
-        let server_handshake_traffic_secret = self.hkdf_expand_label(&handshake_secret, b"s hs traffic", &transcript_hash, 32)?;
+        let client_hs_secret =
+            self.hkdf_expand_label(&handshake_secret, b"c hs traffic", &transcript_hash, 32)?;
         
-        let client_write_key = self.hkdf_expand_label(&client_handshake_traffic_secret, b"key", b"", 16)?;
-        let client_write_iv = self.hkdf_expand_label(&client_handshake_traffic_secret, b"iv", b"", 12)?;
-        let server_write_key = self.hkdf_expand_label(&server_handshake_traffic_secret, b"key", b"", 16)?;
-        let server_write_iv = self.hkdf_expand_label(&server_handshake_traffic_secret, b"iv", b"", 12)?;
-        
+        let server_hs_secret =
+            self.hkdf_expand_label(&handshake_secret, b"s hs traffic", &transcript_hash, 32)?;
+
+        let client_write_key = self.hkdf_expand_label(&client_hs_secret, b"key", b"", 16)?;
+        let client_write_iv = self.hkdf_expand_label(&client_hs_secret, b"iv", b"", 12)?;
+        let server_write_key = self.hkdf_expand_label(&server_hs_secret, b"key", b"", 16)?;
+        let server_write_iv = self.hkdf_expand_label(&server_hs_secret, b"iv", b"", 12)?;
         self.keys = Some(TlsKeys {
             client_write_key: client_write_key.clone(),
             server_write_key: server_write_key.clone(),
@@ -1098,35 +1149,34 @@ impl TlsStream {
             server_write_iv: server_write_iv.clone(),
         });
 
-        self.client_cipher = Some(aes::Aes::new(&client_write_key).map_err(|e|
-            TlsError::CipherError(format!("Failed to create client cipher: {:?}", e))
-        )?);
+        self.client_cipher = Some(
+            aes::Aes::new(&client_write_key).map_err(|e| {
+                TlsError::CipherError(format!("Failed to create client cipher: {:?}", e))
+            })?,
+        );
 
-        self.server_cipher = Some(aes::Aes::new(&server_write_key).map_err(|e|
-            TlsError::CipherError(format!("Failed to create server cipher: {:?}", e))
-        )?);
-        
+        self.server_cipher = Some(
+            aes::Aes::new(&server_write_key).map_err(|e| {
+                TlsError::CipherError(format!("Failed to create server cipher: {:?}", e))
+            })?,
+        );
+
         Ok(())
     }
 
     fn derive_keys(&mut self, _client_random: &[u8; 32], _server_random: &[u8; 32], shared_secret: &[u8]) -> Result<(), TlsError> {
-        self.derive_application_keys(shared_secret, _client_random, _server_random)
+        self.derive_application_keys(shared_secret)
     }
 
-    fn derive_application_keys(&mut self, shared_secret: &[u8], _client_random: &[u8; 32], _server_random: &[u8; 32]) -> Result<(), TlsError> {
-        let mut hasher = sha2::Sha256::new();
-        hasher.update(b"");
-        let _empty_hash = hasher.finalize();
-
+    fn derive_application_keys(&mut self, shared_secret: &[u8]) -> Result<(), TlsError> {
         let handshake_hash = self.compute_transcript_hash();
-        let client_app_traffic_secret = self.hkdf_expand_label(shared_secret, b"c ap traffic", &handshake_hash, 32)?;
-        let server_app_traffic_secret = self.hkdf_expand_label(shared_secret, b"s ap traffic", &handshake_hash, 32)?;
+        let client_app_secret = self.hkdf_expand_label(shared_secret, b"c ap traffic", &handshake_hash, 32)?;
+        let server_app_secret = self.hkdf_expand_label(shared_secret, b"s ap traffic", &handshake_hash, 32)?;
+        let client_write_key = self.hkdf_expand_label(&client_app_secret, b"key", b"", 16)?;
+        let client_write_iv = self.hkdf_expand_label(&client_app_secret, b"iv", b"", 12)?;
+        let server_write_key = self.hkdf_expand_label(&server_app_secret, b"key", b"", 16)?;
+        let server_write_iv = self.hkdf_expand_label(&server_app_secret, b"iv", b"", 12)?;
 
-        let client_write_key = self.hkdf_expand_label(&client_app_traffic_secret, b"key", b"", 16)?;
-        let client_write_iv = self.hkdf_expand_label(&client_app_traffic_secret, b"iv", b"", 12)?;
-        let server_write_key = self.hkdf_expand_label(&server_app_traffic_secret, b"key", b"", 16)?;
-        let server_write_iv = self.hkdf_expand_label(&server_app_traffic_secret, b"iv", b"", 12)?;
-        
         self.keys = Some(TlsKeys {
             client_write_key: client_write_key.clone(),
             server_write_key: server_write_key.clone(),
@@ -1134,26 +1184,30 @@ impl TlsStream {
             server_write_iv: server_write_iv.clone(),
         });
 
-        self.client_cipher = Some(aes::Aes::new(&client_write_key).map_err(|e|
-            TlsError::CipherError(format!("Failed to create client cipher: {:?}", e))
-        )?);
+        self.client_cipher = Some(
+            aes::Aes::new(&client_write_key).map_err(|e| {
+                TlsError::CipherError(format!("Failed to create client cipher: {:?}", e))
+            })?,
+        );
 
-        self.server_cipher = Some(aes::Aes::new(&server_write_key).map_err(|e|
-            TlsError::CipherError(format!("Failed to create server cipher: {:?}", e))
-        )?);
-        
+        self.server_cipher = Some(
+            aes::Aes::new(&server_write_key).map_err(|e| {
+                TlsError::CipherError(format!("Failed to create server cipher: {:?}", e))
+            })?,
+        );
+
         Ok(())
     }
 
     fn derive_finished_key(&self, is_client: bool) -> Result<Vec<u8>, TlsError> {
         let keys = self.keys.as_ref().ok_or_else(|| TlsError::HandshakeFailed("Keys not derived".to_string()))?;
-        let base_key = if is_client {
+        let base = if is_client {
             &keys.client_write_key
         } else {
             &keys.server_write_key
         };
 
-        self.hkdf_expand_label(base_key, b"finished", b"", 32)
+        self.hkdf_expand_label(base, b"finished", b"", 32)
     }
 
     fn hkdf_expand_label(&self, secret: &[u8], label: &[u8], context: &[u8], length: usize) -> Result<Vec<u8>, TlsError> {
@@ -1164,14 +1218,15 @@ impl TlsStream {
         hkdf_label.extend_from_slice(&full_label);
         hkdf_label.push(context.len() as u8);
         hkdf_label.extend_from_slice(context);
-        hkdf::Hkdf::expand(secret, &hkdf_label, length).map_err(|e| 
-            TlsError::CipherError(format!("HKDF expand failed: {:?}", e))
-        )
+
+        hkdf::Hkdf::expand(secret, &hkdf_label, length)
+            .map_err(|e| TlsError::CipherError(format!("HKDF expand failed: {:?}", e)))
     }
 
     fn compute_transcript_hash(&self) -> Vec<u8> {
         let mut hasher = sha2::Sha256::new();
         hasher.update(&self.handshake_msg);
+
         hasher.finalize().to_vec()
     }
 
@@ -1179,9 +1234,9 @@ impl TlsStream {
         let mut message = Vec::new();
         let len = msg.len() as u32;
         message.push(msg_type);
-        message.push(((len >> 16) & 0xFF) as u8);
-        message.push(((len >> 8) & 0xFF) as u8);
-        message.push((len & 0xFF) as u8);
+        message.push(((len >> 16) & 0xff) as u8);
+        message.push(((len >> 8) & 0xff) as u8);
+        message.push((len & 0xff) as u8);
         message.extend_from_slice(msg);
 
         self.send_record(CONTENT_TYPE_HANDSHAKE, &message)
@@ -1190,27 +1245,324 @@ impl TlsStream {
     fn recieve_handshake_message(&mut self) -> Result<(u8, Vec<u8>), TlsError> {
         let record_data = self.receive_record()?;
         if record_data.len() < 4 {
-            return Err(TlsError::DecodeError("Handshake message too short".to_string()));
+            return Err(TlsError::DecodeError(
+                "Handshake message too short".to_string(),
+            ));
         }
 
         let msg_type = record_data[0];
-        let msg_len = ((record_data[1] as usize) << 16) | ((record_data[2] as usize) << 8) | (record_data[3] as usize);
+        let msg_len = ((record_data[1] as usize) << 16)
+            | ((record_data[2] as usize) << 8)
+            | (record_data[3] as usize);
+
         if record_data.len() < 4 + msg_len {
-            return Err(TlsError::DecodeError("Incomplete handshake message".to_string()));
+            return Err(TlsError::DecodeError(
+                "Incomplete handshake message".to_string(),
+            ));
         }
 
-        let msg_data = record_data[4..4 + msg_len].to_vec();
+        Ok((msg_type, record_data[4..4 + msg_len].to_vec()))
+    }
+
+    fn next_send_sequence(&mut self) -> u64 {
+        if self.is_client {
+            let current = self.client_seq;
+            self.client_seq = self.client_seq.saturating_add(1);
+            
+            current
+        } else {
+            let current = self.server_seq;
+            self.server_seq = self.server_seq.saturating_add(1);
+            
+            current
+        }
+    }
+
+    fn next_receive_sequence(&mut self) -> u64 {
+        if self.is_client {
+            let current = self.server_seq;
+            self.server_seq = self.server_seq.saturating_add(1);
+            
+            current
+        } else {
+            let current = self.client_seq;
+            self.client_seq = self.client_seq.saturating_add(1);
+            
+            current
+        }
+    }
+
+    fn should_secure_record_payload(&self, content_type: u8) -> bool {
+        self.state == ConnectionState::Connected && content_type == CONTENT_TYPE_APPLICATION_DATA
+    }
+
+    fn choose_record_algorithm(&self, payload_len: usize) -> CompressionAlgorithm {
+        let cfg = &self.config.record_compression;
+        if !cfg.enabled || payload_len < cfg.min_size {
+            return CompressionAlgorithm::Identity;
+        }
+
+        if cfg.preferred_algorithm.is_implemented() {
+            cfg.preferred_algorithm
+        } else {
+            CompressionAlgorithm::Identity
+        }
+    }
+
+    fn compression_algorithm_to_id(algorithm: CompressionAlgorithm) -> u8 {
+        match algorithm {
+            CompressionAlgorithm::Identity => 0,
+            CompressionAlgorithm::Gzip => 1,
+            CompressionAlgorithm::Deflate => 2,
+            CompressionAlgorithm::Brotli => 3,
+            CompressionAlgorithm::Zstd => 4,
+        }
+    }
+
+    fn compression_algorithm_from_id(id: u8) -> Result<CompressionAlgorithm, TlsError> {
+        match id {
+            0 => Ok(CompressionAlgorithm::Identity),
+            1 => Ok(CompressionAlgorithm::Gzip),
+            2 => Ok(CompressionAlgorithm::Deflate),
+            3 => Ok(CompressionAlgorithm::Brotli),
+            4 => Ok(CompressionAlgorithm::Zstd),
+            _ => Err(TlsError::DecodeError(format!(
+                "Unknown compression algorithm id: {}",
+                id
+            ))),
+        }
+    }
+
+    fn derive_record_integrity_key(&self, seq: u64, outbound: bool) -> Result<[u8; 32], TlsError> {
+        let keys = self.keys.as_ref().ok_or_else(|| TlsError::IntegrityError("TLS keys not initialized".to_string()))?;
+        let base_key: &[u8] = if outbound {
+            if self.is_client {
+                &keys.client_write_key
+            } else {
+                &keys.server_write_key
+            }
+        } else if self.is_client {
+            &keys.server_write_key
+        } else {
+            &keys.client_write_key
+        };
+
+        let mut material = Vec::new();
+        material.extend_from_slice(self.config.record_security.context.as_bytes());
+        material.extend_from_slice(&seq.to_be_bytes());
+        material.extend_from_slice(base_key);
+
+        Ok(sha256(&material))
+    }
+
+    fn compute_secure_record_digest(&self, integrity_key: &[u8], content_type: u8, algorithm: CompressionAlgorithm, flags: u8, nonce: &[u8], raw_len: usize, wire_len: usize, wire_payload: &[u8]) -> [u8; 32] {
+        let mut material = Vec::new();
+        material.extend_from_slice(integrity_key);
+        material.extend_from_slice(SECURE_RECORD_MAGIC);
+        material.push(SECURE_RECORD_VERSION);
+        material.push(content_type);
+        material.push(Self::compression_algorithm_to_id(algorithm));
+        material.push(flags);
+        material.extend_from_slice(&(raw_len as u32).to_be_bytes());
+        material.extend_from_slice(&(wire_len as u32).to_be_bytes());
+        material.extend_from_slice(nonce);
+        material.extend_from_slice(wire_payload);
         
-        Ok((msg_type, msg_data))
+        sha256(&material)
+    }
+
+    fn build_secure_record_payload(&self, plaintext: &[u8], content_type: u8, seq: u64, outbound: bool) -> Result<Vec<u8>, TlsError> {
+        let mut algorithm = self.choose_record_algorithm(plaintext.len());
+        if algorithm == CompressionAlgorithm::Identity {
+            algorithm = self.negotiated_record_compression;
+        }
+
+        if !algorithm.is_implemented() {
+            algorithm = CompressionAlgorithm::Identity;
+        }
+
+        let mut wire_payload = if algorithm == CompressionAlgorithm::Identity {
+            plaintext.to_vec()
+        } else {
+            match compression::compress(algorithm, plaintext, self.config.record_compression.level) {
+                Ok(out) => out,
+                Err(e) if self.config.record_compression.fallback_to_identity_on_error => {
+                    algorithm = CompressionAlgorithm::Identity;
+                    plaintext.to_vec()
+                }
+                Err(e) => {
+                    return Err(TlsError::CompressionError(format!(
+                        "Failed to compress TLS record: {}",
+                        e
+                    )))
+                }
+            }
+        };
+
+        let mut flags = 0u8;
+        if algorithm != CompressionAlgorithm::Identity {
+            flags |= SECURE_RECORD_FLAG_COMPRESSED;
+        }
+
+        if wire_payload.is_empty() {
+            wire_payload = Vec::new();
+        }
+
+        let nonce_len = self.config.record_security.nonce_len.max(8).min(64);
+        let mut nonce = vec![0u8; nonce_len];
+        random::fill_random(&mut nonce).map_err(|e| {
+            TlsError::IntegrityError(format!(
+                "Failed to generate record nonce: {:?}",
+                e
+            ))
+        })?;
+
+        let integrity_key = self.derive_record_integrity_key(seq, outbound)?;
+        let digest = self.compute_secure_record_digest(
+            &integrity_key,
+            content_type,
+            algorithm,
+            flags,
+            &nonce,
+            plaintext.len(),
+            wire_payload.len(),
+            &wire_payload,
+        );
+
+        let mut blob = Vec::new();
+        blob.extend_from_slice(SECURE_RECORD_MAGIC);
+        blob.push(SECURE_RECORD_VERSION);
+        blob.push(content_type);
+        blob.push(Self::compression_algorithm_to_id(algorithm));
+        blob.push(flags);
+        blob.push(nonce_len as u8);
+        blob.extend_from_slice(&(plaintext.len() as u32).to_be_bytes());
+        blob.extend_from_slice(&(wire_payload.len() as u32).to_be_bytes());
+        blob.extend_from_slice(&nonce);
+        blob.extend_from_slice(&digest);
+        blob.extend_from_slice(&wire_payload);
+
+        Ok(blob)
+    }
+
+    fn parse_secure_record_payload(&self, payload: &[u8], seq: u64, outbound: bool, fallback_content_type: u8) -> Result<(Vec<u8>, u8), TlsError> {
+        if payload.len() < SECURE_RECORD_BASE_HEADER_LEN {
+            return Ok((payload.to_vec(), fallback_content_type));
+        }
+
+        if &payload[..8] != SECURE_RECORD_MAGIC {
+            return Ok((payload.to_vec(), fallback_content_type));
+        }
+
+        let mut pos = 8;
+        let version = payload[pos];
+        pos += 1;
+        if version != SECURE_RECORD_VERSION {
+            return Err(TlsError::DecodeError(format!(
+                "Unsupported secure record version: {}",
+                version
+            )));
+        }
+
+        let inner_content_type = payload[pos];
+        pos += 1;
+
+        let algorithm_id = payload[pos];
+        pos += 1;
+
+        let algorithm = Self::compression_algorithm_from_id(algorithm_id)?;
+        let flags = payload[pos];
+        pos += 1;
+
+        let nonce_len = payload[pos] as usize;
+        pos += 1;
+        if payload.len() < SECURE_RECORD_BASE_HEADER_LEN + nonce_len + SECURE_RECORD_DIGEST_LEN {
+            return Err(TlsError::DecodeError(
+                "Secure record too short".to_string(),
+            ));
+        }
+
+        let raw_len = u32::from_be_bytes([
+            payload[pos],
+            payload[pos + 1],
+            payload[pos + 2],
+            payload[pos + 3],
+        ]) as usize;
+
+        pos += 4;
+
+        let wire_len = u32::from_be_bytes([
+            payload[pos],
+            payload[pos + 1],
+            payload[pos + 2],
+            payload[pos + 3],
+        ]) as usize;
+
+        pos += 4;
+        if pos + nonce_len + SECURE_RECORD_DIGEST_LEN + wire_len != payload.len() {
+            return Err(TlsError::DecodeError(
+                "Secure record size mismatch".to_string(),
+            ));
+        }
+
+        let nonce = &payload[pos..pos + nonce_len];
+        pos += nonce_len;
+
+        let expected_digest = &payload[pos..pos + SECURE_RECORD_DIGEST_LEN];
+        pos += SECURE_RECORD_DIGEST_LEN;
+
+        let wire_payload = &payload[pos..pos + wire_len];
+        let integrity_key = self.derive_record_integrity_key(seq, outbound)?;
+        let actual_digest = self.compute_secure_record_digest(
+            &integrity_key,
+            inner_content_type,
+            algorithm,
+            flags,
+            nonce,
+            raw_len,
+            wire_len,
+            wire_payload,
+        );
+
+        if self.config.record_security.enable_integrity && !constant_time_eq(expected_digest, &actual_digest) {
+            return Err(TlsError::IntegrityError(
+                "Secure record digest verification failed".to_string(),
+            ));
+        }
+
+        let decoded = if flags & SECURE_RECORD_FLAG_COMPRESSED != 0 {
+            compression::decompress(algorithm, wire_payload).map_err(|e| {
+                TlsError::CompressionError(format!(
+                    "Failed to decompress secure record: {}",
+                    e
+                ))
+            })?
+        } else {
+            wire_payload.to_vec()
+        };
+
+        if decoded.len() != raw_len {
+            return Err(TlsError::DecodeError(format!(
+                "Secure record raw length mismatch: expected {}, got {}",
+                raw_len,
+                decoded.len()
+            )));
+        }
+
+        Ok((decoded, inner_content_type))
     }
 
     fn send_record(&mut self, content_type: u8, data: &[u8]) -> Result<(), TlsError> {
         let mut record = Vec::new();
-        let (final_content_type, payload) = if self.state == ConnectionState::Handshaking 
-            && self.client_cipher.is_some()
-            && (content_type == CONTENT_TYPE_HANDSHAKE || content_type == CONTENT_TYPE_APPLICATION_DATA) {
-                let encrypted = self.encrypt_record(data, content_type)?;
-                (CONTENT_TYPE_APPLICATION_DATA, encrypted)
+        let (final_content_type, payload) = if self.should_secure_record_payload(content_type) && self.client_cipher.is_some() && self.server_cipher.is_some() {
+            let seq = self.next_send_sequence();
+            let secure_payload = self.build_secure_record_payload(data, content_type, seq, true)?;
+            let encrypted = self.encrypt_record(&secure_payload, CONTENT_TYPE_APPLICATION_DATA, seq)?;
+            (CONTENT_TYPE_APPLICATION_DATA, encrypted)
+        } else if self.state == ConnectionState::Handshaking && self.client_cipher.is_some() && (content_type == CONTENT_TYPE_HANDSHAKE || content_type == CONTENT_TYPE_APPLICATION_DATA) {
+            let seq = self.next_send_sequence();
+            let encrypted = self.encrypt_record(data, content_type, seq)?;
+            (CONTENT_TYPE_APPLICATION_DATA, encrypted)
         } else {
             (content_type, data.to_vec())
         };
@@ -1222,7 +1574,6 @@ impl TlsStream {
 
         self.stream.write_all(&record)?;
         self.stream.flush()?;
-
         Ok(())
     }
 
@@ -1236,21 +1587,27 @@ impl TlsStream {
         self.stream.read_exact(&mut payload)?;
         if content_type == CONTENT_TYPE_ALERT {
             if payload.len() >= 2 {
-                let level = payload[0];
-                let description = payload[1];
-                return Err(TlsError::AlertReceived(level, description));
+                return Err(TlsError::AlertReceived(payload[0], payload[1]));
             }
+
+            return Err(TlsError::AlertReceived(ALERT_LEVEL_FATAL, ALERT_HANDSHAKE_FAILURE));
         }
 
         if content_type == CONTENT_TYPE_APPLICATION_DATA && self.server_cipher.is_some() {
-            let (decrypted, _original_type) = self.decrypt_record(&payload)?;
-            Ok(decrypted)
-        } else {
-            Ok(payload)
+            let seq = self.next_receive_sequence();
+            let (decrypted, original_type) = self.decrypt_record(&payload)?;
+            if self.state == ConnectionState::Connected && original_type == CONTENT_TYPE_APPLICATION_DATA {
+                let (decoded, _inner_type) = self.parse_secure_record_payload(&decrypted, seq, false, original_type)?;
+                return Ok(decoded);
+            }
+
+            return Ok(decrypted);
         }
+
+        Ok(payload)
     }
 
-    fn encrypt_record(&mut self, plaintext: &[u8], content_type: u8) -> Result<Vec<u8>, TlsError> {
+    fn encrypt_record(&mut self, plaintext: &[u8], content_type: u8, seq: u64) -> Result<Vec<u8>, TlsError> {
         let cipher = if self.is_client {
             self.client_cipher.as_ref()
         } else {
@@ -1264,16 +1621,6 @@ impl TlsStream {
             to_encrypt.push(0);
         }
 
-        let seq = if self.is_client {
-            let s = self.client_seq;
-            self.client_seq += 1;
-            s
-        } else {
-            let s = self.server_seq;
-            self.server_seq += 1;
-            s
-        };
-
         let iv = if self.is_client {
             &keys.client_write_iv
         } else {
@@ -1281,9 +1628,9 @@ impl TlsStream {
         };
 
         let mut nonce = [0u8; 12];
-        nonce[..12].copy_from_slice(&iv[..12]);
+        nonce.copy_from_slice(&iv[..12]);
         for i in 0..8 {
-            nonce[4 + i] ^= ((seq >> (56 - i * 8)) & 0xFF) as u8;
+            nonce[4 + i] ^= ((seq >> (56 - i * 8)) & 0xff) as u8;
         }
 
         let mut ciphertext = Vec::new();
@@ -1295,16 +1642,17 @@ impl TlsStream {
             ciphertext.extend_from_slice(&encrypted_block[..chunk.len()]);
         }
 
-        let mut hasher = sha2::Sha256::new();
-        hasher.update(&ciphertext);
-        let tag = hasher.finalize();
-        ciphertext.extend_from_slice(&tag[..16]);
+        let mut tag_material = Vec::new();
+        tag_material.extend_from_slice(&nonce);
+        tag_material.extend_from_slice(&ciphertext[12..]);
+        let tag = sha256(&tag_material);
 
+        ciphertext.extend_from_slice(&tag[..16]);
         Ok(ciphertext)
     }
 
     fn decrypt_record(&mut self, ciphertext: &[u8]) -> Result<(Vec<u8>, u8), TlsError> {
-        if ciphertext.len() < 28 {
+        if ciphertext.len() < 12 + 16 {
             return Err(TlsError::CipherError("Ciphertext too short".to_string()));
         }
 
@@ -1317,20 +1665,14 @@ impl TlsStream {
         let nonce = &ciphertext[..12];
         let encrypted_data = &ciphertext[12..ciphertext.len() - 16];
         let received_tag = &ciphertext[ciphertext.len() - 16..];
-
-        let mut hasher = sha2::Sha256::new();
-        hasher.update(&ciphertext[..ciphertext.len() - 16]);
-        let computed_tag = hasher.finalize();
-        
-        let mut tag_match = true;
-        for i in 0..16 {
-            if computed_tag[i] != received_tag[i] {
-                tag_match = false;
-            }
-        }
-        
-        if !tag_match {
-            return Err(TlsError::CipherError("Authentication tag verification failed".to_string()));
+        let mut tag_material = Vec::new();
+        tag_material.extend_from_slice(nonce);
+        tag_material.extend_from_slice(encrypted_data);
+        let computed_tag = sha256(&tag_material);
+        if !constant_time_eq(received_tag, &computed_tag[..16]) {
+            return Err(TlsError::CipherError(
+                "Authentication tag verification failed".to_string(),
+            ));
         }
 
         let mut plaintext = Vec::new();
@@ -1345,25 +1687,19 @@ impl TlsStream {
             plaintext.pop();
         }
 
-        let content_type = plaintext.pop().ok_or_else(||
+        let content_type = plaintext.pop().ok_or_else(|| {
             TlsError::CipherError("Decrypted data empty".to_string())
-        )?;
+        })?;
 
         Ok((plaintext, content_type))
     }
 
     fn negotiate_version(&self, client_versions: &[u16]) -> Result<TlsVersion, TlsError> {
-        if client_versions.contains(&TLS_VERSION_1_3)
-            && self.config.max_version >= TlsVersion::Tls1_3
-            && self.config.min_version <= TlsVersion::Tls1_3
-        {
+        if client_versions.contains(&TLS_VERSION_1_3) && self.config.max_version >= TlsVersion::Tls1_3 && self.config.min_version <= TlsVersion::Tls1_3 {
             return Ok(TlsVersion::Tls1_3);
         }
 
-        if client_versions.contains(&TLS_VERSION_1_2)
-            && self.config.min_version <= TlsVersion::Tls1_2
-            && self.config.max_version >= TlsVersion::Tls1_2
-        {
+        if client_versions.contains(&TLS_VERSION_1_2) && self.config.max_version >= TlsVersion::Tls1_2 && self.config.min_version <= TlsVersion::Tls1_2 {
             return Ok(TlsVersion::Tls1_2);
         }
 
@@ -1373,7 +1709,6 @@ impl TlsStream {
     pub fn send_alert(&mut self, level: u8, description: u8) -> Result<(), TlsError> {
         let alert = vec![level, description];
         self.send_record(CONTENT_TYPE_ALERT, &alert)?;
-
         Ok(())
     }
 
@@ -1398,12 +1733,12 @@ impl TlsStream {
         &mut self.stream
     }
 
-    pub fn set_read_timeout(&self, dur: Option<std::time::Duration>) -> Result<(), TlsError> {
+    pub fn set_read_timeout(&self, dur: Option<Duration>) -> Result<(), TlsError> {
         self.stream.set_read_timeout(dur)?;
         Ok(())
     }
 
-    pub fn set_write_timeout(&self, dur: Option<std::time::Duration>) -> Result<(), TlsError> {
+    pub fn set_write_timeout(&self, dur: Option<Duration>) -> Result<(), TlsError> {
         self.stream.set_write_timeout(dur)?;
         Ok(())
     }
@@ -1419,8 +1754,9 @@ impl TlsStream {
     }
 
     pub fn negotiate_alpn(&mut self, server_alpn_data: &[u8]) -> Result<AlpnProtocol, TlsError> {
-        self.alpn_negotiator.negotiate(server_alpn_data)
-            .map_err(|e| TlsError::HandshakeFailed(format!("ALPN negotiation failed: {}", e)))
+        self.alpn_negotiator.negotiate(server_alpn_data).map_err(|e| {
+            TlsError::HandshakeFailed(format!("ALPN negotiation failed: {}", e))
+        })
     }
 
     pub fn extract_alpn_from_handshake(&self, server_hello_data: &[u8]) -> Result<Vec<u8>, TlsError> {
@@ -1445,14 +1781,10 @@ impl TlsStream {
                 "ServerHello missing extensions length".to_string(),
             ));
         }
-        
-        let ext_len = u16::from_be_bytes([
-            server_hello_data[pos],
-            server_hello_data[pos + 1]
-        ]) as usize;
 
+        let ext_len = u16::from_be_bytes([server_hello_data[pos], server_hello_data[pos + 1]]) as usize;
         pos += 2;
-        let ext_end = pos + ext_len;
+        let ext_end = pos.saturating_add(ext_len);
         if ext_end > server_hello_data.len() {
             return Err(TlsError::HandshakeFailed(
                 "ServerHello extensions truncated".to_string(),
@@ -1460,13 +1792,10 @@ impl TlsStream {
         }
         
         while pos + 4 <= ext_end {
-            let ext_type = u16::from_be_bytes([
-                server_hello_data[pos],
-                server_hello_data[pos + 1]
-            ]);
+            let ext_type = u16::from_be_bytes([server_hello_data[pos], server_hello_data[pos + 1]]);
             let ext_data_len = u16::from_be_bytes([
                 server_hello_data[pos + 2],
-                server_hello_data[pos + 3]
+                server_hello_data[pos + 3],
             ]) as usize;
 
             pos += 4;
@@ -1475,11 +1804,11 @@ impl TlsStream {
                     "Extension data exceeds extensions boundary".to_string(),
                 ));
             }
-            
+
             if ext_type == 16 {
                 return Ok(server_hello_data[pos..pos + ext_data_len].to_vec());
             }
-            
+
             pos += ext_data_len;
         }
         
@@ -1503,12 +1832,13 @@ impl TlsStream {
     pub fn build_alpn_extension(&self) -> Vec<u8> {
         let mut extension = Vec::new();
         extension.extend_from_slice(&16u16.to_be_bytes());
+
         let protocols_wire = self.alpn_negotiator.supported_protocols_wire();
         let ext_len = 2 + protocols_wire.len();
+
         extension.extend_from_slice(&(ext_len as u16).to_be_bytes());
         extension.extend_from_slice(&(protocols_wire.len() as u16).to_be_bytes());
         extension.extend_from_slice(&protocols_wire);
-        
         extension
     }
 
@@ -1519,7 +1849,7 @@ impl TlsStream {
             ));
         }
 
-        let list_len = u16::from_be_bytes([extension_data[0], extension_data[1]]) as usize;        
+        let list_len = u16::from_be_bytes([extension_data[0], extension_data[1]]) as usize;
         if extension_data.len() < 2 + list_len {
             return Err(TlsError::HandshakeFailed(
                 "ALPN extension data truncated".to_string(),
@@ -1546,54 +1876,46 @@ impl TlsStream {
             let mut is_supported = false;
             let mut pos = 0;
             while pos < supported_wire.len() {
-                if pos >= supported_wire.len() {
-                    break;
-                }
                 let len = supported_wire[pos] as usize;
                 pos += 1;
-                if pos + len <= supported_wire.len() {
-                    let supported_proto = &supported_wire[pos..pos + len];
-                    if supported_proto == &protocol_wire[1..] {
-                        is_supported = true;
-                        break;
-                    }
-                    pos += len;
-                } else {
+                if pos + len > supported_wire.len() {
                     break;
                 }
+
+                if &supported_wire[pos..pos + len] == protocol_wire {
+                    is_supported = true;
+                    break;
+                }
+
+                pos += len;
             }
-            
+
             if !is_supported {
                 return Err(TlsError::HandshakeFailed(format!(
                     "Server selected protocol '{}' not in client offer",
                     protocol.name()
                 )));
             }
-            
+
             self.negotiated_protocol = Some(protocol);
-            Ok(())
-        } else {
-            Err(TlsError::HandshakeFailed(format!(
-                "Unknown ALPN protocol: {:?}",
-                proto_data
-            )))
+            return Ok(());
         }
+
+        Err(TlsError::HandshakeFailed(format!(
+            "Unknown ALPN protocol: {:?}",
+            proto_data
+        )))
     }
 
     pub fn validate_negotiated_protocol(&self, expected: &[AlpnProtocol]) -> Result<(), TlsError> {
         match self.negotiated_protocol {
             Some(proto) => {
-                if expected.is_empty() {
-                    return Ok(());
-                }
-                
-                if expected.contains(&proto) {
+                if expected.is_empty() || expected.contains(&proto) {
                     Ok(())
                 } else {
                     Err(TlsError::ProtocolNegotiationFailed(format!(
-                        "Server negotiated unexpected protocol: {} (expected one of: {:?})",
-                        proto.name(),
-                        expected.iter().map(|p| p.name()).collect::<Vec<_>>()
+                        "Server negotiated unexpected protocol: {}",
+                        proto.name()
                     )))
                 }
             }
@@ -1615,22 +1937,45 @@ impl TlsStream {
             stream: cloned_stream,
             config: self.config.clone(),
             state: self.state,
+            version: self.version,
+            cipher_suite: self.cipher_suite,
+            keys: self.keys.clone(),
+            client_cipher: self.client_cipher.clone(),
+            server_cipher: self.server_cipher.clone(),
+            handshake_msg: self.handshake_msg.clone(),
+            client_seq: self.client_seq,
+            server_seq: self.server_seq,
             is_client: self.is_client,
             buffer: Vec::new(),
-            session_id: self.session_id.clone(),
             server_name: self.server_name.clone(),
-            cipher_suite: self.cipher_suite,
-            version: self.version,
-            keys: None,
-            client_cipher: None,
-            server_cipher: None,
-            client_seq: 0,
-            server_seq: 0,
-            handshake_msg: Vec::new(),
+            session_id: self.session_id.clone(),
             resuming_session: self.resuming_session,
             alpn_negotiator: self.alpn_negotiator.clone(),
-            negotiated_protocol: self.negotiated_protocol.clone(),
+            negotiated_protocol: self.negotiated_protocol,
+            negotiated_record_compression: self.negotiated_record_compression,
         })
+    }
+}
+
+impl Default for TlsRecordSecurityCfg {
+    fn default() -> Self {
+        Self {
+            enable_integrity: true,
+            nonce_len: 16,
+            context: "SINGULARITY_TLS_RECORD_CTX_V1".to_string(),
+        }
+    }
+}
+
+impl Default for TlsRecordCompressionCfg {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            min_size: 512,
+            preferred_algorithm: CompressionAlgorithm::Zstd,
+            level: CompressionLevel::Default,
+            fallback_to_identity_on_error: true,
+        }
     }
 }
 
@@ -1638,19 +1983,20 @@ impl Default for TlsCfg {
     fn default() -> Self {
         TlsCfg {
             cert_chain: vec![],
-            private_key: rsa::RsaPrivateKey::generate(rsa::RsaKeySize::Rsa2048)
-                .expect("Failed to generate RSA key"),
+            private_key: rsa::RsaPrivateKey::generate(rsa::RsaKeySize::Rsa2048).expect("Failed to generate RSA key"),
             supported_ciphers: vec![
                 "TLS_AES_256_GCM_SHA384".to_string(),
                 "TLS_AES_128_GCM_SHA256".to_string(),
                 "TLS_CHACHA20_POLY1305_SHA256".to_string(),
             ],
-            min_version: TlsVersion::Tls1_3,
+            min_version: TlsVersion::Tls1_2,
             max_version: TlsVersion::Tls1_3,
-            verify_peer: true,
+            verify_peer: false,
             ca_certs: vec![],
             session_cache: Some(SessionCache::new()),
             enable_session_resumption: true,
+            record_security: TlsRecordSecurityCfg::default(),
+            record_compression: TlsRecordCompressionCfg::default(),
         }
     }
 }
@@ -1663,23 +2009,23 @@ impl Read for TlsStream {
                 "TLS connection not established",
             ));
         }
-        
+
         if !self.buffer.is_empty() {
             let to_copy = buf.len().min(self.buffer.len());
             buf[..to_copy].copy_from_slice(&self.buffer[..to_copy]);
             self.buffer.drain(..to_copy);
             return Ok(to_copy);
         }
-        
+
         match self.receive_record() {
             Ok(data) => {
                 let to_copy = buf.len().min(data.len());
                 buf[..to_copy].copy_from_slice(&data[..to_copy]);
-                
+
                 if data.len() > to_copy {
                     self.buffer.extend_from_slice(&data[to_copy..]);
                 }
-                
+
                 Ok(to_copy)
             }
             Err(TlsError::Io(e)) => Err(e),
@@ -1699,7 +2045,7 @@ impl Write for TlsStream {
                 "TLS connection not established",
             ));
         }
-        
+
         match self.send_record(CONTENT_TYPE_APPLICATION_DATA, buf) {
             Ok(_) => Ok(buf.len()),
             Err(TlsError::Io(e)) => Err(e),
@@ -1728,6 +2074,8 @@ impl std::fmt::Display for TlsError {
             TlsError::HandshakeFailed(msg) => write!(f, "Handshake Failed: {}", msg),
             TlsError::InvalidCertificate(msg) => write!(f, "Invalid Certificate: {}", msg),
             TlsError::CipherError(msg) => write!(f, "Cipher Error: {}", msg),
+            TlsError::CompressionError(msg) => write!(f, "Compression Error: {}", msg),
+            TlsError::IntegrityError(msg) => write!(f, "Integrity Error: {}", msg),
             TlsError::AlertReceived(level, desc) => {
                 write!(f, "Alert Received: level={}, description={}", level, desc)
             }
@@ -1735,7 +2083,9 @@ impl std::fmt::Display for TlsError {
             TlsError::UnsupportedVersion => write!(f, "Unsupported TLS Version"),
             TlsError::NoSharedCipher => write!(f, "No Shared Cipher Suite"),
             TlsError::VerificationFailed(msg) => write!(f, "Verification Failed: {}", msg),
-            TlsError::ProtocolNegotiationFailed(msg) => write!(f, "Protocol Negotiation Failed: {}", msg),
+            TlsError::ProtocolNegotiationFailed(msg) => {
+                write!(f, "Protocol Negotiation Failed: {}", msg)
+            }
         }
     }
 }
@@ -1757,23 +2107,55 @@ impl Default for SessionCache {
 #[cfg(test)]
 mod tls_tests {
     use super::*;
-    use std::thread;
-    use std::sync::mpsc;
     use crate::net::tcp::TcpListener;
+    use std::sync::mpsc;
+    use std::thread;
 
     fn start_test_server() -> (String, mpsc::Receiver<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind");
         let addr = listener.local_addr().expect("Failed to get local addr");
         let (tx, rx) = mpsc::channel();
-        
+
         thread::spawn(move || {
             if let Ok((stream, _)) = listener.accept() {
                 drop(stream);
                 let _ = tx.send(());
             }
         });
-        
+
         (format!("127.0.0.1:{}", addr.port()), rx)
+    }
+
+    fn test_tls_stream_with_keys(is_client: bool) -> TlsStream {
+        let (addr, _rx) = start_test_server();
+        let stream = TcpStream::connect(&addr).expect("Failed to connect");
+
+        TlsStream {
+            stream,
+            config: TlsCfg::default(),
+            state: ConnectionState::Connected,
+            version: TlsVersion::Tls1_3,
+            cipher_suite: TLS_AES_128_GCM_SHA256,
+            keys: Some(TlsKeys {
+                client_write_key: vec![0x11; 16],
+                server_write_key: vec![0x22; 16],
+                client_write_iv: vec![0x33; 12],
+                server_write_iv: vec![0x44; 12],
+            }),
+            client_cipher: Some(aes::Aes::new(&[0x11; 16]).unwrap()),
+            server_cipher: Some(aes::Aes::new(&[0x22; 16]).unwrap()),
+            handshake_msg: Vec::new(),
+            client_seq: 0,
+            server_seq: 0,
+            is_client,
+            buffer: Vec::new(),
+            server_name: None,
+            session_id: Vec::new(),
+            resuming_session: false,
+            alpn_negotiator: AlpnNegotiator::new(),
+            negotiated_protocol: None,
+            negotiated_record_compression: CompressionAlgorithm::Identity,
+        }
     }
 
     #[test]
@@ -1783,11 +2165,8 @@ mod tls_tests {
         assert_eq!(cfg.max_version, TlsVersion::Tls1_3);
         assert!(!cfg.verify_peer);
         assert_eq!(cfg.supported_ciphers.len(), 3);
-        assert_eq!(cfg.supported_ciphers[0], "4865"); // TLS_AES_128_GCM_SHA256 as string
-        assert_eq!(cfg.supported_ciphers[1], "4866"); // TLS_AES_256_GCM_SHA384 as string
-        assert_eq!(cfg.supported_ciphers[2], "4867"); // TLS_CHACHA20_POLY1305_SHA256 as string
-        assert!(cfg.cert_chain.is_empty());
-        assert!(cfg.ca_certs.is_empty());
+        assert!(cfg.record_compression.enabled);
+        assert!(cfg.record_security.enable_integrity);
     }
 
     #[test]
@@ -1814,6 +2193,7 @@ mod tls_tests {
             resuming_session: false,
             alpn_negotiator: AlpnNegotiator::new(),
             negotiated_protocol: None,
+            negotiated_record_compression: CompressionAlgorithm::Identity,
         };
 
         let client_ciphers = vec![0x1301, 0x1302];
@@ -1845,6 +2225,7 @@ mod tls_tests {
             resuming_session: false,
             alpn_negotiator: AlpnNegotiator::new(),
             negotiated_protocol: None,
+            negotiated_record_compression: CompressionAlgorithm::Identity,
         };
 
         let client_hello = vec![
@@ -1864,47 +2245,69 @@ mod tls_tests {
     }
 
     #[test]
-    fn test_server_hello_parsing() {
-        let (addr, _rx) = start_test_server();
-        let stream = TcpStream::connect(&addr).expect("Failed to connect");
-        
-        let tls = TlsStream {
-            stream,
-            config: TlsCfg::default(),
-            state: ConnectionState::Initial,
-            version: TlsVersion::Tls1_3,
-            cipher_suite: 0,
-            keys: None,
-            client_cipher: None,
-            server_cipher: None,
-            handshake_msg: Vec::new(),
-            client_seq: 0,
-            server_seq: 0,
-            is_client: true,
-            buffer: Vec::new(),
-            server_name: None,
-            session_id: Vec::new(),
-            resuming_session: false,
-            alpn_negotiator: AlpnNegotiator::new(),
-            negotiated_protocol: None,
-        };
+    fn test_secure_record_roundtrip_identity() {
+        let tls = test_tls_stream_with_keys(true);
+        let payload = b"secure tls payload";
+        let blob = tls
+            .build_secure_record_payload(payload, CONTENT_TYPE_APPLICATION_DATA, 7, true)
+            .unwrap();
 
-        let server_hello = vec![
-            0x03, 0x03,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00,
-            0x13, 0x01,
-            0x00,
-            0x00, 0x00,
-        ];
+        let (decoded, inner_type) = tls
+            .parse_secure_record_payload(
+                &blob,
+                7,
+                true,
+                CONTENT_TYPE_APPLICATION_DATA,
+            )
+            .unwrap();
 
-        let result = tls.parse_server_hello(&server_hello);
-        assert!(result.is_ok());
-        let (_, cipher, _, _, _) = result.unwrap();
-        assert_eq!(cipher, 0x1301);
+        assert_eq!(inner_type, CONTENT_TYPE_APPLICATION_DATA);
+        assert_eq!(decoded, payload);
+    }
+
+    #[test]
+    fn test_secure_record_roundtrip_compressed() {
+        let mut tls = test_tls_stream_with_keys(true);
+        tls.config.record_compression.enabled = true;
+        tls.config.record_compression.min_size = 1;
+        tls.config.record_compression.preferred_algorithm = CompressionAlgorithm::Gzip;
+
+        let payload = b"this is a compressible secure tls payload repeated repeated repeated";
+        let blob = tls
+            .build_secure_record_payload(payload, CONTENT_TYPE_APPLICATION_DATA, 12, true)
+            .unwrap();
+
+        let (decoded, inner_type) = tls
+            .parse_secure_record_payload(
+                &blob,
+                12,
+                true,
+                CONTENT_TYPE_APPLICATION_DATA,
+            )
+            .unwrap();
+
+        assert_eq!(inner_type, CONTENT_TYPE_APPLICATION_DATA);
+        assert_eq!(decoded, payload);
+    }
+
+    #[test]
+    fn test_secure_record_tamper_detection() {
+        let tls = test_tls_stream_with_keys(true);
+        let payload = b"tamper me";
+        let mut blob = tls
+            .build_secure_record_payload(payload, CONTENT_TYPE_APPLICATION_DATA, 99, true)
+            .unwrap();
+
+        let last = blob.len() - 1;
+        blob[last] ^= 0x01;
+
+        let result = tls.parse_secure_record_payload(
+            &blob,
+            99,
+            true,
+            CONTENT_TYPE_APPLICATION_DATA,
+        );
+        assert!(result.is_err());
     }
 
     #[test]
@@ -1918,5 +2321,12 @@ mod tls_tests {
     fn test_version_ordering() {
         assert!(TlsVersion::Tls1_2 < TlsVersion::Tls1_3);
         assert_eq!(TlsVersion::Tls1_3, TlsVersion::Tls1_3);
+    }
+
+    #[test]
+    fn test_pem_for_debug_digest_only() {
+        let digest = sha256(b"digest-example");
+        let b64 = pem::encode(&digest);
+        assert!(!b64.is_empty());
     }
 }

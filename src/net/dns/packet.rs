@@ -1,6 +1,13 @@
-use super::record::{RecordType, RecordClass, RecordData, DnsRecord};
-use std::io::{self, Read, Write, Cursor};
+use super::record::{DnsRecord, RecordClass, RecordData, RecordType};
+use crate::crypto::constant_time_eq;
+use crate::crypto::encoding::pem;
+use crate::crypto::hash::sha2::sha256;
+use crate::crypto::random;
+use crate::net::http::compression::{self, CompressionAlgorithm, CompressionLevel};
+use std::io::{self, Cursor, Read, Write};
 use std::net::{Ipv4Addr, Ipv6Addr};
+
+const DNS_PACKET_BLOB_MAGIC: &str = "SINGULARITY_DNS_PACKET_BLOB_V1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OpCode {
@@ -86,7 +93,7 @@ impl DnsHeader {
         writer.write_all(&self.id.to_be_bytes())?;
         let mut flags: u16 = 0;
         if self.is_response {
-            flags|= 0x8000;
+            flags |= 0x8000;
         }
 
         flags |= ((self.opcode as u16) & 0x0F) << 11;
@@ -192,6 +199,15 @@ impl DnsQuestion {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SecureDnsPacketBlobMeta {
+    pub algorithm: CompressionAlgorithm,
+    pub nonce_b64: String,
+    pub digest_b64: String,
+    pub raw_size: usize,
+    pub encoded_size: usize,
+}
+
 #[derive(Debug, Clone)]
 pub struct DnsPacket {
     pub header: DnsHeader,
@@ -218,7 +234,6 @@ impl DnsPacket {
     pub fn write(&self) -> io::Result<Vec<u8>> {
         let mut buffer = Vec::with_capacity(512);
         self.header.write(&mut buffer)?;
-
         for question in &self.questions {
             question.write(&mut buffer)?;
         }
@@ -241,7 +256,6 @@ impl DnsPacket {
     pub fn read(data: &[u8]) -> io::Result<Self> {
         let mut cursor = Cursor::new(data);
         let header = DnsHeader::read(&mut cursor)?;
-
         let mut questions = Vec::new();
         for _ in 0..header.question_count {
             questions.push(DnsQuestion::read(&mut cursor, data)?);
@@ -270,6 +284,226 @@ impl DnsPacket {
             additional,
         })
     }
+
+    pub fn fingerprint_sha256_b64(&self) -> io::Result<String> {
+        let raw = self.write()?;
+        Ok(pem::encode(&sha256(&raw)))
+    }
+
+    pub fn encode_secure_blob(&self, algorithm: CompressionAlgorithm) -> io::Result<(SecureDnsPacketBlobMeta, Vec<u8>)> {
+        let raw = self.write()?;
+        let encoded = compression::compress(algorithm, &raw, CompressionLevel::Default)?;
+        let mut nonce = [0u8; 24];
+        random::fill_random(&mut nonce).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::Other,
+                format!("failed to generate packet nonce: {e}"),
+            )
+        })?;
+
+        let digest = compute_packet_digest(&nonce, &raw);
+        let nonce_b64 = pem::encode(&nonce);
+        let digest_b64 = pem::encode(&digest);
+        let encoding_str = match algorithm {
+            CompressionAlgorithm::Identity => "identity",
+            CompressionAlgorithm::Gzip => "gzip",
+            CompressionAlgorithm::Deflate => "deflate",
+            CompressionAlgorithm::Brotli => "br",
+            CompressionAlgorithm::Zstd => "zstd",
+        };
+
+        let header = format!(
+            "{magic}\ncontent-encoding: {encoding}\nnonce: {nonce}\ndigest: {digest}\nraw-size: {raw_size}\nencoded-size: {encoded_size}\n\n",
+            magic = DNS_PACKET_BLOB_MAGIC,
+            encoding = encoding_str,
+            nonce = nonce_b64,
+            digest = digest_b64,
+            raw_size = raw.len(),
+            encoded_size = encoded.len(),
+        );
+
+        let mut out = header.into_bytes();
+        out.extend_from_slice(&encoded);
+
+        Ok((
+            SecureDnsPacketBlobMeta {
+                algorithm,
+                nonce_b64,
+                digest_b64,
+                raw_size: raw.len(),
+                encoded_size: encoded.len(),
+            },
+            out,
+        ))
+    }
+
+    pub fn encode_secure_blob_auto(&self, accept_encoding: &str) -> io::Result<(SecureDnsPacketBlobMeta, Vec<u8>)> {
+        let algorithm = select_algorithm_from_accept_encoding(accept_encoding);
+        self.encode_secure_blob(algorithm)
+    }
+
+    pub fn decode_secure_blob(data: &[u8]) -> io::Result<(SecureDnsPacketBlobMeta, DnsPacket)> {
+        let (header, body) = split_header_body(data)?;
+        let meta = parse_secure_blob_meta(&header, body.len())?;
+        let wire = if meta.algorithm == CompressionAlgorithm::Identity {
+            body.to_vec()
+        } else {
+            compression::decompress(meta.algorithm, body)?
+        };
+
+        if wire.len() != meta.raw_size {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "secure packet raw size mismatch: expected {}, got {}",
+                    meta.raw_size,
+                    wire.len()
+                ),
+            ));
+        }
+
+        let nonce = pem::decode(&meta.nonce_b64)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid packet nonce"))?;
+        
+        let expected_digest = pem::decode(&meta.digest_b64)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid packet digest"))?;
+
+        let actual_digest = compute_packet_digest(&nonce, &wire);
+        if !constant_time_eq(&expected_digest, &actual_digest) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "secure packet digest verification failed",
+            ));
+        }
+
+        let packet = DnsPacket::read(&wire)?;
+        Ok((meta, packet))
+    }
+}
+
+fn select_algorithm_from_accept_encoding(accept_encoding: &str) -> CompressionAlgorithm {
+    let mut prefs = compression::parse_accept_encoding(accept_encoding);
+    if prefs.is_empty() {
+        return CompressionAlgorithm::Identity;
+    }
+
+    prefs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    prefs.into_iter().find(|(alg, q)| *q > 0.0 && *alg != CompressionAlgorithm::Identity)
+        .map(|(alg, _)| alg).unwrap_or(CompressionAlgorithm::Identity)
+}
+
+fn compute_packet_digest(nonce: &[u8], raw_packet: &[u8]) -> [u8; 32] {
+    let mut material = Vec::with_capacity(
+        DNS_PACKET_BLOB_MAGIC.len() + nonce.len() + std::mem::size_of::<u64>() + raw_packet.len(),
+    );
+
+    material.extend_from_slice(DNS_PACKET_BLOB_MAGIC.as_bytes());
+    material.extend_from_slice(nonce);
+    material.extend_from_slice(&(raw_packet.len() as u64).to_be_bytes());
+    material.extend_from_slice(raw_packet);
+    
+    sha256(&material)
+}
+
+fn split_header_body(data: &[u8]) -> io::Result<(String, &[u8])> {
+    const DELIM: &[u8] = b"\n\n";
+    let pos = data.windows(DELIM.len()).position(|w| w == DELIM)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "secure packet header missing"))?;
+
+    let header = std::str::from_utf8(&data[..pos])
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "secure packet header not utf8"))?.to_string();
+
+    let body = &data[pos + DELIM.len()..];
+    Ok((header, body))
+}
+
+fn parse_secure_blob_meta(header: &str, body_len: usize) -> io::Result<SecureDnsPacketBlobMeta> {
+    let mut lines = header.lines();
+    let magic = lines.next()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "secure packet magic missing"))?;
+    
+    if magic != DNS_PACKET_BLOB_MAGIC {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "secure packet magic mismatch",
+        ));
+    }
+
+    let mut algorithm = CompressionAlgorithm::Identity;
+    let mut nonce_b64 = String::new();
+    let mut digest_b64 = String::new();
+    let mut raw_size = None::<usize>;
+    let mut encoded_size = None::<usize>;
+    for line in lines {
+        let mut parts = line.splitn(2, ':');
+        let key = parts.next().unwrap_or("").trim();
+        let value = parts.next().unwrap_or("").trim();
+        match key {
+            "content-encoding" => {
+                algorithm = compression::CompressionAlgorithm::from_content_encoding(value).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("unsupported packet content-encoding: {value}"),
+                    )
+                })?;
+            }
+            "nonce" => nonce_b64 = value.to_string(),
+            "digest" => digest_b64 = value.to_string(),
+            "raw-size" => {
+                raw_size = Some(value.parse::<usize>().map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidData, "invalid secure packet raw-size")
+                })?)
+            }
+            "encoded-size" => {
+                encoded_size = Some(value.parse::<usize>().map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "invalid secure packet encoded-size",
+                    )
+                })?)
+            }
+            _ => {}
+        }
+    }
+
+    if nonce_b64.is_empty() || digest_b64.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "secure packet metadata missing nonce/digest",
+        ));
+    }
+
+    let raw_size = raw_size.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "secure packet metadata missing raw-size",
+        )
+    })?;
+
+    let encoded_size = encoded_size.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "secure packet metadata missing encoded-size",
+        )
+    })?;
+
+    if encoded_size != body_len {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "secure packet encoded-size mismatch: metadata {}, body {}",
+                encoded_size, body_len
+            ),
+        ));
+    }
+
+    Ok(SecureDnsPacketBlobMeta {
+        algorithm,
+        nonce_b64,
+        digest_b64,
+        raw_size,
+        encoded_size,
+    })
 }
 
 fn write_domain_name<W: Write>(writer: &mut W, name: &str) -> io::Result<()> {
@@ -277,12 +511,15 @@ fn write_domain_name<W: Write>(writer: &mut W, name: &str) -> io::Result<()> {
         if label.is_empty() {
             continue;
         }
+
         if label.len() > 63 {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "Label too long"));
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "label too long"));
         }
+
         writer.write_all(&[label.len() as u8])?;
         writer.write_all(label.as_bytes())?;
     }
+
     writer.write_all(&[0u8])?;
     Ok(())
 }
@@ -291,16 +528,17 @@ fn read_domain_name(reader: &mut Cursor<&[u8]>, packet: &[u8]) -> io::Result<Str
     let mut labels = Vec::new();
     let mut jumped = false;
     let mut jump_position = reader.position();
-
     loop {
         let current_pos = reader.position() as usize;
         if current_pos >= packet.len() {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "Read past end of packet"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "read past end of packet",
+            ));
         }
 
         let len = packet[current_pos];
         reader.set_position(current_pos as u64 + 1);
-
         if len == 0 {
             break;
         }
@@ -313,13 +551,12 @@ fn read_domain_name(reader: &mut Cursor<&[u8]>, packet: &[u8]) -> io::Result<Str
 
             let next_pos = reader.position() as usize;
             if next_pos >= packet.len() {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid pointer"));
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid pointer"));
             }
 
             let offset = (((len & 0x3F) as u16) << 8 | packet[next_pos] as u16) as usize;
-
             if offset >= packet.len() {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid pointer"));
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid pointer"));
             }
 
             reader.set_position(offset as u64);
@@ -328,7 +565,10 @@ fn read_domain_name(reader: &mut Cursor<&[u8]>, packet: &[u8]) -> io::Result<Str
 
         let pos = reader.position() as usize;
         if pos + len as usize > packet.len() {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "Label extends past packet"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "label extends past packet",
+            ));
         }
 
         let label = &packet[pos..pos + len as usize];
@@ -348,7 +588,6 @@ fn write_record<W: Write>(writer: &mut W, record: &DnsRecord) -> io::Result<()> 
     writer.write_all(&record.record_type.to_u16().to_be_bytes())?;
     writer.write_all(&record.record_class.to_u16().to_be_bytes())?;
     writer.write_all(&record.ttl.to_be_bytes())?;
-
     let mut data_buf = Vec::new();
     match &record.data {
         RecordData::A(ip) => data_buf.extend_from_slice(&ip.octets()),
@@ -356,32 +595,44 @@ fn write_record<W: Write>(writer: &mut W, record: &DnsRecord) -> io::Result<()> 
         RecordData::NS(name) | RecordData::CNAME(name) | RecordData::PTR(name) => {
             write_domain_name(&mut data_buf, name)?;
         }
-        RecordData::MX { preference, exchange } => {
+        RecordData::MX {preference, exchange} => {
             data_buf.extend_from_slice(&preference.to_be_bytes());
             write_domain_name(&mut data_buf, exchange)?;
         }
         RecordData::TXT(texts) => {
             for text in texts {
                 if text.len() > 255 {
-                    return Err(io::Error::new(io::ErrorKind::InvalidInput, "TXT too long"));
+                    return Err(io::Error::new(io::ErrorKind::InvalidInput, "txt item too long"));
                 }
                 data_buf.push(text.len() as u8);
                 data_buf.extend_from_slice(text.as_bytes());
             }
         }
+        RecordData::SOA {mname, rname, serial, refresh, retry, expire, minimum} => {
+            write_domain_name(&mut data_buf, mname)?;
+            write_domain_name(&mut data_buf, rname)?;
+            data_buf.extend_from_slice(&serial.to_be_bytes());
+            data_buf.extend_from_slice(&refresh.to_be_bytes());
+            data_buf.extend_from_slice(&retry.to_be_bytes());
+            data_buf.extend_from_slice(&expire.to_be_bytes());
+            data_buf.extend_from_slice(&minimum.to_be_bytes());
+        }
+        RecordData::SRV {priority, weight, port, target} => {
+            data_buf.extend_from_slice(&priority.to_be_bytes());
+            data_buf.extend_from_slice(&weight.to_be_bytes());
+            data_buf.extend_from_slice(&port.to_be_bytes());
+            write_domain_name(&mut data_buf, target)?;
+        }
         RecordData::Unknown(data) => data_buf.extend_from_slice(data),
-        _ => {}
     }
 
     writer.write_all(&(data_buf.len() as u16).to_be_bytes())?;
     writer.write_all(&data_buf)?;
-
     Ok(())
 }
 
 fn read_record(reader: &mut Cursor<&[u8]>, packet: &[u8]) -> io::Result<DnsRecord> {
     let name = read_domain_name(reader, packet)?;
-
     let mut buf = [0u8; 10];
     reader.read_exact(&mut buf)?;
 
@@ -389,7 +640,6 @@ fn read_record(reader: &mut Cursor<&[u8]>, packet: &[u8]) -> io::Result<DnsRecor
     let record_class = RecordClass::from_u16(u16::from_be_bytes([buf[2], buf[3]]));
     let ttl = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
     let data_len = u16::from_be_bytes([buf[8], buf[9]]) as usize;
-
     let mut data_buf = vec![0u8; data_len];
     reader.read_exact(&mut data_buf)?;
 
@@ -397,14 +647,24 @@ fn read_record(reader: &mut Cursor<&[u8]>, packet: &[u8]) -> io::Result<DnsRecor
     let data = match record_type {
         RecordType::A => {
             if data_len != 4 {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid A record"));
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid A record"));
             }
-            RecordData::A(Ipv4Addr::new(data_buf[0], data_buf[1], data_buf[2], data_buf[3]))
+
+            RecordData::A(Ipv4Addr::new(
+                data_buf[0],
+                data_buf[1],
+                data_buf[2],
+                data_buf[3],
+            ))
         }
         RecordType::AAAA => {
             if data_len != 16 {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid AAAA record"));
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid AAAA record",
+                ));
             }
+
             let mut octets = [0u8; 16];
             octets.copy_from_slice(&data_buf);
             RecordData::AAAA(Ipv6Addr::from(octets))
@@ -419,10 +679,14 @@ fn read_record(reader: &mut Cursor<&[u8]>, packet: &[u8]) -> io::Result<DnsRecor
             }
         }
         RecordType::MX => {
+            if data_len < 3 {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid MX record"));
+            }
+
             let preference = u16::from_be_bytes([data_buf[0], data_buf[1]]);
             data_cursor.set_position(2);
             let exchange = read_domain_name(&mut data_cursor, packet)?;
-            RecordData::MX { preference, exchange }
+            RecordData::MX {preference, exchange}
         }
         RecordType::TXT => {
             let mut texts = Vec::new();
@@ -431,12 +695,71 @@ fn read_record(reader: &mut Cursor<&[u8]>, packet: &[u8]) -> io::Result<DnsRecor
                 let txt_len = data_buf[pos] as usize;
                 pos += 1;
                 if pos + txt_len > data_len {
-                    break;
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid TXT record"));
                 }
+
                 texts.push(String::from_utf8_lossy(&data_buf[pos..pos + txt_len]).into_owned());
                 pos += txt_len;
             }
+
             RecordData::TXT(texts)
+        }
+        RecordType::SOA => {
+            let mname = read_domain_name(&mut data_cursor, packet)?;
+            let rname = read_domain_name(&mut data_cursor, packet)?;
+            let pos = data_cursor.position() as usize;
+            if data_len < pos + 20 {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid SOA record"));
+            }
+
+            let serial = u32::from_be_bytes([
+                data_buf[pos],
+                data_buf[pos + 1],
+                data_buf[pos + 2],
+                data_buf[pos + 3],
+            ]);
+
+            let refresh = u32::from_be_bytes([
+                data_buf[pos + 4],
+                data_buf[pos + 5],
+                data_buf[pos + 6],
+                data_buf[pos + 7],
+            ]);
+
+            let retry = u32::from_be_bytes([
+                data_buf[pos + 8],
+                data_buf[pos + 9],
+                data_buf[pos + 10],
+                data_buf[pos + 11],
+            ]);
+
+            let expire = u32::from_be_bytes([
+                data_buf[pos + 12],
+                data_buf[pos + 13],
+                data_buf[pos + 14],
+                data_buf[pos + 15],
+            ]);
+
+            let minimum = u32::from_be_bytes([
+                data_buf[pos + 16],
+                data_buf[pos + 17],
+                data_buf[pos + 18],
+                data_buf[pos + 19],
+            ]);
+
+            RecordData::SOA {mname, rname, serial, refresh, retry, expire, minimum}
+        }
+        RecordType::SRV => {
+            if data_len < 7 {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid SRV record"));
+            }
+
+            let priority = u16::from_be_bytes([data_buf[0], data_buf[1]]);
+            let weight = u16::from_be_bytes([data_buf[2], data_buf[3]]);
+            let port = u16::from_be_bytes([data_buf[4], data_buf[5]]);
+            data_cursor.set_position(6);
+            let target = read_domain_name(&mut data_cursor, packet)?;
+            RecordData::SRV {priority, weight, port, target}
         }
         _ => RecordData::Unknown(data_buf),
     };
@@ -453,10 +776,10 @@ mod tests {
         let header = DnsHeader::new_query(1234, true);
         let mut buffer = Vec::new();
         header.write(&mut buffer).unwrap();
-        
+
         let mut cursor = Cursor::new(&buffer[..]);
         let parsed = DnsHeader::read(&mut cursor).unwrap();
-        
+
         assert_eq!(header.id, parsed.id);
         assert_eq!(header.recursion_desired, parsed.recursion_desired);
     }
@@ -466,16 +789,68 @@ mod tests {
         let question = DnsQuestion::new("example.com".to_string(), RecordType::A);
         let mut buffer = Vec::new();
         question.write(&mut buffer).unwrap();
-        
-        assert!(buffer.len() > 0);
+
+        assert!(!buffer.is_empty());
     }
 
     #[test]
     fn test_packet_creation() {
         let packet = DnsPacket::new_query(5678, "example.com".to_string(), RecordType::A);
-        
+
         assert_eq!(packet.header.id, 5678);
         assert_eq!(packet.questions.len(), 1);
         assert_eq!(packet.questions[0].name, "example.com");
+    }
+
+    #[test]
+    fn test_secure_packet_blob_roundtrip_identity() {
+        let packet = DnsPacket::new_query(42, "example.org".to_string(), RecordType::AAAA);
+
+        let (meta, blob) = packet
+            .encode_secure_blob(CompressionAlgorithm::Identity)
+            .unwrap();
+        assert_eq!(meta.algorithm, CompressionAlgorithm::Identity);
+
+        let (decoded_meta, decoded_packet) = DnsPacket::decode_secure_blob(&blob).unwrap();
+
+        assert_eq!(decoded_meta.algorithm, CompressionAlgorithm::Identity);
+        assert_eq!(decoded_packet.header.id, packet.header.id);
+        assert_eq!(decoded_packet.questions.len(), packet.questions.len());
+        assert_eq!(decoded_packet.questions[0].name, "example.org");
+    }
+
+    #[test]
+    fn test_secure_packet_blob_roundtrip_gzip() {
+        let packet = DnsPacket::new_query(7, "www.example.com".to_string(), RecordType::A);
+
+        let (meta, blob) = packet
+            .encode_secure_blob(CompressionAlgorithm::Gzip)
+            .unwrap();
+        assert_eq!(meta.algorithm, CompressionAlgorithm::Gzip);
+
+        let (_decoded_meta, decoded_packet) = DnsPacket::decode_secure_blob(&blob).unwrap();
+        assert_eq!(decoded_packet.header.id, 7);
+        assert_eq!(decoded_packet.questions[0].name, "www.example.com");
+    }
+
+    #[test]
+    fn test_secure_packet_blob_tamper_detection() {
+        let packet = DnsPacket::new_query(123, "tamper.test".to_string(), RecordType::A);
+        let (_meta, mut blob) = packet
+            .encode_secure_blob(CompressionAlgorithm::Identity)
+            .unwrap();
+
+        let last = blob.len() - 1;
+        blob[last] ^= 0x01;
+
+        let err = DnsPacket::decode_secure_blob(&blob).unwrap_err();
+        assert!(err.to_string().contains("digest verification failed"));
+    }
+
+    #[test]
+    fn test_fingerprint_generation() {
+        let packet = DnsPacket::new_query(9000, "fingerprint.example".to_string(), RecordType::TXT);
+        let fp = packet.fingerprint_sha256_b64().unwrap();
+        assert!(!fp.is_empty());
     }
 }
