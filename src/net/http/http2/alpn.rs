@@ -1,4 +1,17 @@
+use crate::crypto::constant_time_eq;
+use crate::crypto::encoding::pem;
+use crate::crypto::hash::hmac::hmac_sha256;
+use crate::crypto::hash::sha2::sha256;
+use crate::crypto::random;
+use crate::net::http::compression::{self, CompressionAlgorithm, CompressionLevel};
 use std::fmt;
+use std::io;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+const ALPN_NEGOTIATOR_BLOB_MAGIC: &str = "SINGULARITY_HTTP2_ALPN_NEGOTIATOR_BLOB_V1";
+const ALPN_NEGOTIATOR_BLOB_CONTEXT: &str = "SINGULARITY_HTTP2_ALPN_NEGOTIATOR_BLOB_BINDING_V1";
+const NPN_NEGOTIATOR_BLOB_MAGIC: &str = "SINGULARITY_HTTP2_NPN_NEGOTIATOR_BLOB_V1";
+const NPN_NEGOTIATOR_BLOB_CONTEXT: &str = "SINGULARITY_HTTP2_NPN_NEGOTIATOR_BLOB_BINDING_V1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AlpnProtocol {
@@ -25,6 +38,28 @@ pub struct AlpnNegotiator {
 pub struct NpnNegotiator {
     supported_protocols: Vec<NpnProtocol>,
     selected_protocol: Option<NpnProtocol>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SecureAlpnNegotiatorBlobMeta {
+    pub algorithm: CompressionAlgorithm,
+    pub nonce_b64: String,
+    pub digest_b64: String,
+    pub tag_b64: String,
+    pub raw_size: usize,
+    pub encoded_size: usize,
+    pub issued_at_unix: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SecureNpnNegotiatorBlobMeta {
+    pub algorithm: CompressionAlgorithm,
+    pub nonce_b64: String,
+    pub digest_b64: String,
+    pub tag_b64: String,
+    pub raw_size: usize,
+    pub encoded_size: usize,
+    pub issued_at_unix: u64,
 }
 
 impl AlpnProtocol {
@@ -77,10 +112,7 @@ impl AlpnProtocol {
 impl AlpnNegotiator {
     pub fn new() -> Self {
         Self {
-            supported_protocols: vec![
-                AlpnProtocol::Http2,
-                AlpnProtocol::Http11,
-            ],
+            supported_protocols: vec![AlpnProtocol::Http2, AlpnProtocol::Http11],
             selected_protocol: None,
             server_preference: true,
         }
@@ -136,15 +168,9 @@ impl AlpnNegotiator {
         self.selected_protocol = selected;
 
         selected.ok_or_else(|| {
-            let server_protos: Vec<&str> = self.supported_protocols
-                .iter()
-                .map(|p| p.name())
-                .collect();
-            let client_protos: Vec<&str> = client_prefs
-                .iter()
-                .map(|p| p.name())
-                .collect();
-            
+            let server_protos: Vec<&str> = self.supported_protocols.iter().map(|p| p.name()).collect();
+            let client_protos: Vec<&str> = client_prefs.iter().map(|p| p.name()).collect();
+
             format!(
                 "No common ALPN protocols. Server: {:?}, Client: {:?}",
                 server_protos, client_protos
@@ -156,10 +182,6 @@ impl AlpnNegotiator {
         let mut protocols = Vec::new();
         let mut pos = 0;
         while pos < data.len() {
-            if pos >= data.len() {
-                return None;
-            }
-
             let len = data[pos] as usize;
             pos += 1;
             if pos + len > data.len() {
@@ -219,12 +241,23 @@ impl AlpnNegotiator {
     pub fn supported_protocols_sorted(&self) -> Vec<AlpnProtocol> {
         let mut protocols = self.supported_protocols.clone();
         protocols.sort_by(|a, b| b.priority().cmp(&a.priority()));
-        
         protocols
     }
 
     pub fn reset(&mut self) {
         self.selected_protocol = None;
+    }
+
+    pub fn to_secure_blob(&self, algorithm: CompressionAlgorithm) -> io::Result<(SecureAlpnNegotiatorBlobMeta, Vec<u8>)> {
+        encode_secure_alpn_negotiator(self, algorithm)
+    }
+
+    pub fn to_secure_blob_auto(&self, accept_encoding: &str) -> io::Result<(SecureAlpnNegotiatorBlobMeta, Vec<u8>)> {
+        encode_secure_alpn_negotiator_auto(self, accept_encoding)
+    }
+
+    pub fn from_secure_blob(data: &[u8]) -> io::Result<(SecureAlpnNegotiatorBlobMeta, Self)> {
+        decode_secure_alpn_negotiator(data)
     }
 }
 
@@ -243,15 +276,19 @@ impl NpnProtocol {
             _ => None,
         }
     }
+
+    pub fn name(&self) -> &'static str {
+        match self {
+            NpnProtocol::Http2 => "HTTP/2",
+            NpnProtocol::Http11 => "HTTP/1.1",
+        }
+    }
 }
 
 impl NpnNegotiator {
     pub fn new() -> Self {
         Self {
-            supported_protocols: vec![
-                NpnProtocol::Http2,
-                NpnProtocol::Http11,
-            ],
+            supported_protocols: vec![NpnProtocol::Http2, NpnProtocol::Http11],
             selected_protocol: None,
         }
     }
@@ -285,13 +322,8 @@ impl NpnNegotiator {
         let mut protocols = Vec::new();
         let mut pos = 0;
         while pos < data.len() {
-            if pos >= data.len() {
-                return None;
-            }
-
             let len = data[pos] as usize;
             pos += 1;
-
             if pos + len > data.len() {
                 return None;
             }
@@ -317,6 +349,18 @@ impl NpnNegotiator {
     pub fn reset(&mut self) {
         self.selected_protocol = None;
     }
+
+    pub fn to_secure_blob(&self, algorithm: CompressionAlgorithm) -> io::Result<(SecureNpnNegotiatorBlobMeta, Vec<u8>)> {
+        encode_secure_npn_negotiator(self, algorithm)
+    }
+
+    pub fn to_secure_blob_auto(&self, accept_encoding: &str) -> io::Result<(SecureNpnNegotiatorBlobMeta, Vec<u8>)> {
+        encode_secure_npn_negotiator_auto(self, accept_encoding)
+    }
+
+    pub fn from_secure_blob(data: &[u8]) -> io::Result<(SecureNpnNegotiatorBlobMeta, Self)> {
+        decode_secure_npn_negotiator(data)
+    }
 }
 
 impl fmt::Display for AlpnProtocol {
@@ -337,6 +381,791 @@ impl Default for NpnNegotiator {
     }
 }
 
+pub fn select_secure_alpn_negotiator_algorithm(accept_encoding: &str) -> CompressionAlgorithm {
+    compression::parse_accept_encoding(accept_encoding).into_iter().find_map(|(algorithm, quality)| {
+        if quality > 0.0 && algorithm.is_implemented() {
+            Some(algorithm)
+        } else {
+            None
+        }
+    }).unwrap_or(CompressionAlgorithm::Identity)
+}
+
+pub fn encode_secure_alpn_negotiator(negotiator: &AlpnNegotiator, algorithm: CompressionAlgorithm) -> io::Result<(SecureAlpnNegotiatorBlobMeta, Vec<u8>)> {
+    let mut selected_algorithm = algorithm;
+    if !selected_algorithm.is_implemented() {
+        selected_algorithm = CompressionAlgorithm::Identity;
+    }
+
+    let raw_payload = serialize_alpn_negotiator(negotiator);
+    let encoded_payload = if selected_algorithm == CompressionAlgorithm::Identity {
+        raw_payload.clone()
+    } else {
+        compression::compress(selected_algorithm, &raw_payload, CompressionLevel::Default)?
+    };
+
+    let nonce = random::generate_random(24).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::Other,
+            format!("failed to generate ALPN negotiator blob nonce: {}", e),
+        )
+    })?;
+
+    let digest = sha256(&raw_payload);
+    let tag = compute_alpn_negotiator_blob_tag(
+        &nonce,
+        selected_algorithm,
+        raw_payload.len(),
+        &encoded_payload,
+    );
+
+    let digest_b64 = pem::encode(&digest);
+    let tag_b64 = pem::encode(&tag);
+    let nonce_b64 = pem::encode(&nonce);
+    let issued_at_unix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    let header = format!(
+        "{magic}\ncontent-encoding={encoding}\nnonce={nonce}\ndigest=SHA-256={digest}\ntag=HMAC-SHA-256={tag}\nraw-size={raw_size}\nencoded-size={encoded_size}\nissued-at={issued_at}\n\n",
+        magic = ALPN_NEGOTIATOR_BLOB_MAGIC,
+        encoding = selected_algorithm.content_encoding(),
+        nonce = nonce_b64,
+        digest = digest_b64,
+        tag = tag_b64,
+        raw_size = raw_payload.len(),
+        encoded_size = encoded_payload.len(),
+        issued_at = issued_at_unix
+    );
+
+    let mut blob = header.into_bytes();
+    blob.extend_from_slice(&encoded_payload);
+
+    Ok((
+        SecureAlpnNegotiatorBlobMeta {
+            algorithm: selected_algorithm,
+            nonce_b64,
+            digest_b64,
+            tag_b64,
+            raw_size: raw_payload.len(),
+            encoded_size: encoded_payload.len(),
+            issued_at_unix,
+        },
+        blob,
+    ))
+}
+
+pub fn encode_secure_alpn_negotiator_auto(negotiator: &AlpnNegotiator, accept_encoding: &str) -> io::Result<(SecureAlpnNegotiatorBlobMeta, Vec<u8>)> {
+    let selected = select_secure_alpn_negotiator_algorithm(accept_encoding);
+    encode_secure_alpn_negotiator(negotiator, selected)
+}
+
+pub fn decode_secure_alpn_negotiator(data: &[u8]) -> io::Result<(SecureAlpnNegotiatorBlobMeta, AlpnNegotiator)> {
+    let (header, body) = split_header_body(data)?;
+    let meta = parse_secure_alpn_negotiator_meta(&header, body.len())?;
+    let nonce = pem::decode(&meta.nonce_b64).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid nonce encoding: {}", e),
+        )
+    })?;
+
+    let expected_digest = pem::decode(&meta.digest_b64).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid digest encoding: {}", e),
+        )
+    })?;
+
+    let provided_tag = pem::decode(&meta.tag_b64).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid tag encoding: {}", e),
+        )
+    })?;
+
+    if expected_digest.len() != 32 || provided_tag.len() != 32 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "digest or tag has invalid length",
+        ));
+    }
+
+    let expected_tag = compute_alpn_negotiator_blob_tag(&nonce, meta.algorithm, meta.raw_size, body);
+    if !constant_time_eq(&expected_tag, &provided_tag) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "ALPN negotiator blob HMAC mismatch",
+        ));
+    }
+
+    let raw_payload = if meta.algorithm == CompressionAlgorithm::Identity {
+        body.to_vec()
+    } else {
+        compression::decompress(meta.algorithm, body)?
+    };
+
+    if raw_payload.len() != meta.raw_size {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "raw-size mismatch: expected {}, got {}",
+                meta.raw_size,
+                raw_payload.len()
+            ),
+        ));
+    }
+
+    let actual_digest = sha256(&raw_payload);
+    if !constant_time_eq(&actual_digest, &expected_digest) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "ALPN negotiator blob digest mismatch",
+        ));
+    }
+
+    let negotiator = deserialize_alpn_negotiator(&raw_payload)?;
+    Ok((meta, negotiator))
+}
+
+pub fn select_secure_npn_negotiator_algorithm(accept_encoding: &str) -> CompressionAlgorithm {
+    compression::parse_accept_encoding(accept_encoding).into_iter().find_map(|(algorithm, quality)| {
+        if quality > 0.0 && algorithm.is_implemented() {
+            Some(algorithm)
+        } else {
+            None
+        }
+    }).unwrap_or(CompressionAlgorithm::Identity)
+}
+
+pub fn encode_secure_npn_negotiator(negotiator: &NpnNegotiator, algorithm: CompressionAlgorithm) -> io::Result<(SecureNpnNegotiatorBlobMeta, Vec<u8>)> {
+    let mut selected_algorithm = algorithm;
+    if !selected_algorithm.is_implemented() {
+        selected_algorithm = CompressionAlgorithm::Identity;
+    }
+
+    let raw_payload = serialize_npn_negotiator(negotiator);
+    let encoded_payload = if selected_algorithm == CompressionAlgorithm::Identity {
+        raw_payload.clone()
+    } else {
+        compression::compress(selected_algorithm, &raw_payload, CompressionLevel::Default)?
+    };
+
+    let nonce = random::generate_random(24).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::Other,
+            format!("failed to generate NPN negotiator blob nonce: {}", e),
+        )
+    })?;
+
+    let digest = sha256(&raw_payload);
+    let tag = compute_npn_negotiator_blob_tag(
+        &nonce,
+        selected_algorithm,
+        raw_payload.len(),
+        &encoded_payload,
+    );
+
+    let digest_b64 = pem::encode(&digest);
+    let tag_b64 = pem::encode(&tag);
+    let nonce_b64 = pem::encode(&nonce);
+    let issued_at_unix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    let header = format!(
+        "{magic}\ncontent-encoding={encoding}\nnonce={nonce}\ndigest=SHA-256={digest}\ntag=HMAC-SHA-256={tag}\nraw-size={raw_size}\nencoded-size={encoded_size}\nissued-at={issued_at}\n\n",
+        magic = NPN_NEGOTIATOR_BLOB_MAGIC,
+        encoding = selected_algorithm.content_encoding(),
+        nonce = nonce_b64,
+        digest = digest_b64,
+        tag = tag_b64,
+        raw_size = raw_payload.len(),
+        encoded_size = encoded_payload.len(),
+        issued_at = issued_at_unix
+    );
+
+    let mut blob = header.into_bytes();
+    blob.extend_from_slice(&encoded_payload);
+
+    Ok((
+        SecureNpnNegotiatorBlobMeta {
+            algorithm: selected_algorithm,
+            nonce_b64,
+            digest_b64,
+            tag_b64,
+            raw_size: raw_payload.len(),
+            encoded_size: encoded_payload.len(),
+            issued_at_unix,
+        },
+        blob,
+    ))
+}
+
+pub fn encode_secure_npn_negotiator_auto(negotiator: &NpnNegotiator, accept_encoding: &str) -> io::Result<(SecureNpnNegotiatorBlobMeta, Vec<u8>)> {
+    let selected = select_secure_npn_negotiator_algorithm(accept_encoding);
+    encode_secure_npn_negotiator(negotiator, selected)
+}
+
+pub fn decode_secure_npn_negotiator(data: &[u8]) -> io::Result<(SecureNpnNegotiatorBlobMeta, NpnNegotiator)> {
+    let (header, body) = split_header_body(data)?;
+    let meta = parse_secure_npn_negotiator_meta(&header, body.len())?;
+    let nonce = pem::decode(&meta.nonce_b64).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid nonce encoding: {}", e),
+        )
+    })?;
+
+    let expected_digest = pem::decode(&meta.digest_b64).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid digest encoding: {}", e),
+        )
+    })?;
+
+    let provided_tag = pem::decode(&meta.tag_b64).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid tag encoding: {}", e),
+        )
+    })?;
+
+    if expected_digest.len() != 32 || provided_tag.len() != 32 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "digest or tag has invalid length",
+        ));
+    }
+
+    let expected_tag = compute_npn_negotiator_blob_tag(&nonce, meta.algorithm, meta.raw_size, body);
+    if !constant_time_eq(&expected_tag, &provided_tag) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "NPN negotiator blob HMAC mismatch",
+        ));
+    }
+
+    let raw_payload = if meta.algorithm == CompressionAlgorithm::Identity {
+        body.to_vec()
+    } else {
+        compression::decompress(meta.algorithm, body)?
+    };
+
+    if raw_payload.len() != meta.raw_size {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "raw-size mismatch: expected {}, got {}",
+                meta.raw_size,
+                raw_payload.len()
+            ),
+        ));
+    }
+
+    let actual_digest = sha256(&raw_payload);
+    if !constant_time_eq(&actual_digest, &expected_digest) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "NPN negotiator blob digest mismatch",
+        ));
+    }
+
+    let negotiator = deserialize_npn_negotiator(&raw_payload)?;
+    Ok((meta, negotiator))
+}
+
+fn serialize_alpn_negotiator(negotiator: &AlpnNegotiator) -> Vec<u8> {
+    let mut lines = Vec::new();
+    lines.push(format!(
+        "server-preference={}",
+        if negotiator.server_preference { "1" } else { "0" }
+    ));
+
+    let selected = negotiator.selected_protocol.map(|p| pem::encode(p.wire_format())).unwrap_or_default();
+    lines.push(format!("selected={}", selected));
+    for protocol in &negotiator.supported_protocols {
+        lines.push(format!("p={}", pem::encode(protocol.wire_format())));
+    }
+
+    lines.join("\n").into_bytes()
+}
+
+fn deserialize_alpn_negotiator(raw_payload: &[u8]) -> io::Result<AlpnNegotiator> {
+    let text = String::from_utf8(raw_payload.to_vec()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "ALPN negotiator payload is not valid UTF-8",
+        )
+    })?;
+
+    let mut supported_protocols = Vec::new();
+    let mut selected_protocol = None;
+    let mut server_preference = true;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        if let Some(v) = trimmed.strip_prefix("server-preference=") {
+            server_preference = parse_bool(v)?;
+            continue;
+        }
+
+        if let Some(v) = trimmed.strip_prefix("selected=") {
+            let selected_encoded = v.trim();
+            if !selected_encoded.is_empty() {
+                let decoded = pem::decode(selected_encoded).map_err(|e| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("invalid selected protocol encoding: {}", e),
+                    )
+                })?;
+
+                selected_protocol = AlpnProtocol::from_wire(&decoded);
+            }
+            continue;
+        }
+
+        if let Some(v) = trimmed.strip_prefix("p=") {
+            let decoded = pem::decode(v.trim()).map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("invalid supported protocol encoding: {}", e),
+                )
+            })?;
+
+            let protocol = AlpnProtocol::from_wire(&decoded).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "unsupported ALPN protocol in payload",
+                )
+            })?;
+
+            if !supported_protocols.contains(&protocol) {
+                supported_protocols.push(protocol);
+            }
+        }
+    }
+
+    if supported_protocols.is_empty() {
+        supported_protocols = vec![AlpnProtocol::Http2, AlpnProtocol::Http11];
+    }
+
+    if let Some(selected) = selected_protocol {
+        if !supported_protocols.contains(&selected) {
+            supported_protocols.push(selected);
+        }
+    }
+
+    Ok(AlpnNegotiator {
+        supported_protocols,
+        selected_protocol,
+        server_preference,
+    })
+}
+
+fn serialize_npn_negotiator(negotiator: &NpnNegotiator) -> Vec<u8> {
+    let mut lines = Vec::new();
+
+    let selected = negotiator.selected_protocol.map(|p| pem::encode(p.wire_format())).unwrap_or_default();
+    lines.push(format!("selected={}", selected));
+    for protocol in &negotiator.supported_protocols {
+        lines.push(format!("p={}", pem::encode(protocol.wire_format())));
+    }
+
+    lines.join("\n").into_bytes()
+}
+
+fn deserialize_npn_negotiator(raw_payload: &[u8]) -> io::Result<NpnNegotiator> {
+    let text = String::from_utf8(raw_payload.to_vec()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "NPN negotiator payload is not valid UTF-8",
+        )
+    })?;
+
+    let mut supported_protocols = Vec::new();
+    let mut selected_protocol = None;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        if let Some(v) = trimmed.strip_prefix("selected=") {
+            let selected_encoded = v.trim();
+            if !selected_encoded.is_empty() {
+                let decoded = pem::decode(selected_encoded).map_err(|e| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("invalid selected protocol encoding: {}", e),
+                    )
+                })?;
+
+                selected_protocol = NpnProtocol::from_wire(&decoded);
+            }
+
+            continue;
+        }
+
+        if let Some(v) = trimmed.strip_prefix("p=") {
+            let decoded = pem::decode(v.trim()).map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("invalid supported protocol encoding: {}", e),
+                )
+            })?;
+
+            let protocol = NpnProtocol::from_wire(&decoded).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "unsupported NPN protocol in payload",
+                )
+            })?;
+
+            if !supported_protocols.contains(&protocol) {
+                supported_protocols.push(protocol);
+            }
+        }
+    }
+
+    if supported_protocols.is_empty() {
+        supported_protocols = vec![NpnProtocol::Http2, NpnProtocol::Http11];
+    }
+
+    if let Some(selected) = selected_protocol {
+        if !supported_protocols.contains(&selected) {
+            supported_protocols.push(selected);
+        }
+    }
+
+    Ok(NpnNegotiator {
+        supported_protocols,
+        selected_protocol,
+    })
+}
+
+fn compute_alpn_negotiator_blob_tag(nonce: &[u8], algorithm: CompressionAlgorithm, raw_size: usize, encoded_payload: &[u8]) -> [u8; 32] {
+    let mut mac_input = Vec::new();
+    mac_input.extend_from_slice(ALPN_NEGOTIATOR_BLOB_CONTEXT.as_bytes());
+    mac_input.extend_from_slice(algorithm.content_encoding().as_bytes());
+    mac_input.extend_from_slice(&(raw_size as u64).to_be_bytes());
+    mac_input.extend_from_slice(nonce);
+    mac_input.extend_from_slice(encoded_payload);
+    hmac_sha256(ALPN_NEGOTIATOR_BLOB_CONTEXT.as_bytes(), &mac_input)
+}
+
+fn compute_npn_negotiator_blob_tag(nonce: &[u8], algorithm: CompressionAlgorithm, raw_size: usize, encoded_payload: &[u8]) -> [u8; 32] {
+    let mut mac_input = Vec::new();
+    mac_input.extend_from_slice(NPN_NEGOTIATOR_BLOB_CONTEXT.as_bytes());
+    mac_input.extend_from_slice(algorithm.content_encoding().as_bytes());
+    mac_input.extend_from_slice(&(raw_size as u64).to_be_bytes());
+    mac_input.extend_from_slice(nonce);
+    mac_input.extend_from_slice(encoded_payload);
+    hmac_sha256(NPN_NEGOTIATOR_BLOB_CONTEXT.as_bytes(), &mac_input)
+}
+
+fn split_header_body(data: &[u8]) -> io::Result<(String, &[u8])> {
+    if let Some(pos) = data.windows(2).position(|w| w == b"\n\n") {
+        let header = std::str::from_utf8(&data[..pos]).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidData, "header is not valid UTF-8")
+        })?;
+
+        return Ok((header.to_string(), &data[pos + 2..]));
+    }
+
+    if let Some(pos) = data.windows(4).position(|w| w == b"\r\n\r\n") {
+        let header = std::str::from_utf8(&data[..pos]).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidData, "header is not valid UTF-8")
+        })?;
+
+        return Ok((header.to_string(), &data[pos + 4..]));
+    }
+
+    Err(io::Error::new(
+        io::ErrorKind::InvalidData,
+        "missing blob header/body separator",
+    ))
+}
+
+fn parse_secure_alpn_negotiator_meta(header: &str, body_len: usize) -> io::Result<SecureAlpnNegotiatorBlobMeta> {
+    let mut lines = header.lines();
+    let magic = lines.next().unwrap_or_default();
+    if magic != ALPN_NEGOTIATOR_BLOB_MAGIC {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "secure ALPN negotiator blob magic mismatch",
+        ));
+    }
+
+    let mut algorithm = CompressionAlgorithm::Identity;
+    let mut nonce_b64 = None::<String>;
+    let mut digest_b64 = None::<String>;
+    let mut tag_b64 = None::<String>;
+    let mut raw_size = None::<usize>;
+    let mut encoded_size = None::<usize>;
+    let mut issued_at_unix = None::<u64>;
+    for line in lines {
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        let (key, value) = line.split_once('=').ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid secure ALPN header line '{}'", line),
+            )
+        })?;
+
+        match key.trim() {
+            "content-encoding" => {
+                algorithm = CompressionAlgorithm::from_content_encoding(value.trim()).ok_or_else(
+                    || {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("unsupported content-encoding '{}'", value.trim()),
+                        )
+                    },
+                )?;
+            }
+            "nonce" => nonce_b64 = Some(value.trim().to_string()),
+            "digest" => {
+                let parsed = value.trim().strip_prefix("SHA-256=").ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "invalid digest header")
+                })?.to_string();
+
+                digest_b64 = Some(parsed);
+            }
+            "tag" => {
+                let parsed = value.trim().strip_prefix("HMAC-SHA-256=").ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "invalid tag header")
+                })?.to_string();
+
+                tag_b64 = Some(parsed);
+            }
+            "raw-size" => {
+                raw_size = Some(value.trim().parse::<usize>().map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidData, "invalid raw-size")
+                })?);
+            }
+            "encoded-size" => {
+                encoded_size = Some(value.trim().parse::<usize>().map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidData, "invalid encoded-size")
+                })?);
+            }
+            "issued-at" => {
+                issued_at_unix = Some(value.trim().parse::<u64>().map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidData, "invalid issued-at")
+                })?);
+            }
+            _ => {}
+        }
+    }
+
+    let nonce_b64 = nonce_b64.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "missing nonce in secure ALPN blob",
+        )
+    })?;
+
+    let digest_b64 = digest_b64.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "missing digest in secure ALPN blob",
+        )
+    })?;
+
+    let tag_b64 = tag_b64.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "missing tag in secure ALPN blob",
+        )
+    })?;
+
+    let raw_size = raw_size.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "missing raw-size in secure ALPN blob",
+        )
+    })?;
+
+    let encoded_size = encoded_size.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "missing encoded-size in secure ALPN blob",
+        )
+    })?;
+
+    if encoded_size != body_len {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "encoded-size mismatch: metadata {}, actual {}",
+                encoded_size, body_len
+            ),
+        ));
+    }
+
+    let issued_at_unix = issued_at_unix.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "missing issued-at in secure ALPN blob",
+        )
+    })?;
+
+    Ok(SecureAlpnNegotiatorBlobMeta {
+        algorithm,
+        nonce_b64,
+        digest_b64,
+        tag_b64,
+        raw_size,
+        encoded_size,
+        issued_at_unix,
+    })
+}
+
+fn parse_secure_npn_negotiator_meta(header: &str, body_len: usize) -> io::Result<SecureNpnNegotiatorBlobMeta> {
+    let mut lines = header.lines();
+    let magic = lines.next().unwrap_or_default();
+    if magic != NPN_NEGOTIATOR_BLOB_MAGIC {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "secure NPN negotiator blob magic mismatch",
+        ));
+    }
+
+    let mut algorithm = CompressionAlgorithm::Identity;
+    let mut nonce_b64 = None::<String>;
+    let mut digest_b64 = None::<String>;
+    let mut tag_b64 = None::<String>;
+    let mut raw_size = None::<usize>;
+    let mut encoded_size = None::<usize>;
+    let mut issued_at_unix = None::<u64>;
+    for line in lines {
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        let (key, value) = line.split_once('=').ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid secure NPN header line '{}'", line),
+            )
+        })?;
+
+        match key.trim() {
+            "content-encoding" => {
+                algorithm = CompressionAlgorithm::from_content_encoding(value.trim()).ok_or_else(
+                    || {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("unsupported content-encoding '{}'", value.trim()),
+                        )
+                    },
+                )?;
+            }
+            "nonce" => nonce_b64 = Some(value.trim().to_string()),
+            "digest" => {
+                let parsed = value.trim().strip_prefix("SHA-256=").ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "invalid digest header")
+                })?.to_string();
+
+                digest_b64 = Some(parsed);
+            }
+            "tag" => {
+                let parsed = value.trim().strip_prefix("HMAC-SHA-256=").ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "invalid tag header")
+                })?.to_string();
+                
+                tag_b64 = Some(parsed);
+            }
+            "raw-size" => {
+                raw_size = Some(value.trim().parse::<usize>().map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidData, "invalid raw-size")
+                })?);
+            }
+            "encoded-size" => {
+                encoded_size = Some(value.trim().parse::<usize>().map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidData, "invalid encoded-size")
+                })?);
+            }
+            "issued-at" => {
+                issued_at_unix = Some(value.trim().parse::<u64>().map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidData, "invalid issued-at")
+                })?);
+            }
+            _ => {}
+        }
+    }
+
+    let nonce_b64 = nonce_b64.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "missing nonce in secure NPN blob",
+        )
+    })?;
+
+    let digest_b64 = digest_b64.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "missing digest in secure NPN blob",
+        )
+    })?;
+
+    let tag_b64 = tag_b64.ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidData, "missing tag in secure NPN blob")
+    })?;
+
+    let raw_size = raw_size.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "missing raw-size in secure NPN blob",
+        )
+    })?;
+
+    let encoded_size = encoded_size.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "missing encoded-size in secure NPN blob",
+        )
+    })?;
+
+    if encoded_size != body_len {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "encoded-size mismatch: metadata {}, actual {}",
+                encoded_size, body_len
+            ),
+        ));
+    }
+
+    let issued_at_unix = issued_at_unix.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "missing issued-at in secure NPN blob",
+        )
+    })?;
+
+    Ok(SecureNpnNegotiatorBlobMeta {
+        algorithm,
+        nonce_b64,
+        digest_b64,
+        tag_b64,
+        raw_size,
+        encoded_size,
+        issued_at_unix,
+    })
+}
+
+fn parse_bool(v: &str) -> io::Result<bool> {
+    match v.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid boolean '{}'", v),
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -351,7 +1180,10 @@ mod tests {
     #[test]
     fn test_alpn_protocol_from_wire() {
         assert_eq!(AlpnProtocol::from_wire(b"h2"), Some(AlpnProtocol::Http2));
-        assert_eq!(AlpnProtocol::from_wire(b"http/1.1"), Some(AlpnProtocol::Http11));
+        assert_eq!(
+            AlpnProtocol::from_wire(b"http/1.1"),
+            Some(AlpnProtocol::Http11)
+        );
         assert_eq!(AlpnProtocol::from_wire(b"invalid"), None);
     }
 
@@ -420,7 +1252,6 @@ mod tests {
 
     #[test]
     fn test_alpn_parse_protocol_list() {
-        let data = b"\x02h2\x08http/1.1";
         let protocols = AlpnNegotiator::new().supported_protocols_wire();
         assert!(!protocols.is_empty());
     }
@@ -429,7 +1260,7 @@ mod tests {
     fn test_alpn_reset() {
         let mut negotiator = AlpnNegotiator::new();
         let client_prefs = b"\x02h2";
-        negotiator.negotiate(client_prefs);
+        negotiator.negotiate(client_prefs).ok();
         assert!(negotiator.is_negotiated());
 
         negotiator.reset();
@@ -480,5 +1311,29 @@ mod tests {
         for i in 0..sorted.len() - 1 {
             assert!(sorted[i].priority() >= sorted[i + 1].priority());
         }
+    }
+
+    #[test]
+    fn test_secure_alpn_roundtrip_identity() {
+        let negotiator = AlpnNegotiator::new();
+        let (meta, blob) = encode_secure_alpn_negotiator(&negotiator, CompressionAlgorithm::Identity)
+            .expect("encode failed");
+        let (decoded_meta, decoded) =
+            decode_secure_alpn_negotiator(&blob).expect("decode failed");
+
+        assert_eq!(meta.algorithm, decoded_meta.algorithm);
+        assert_eq!(decoded.supported_protocols, negotiator.supported_protocols);
+        assert_eq!(decoded.server_preference, negotiator.server_preference);
+    }
+
+    #[test]
+    fn test_secure_npn_roundtrip_identity() {
+        let negotiator = NpnNegotiator::new();
+        let (meta, blob) = encode_secure_npn_negotiator(&negotiator, CompressionAlgorithm::Identity)
+            .expect("encode failed");
+        let (decoded_meta, decoded) = decode_secure_npn_negotiator(&blob).expect("decode failed");
+
+        assert_eq!(meta.algorithm, decoded_meta.algorithm);
+        assert_eq!(decoded.supported_protocols, negotiator.supported_protocols);
     }
 }

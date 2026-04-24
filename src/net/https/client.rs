@@ -1,16 +1,25 @@
-use std::io::{Read, Write};
-use std::time::{Duration, SystemTime};
 use std::collections::HashMap;
-use crate::crypto::random::fill_random;
-use crate::crypto::encoding::x509::Certificate;
-use crate::crypto::encoding::asn1::{DerDecoder, DerEncoder};
-use crate::crypto::hash::sha2::sha1;
-use crate::net::http::http2::hpack::HpackCodec;
+use std::io::{Read, Write};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use crate::crypto::constant_time_eq;
+use crate::crypto::encoding::pem;
+use crate::crypto::hash::hmac::hmac_sha256;
+use crate::crypto::hash::sha2::sha256;
+use crate::crypto::random;
 use crate::net::connection_pool::ConnectionPool;
+use crate::net::http::compression::{self, CompressionAlgorithm, CompressionLevel};
 use crate::net::http::http2::alpn::{AlpnNegotiator, AlpnProtocol};
-use crate::net::http::{HttpResponse, HttpMethod, headers::Headers, HttpVersion};
-use crate::net::https::tls::{TlsStream, TlsCfg, TlsError};
+use crate::net::http::http2::hpack::HpackCodec;
+use crate::net::http::{headers::Headers, HttpMethod, HttpResponse, HttpVersion};
+use crate::net::https::tls::{TlsCfg, TlsError, TlsStream};
 use crate::net::tcp::TcpStream;
+use crate::net::https::{decode_secure_https_payload, encode_secure_https_payload_auto};
+
+const HTTPS_CLIENT_STATE_BLOB_MAGIC: &str = "SINGULARITY_HTTPS_CLIENT_STATE_BLOB_V1";
+const HTTPS_CLIENT_STATE_CONTEXT: &str = "SINGULARITY_HTTPS_CLIENT_STATE_BINDING_V1";
+const HTTPS_CLIENT_REQUEST_TAG_CONTEXT: &str = "SINGULARITY_HTTPS_CLIENT_REQUEST_TAG_V1";
+const HTTPS_CLIENT_RESPONSE_TAG_CONTEXT: &str = "SINGULARITY_HTTPS_CLIENT_RESPONSE_TAG_V1";
 
 #[derive(Debug)]
 pub enum HttpsError {
@@ -33,25 +42,59 @@ pub struct HttpsClientCfg {
     pub max_redirects: usize,
     pub user_agent: String,
     pub default_headers: Headers,
+    pub enable_secure_envelopes: bool,
+    pub enforce_response_integrity: bool,
+    pub request_compression_min_size: usize,
+    pub request_compression_level: CompressionLevel,
+    pub preferred_request_compression: CompressionAlgorithm,
 }
 
-impl Default for HttpsClientCfg {   
+impl Default for HttpsClientCfg {
     fn default() -> Self {
         let mut default_headers = Headers::new();
         default_headers.insert("User-Agent", "singularity-https-client/0.1.0");
         default_headers.insert("Accept", "*/*");
-        default_headers.insert("Accept-Encoding", "identity");
+        default_headers.insert("Accept-Encoding", "br, zstd, gzip, deflate, identity");
         default_headers.insert("Connection", "keep-alive");
-        
+
         Self {
             tls_cfg: TlsCfg::default(),
             timeout: Duration::from_secs(30),
             follow_redirect: true,
-            max_redirects: 5,
+            max_redirects: 10,
             user_agent: "singularity-https-client/0.1.0".to_string(),
             default_headers,
+            enable_secure_envelopes: true,
+            enforce_response_integrity: false,
+            request_compression_min_size: 1024,
+            request_compression_level: CompressionLevel::Default,
+            preferred_request_compression: CompressionAlgorithm::Identity,
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SecureHttpsClientStateMeta {
+    pub algorithm: CompressionAlgorithm,
+    pub nonce_b64: String,
+    pub digest_b64: String,
+    pub tag_b64: String,
+    pub raw_size: usize,
+    pub encoded_size: usize,
+    pub issued_at_unix: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HttpsClientStateSnapshot {
+    pub exported_at_unix: u64,
+    pub secure_envelopes_enabled: bool,
+    pub negotiated_protocols: HashMap<String, AlpnProtocol>,
+}
+
+#[derive(Debug, Clone)]
+struct Http2ConnectionWrapper {
+    next_stream_id: u32,
+    initialized: bool,
 }
 
 #[derive(Debug)]
@@ -61,25 +104,6 @@ struct TlsStreamWrapper {
     host: String,
     port: u16,
     http2_conn: Option<Http2ConnectionWrapper>,
-}
-
-#[derive(Debug, Clone)]
-struct Http2ConnectionWrapper {
-    next_stream_id: u32,
-    negotiated: bool,
-    max_concurrent_streams: u32,
-    active_streams: HashMap<u32, StreamInfo>,
-}
-
-#[derive(Debug, Clone)]
-struct StreamInfo {
-    stream_id: u32,
-    method: HttpMethod,
-    path: String,
-    headers_sent: bool,
-    body_sent: bool,
-    response_headers: Option<HashMap<String, String>>,
-    response_body: Vec<u8>,
 }
 
 pub struct HttpsClient {
@@ -94,10 +118,15 @@ impl HttpsClient {
     pub fn new(cfg: HttpsClientCfg) -> Self {
         let mut alpn_negotiator = AlpnNegotiator::new();
         alpn_negotiator.set_server_preference(false);
-        
-        HttpsClient {
+
+        Self {
             cfg,
-            connection_pool: ConnectionPool::with_limits(10, Duration::from_secs(90), Duration::from_secs(600), 100),
+            connection_pool: ConnectionPool::with_limits(
+                10,
+                Duration::from_secs(90),
+                Duration::from_secs(600),
+                100,
+            ),
             alpn_negotiator,
             tls_connections: HashMap::new(),
             negotiated_protocols: HashMap::new(),
@@ -114,18 +143,7 @@ impl HttpsClient {
     }
 
     pub fn get_negotiated_protocol(&self, host: &str, port: u16) -> Option<AlpnProtocol> {
-        let key = format!("{}:{}", host, port);
-        self.negotiated_protocols.get(&key).copied()
-    }
-
-    fn selected_protocol_with_fallback(&self, negotiated: Option<AlpnProtocol>) -> AlpnProtocol {
-        negotiated.unwrap_or_else(|| {
-            if self.cfg.tls_cfg.max_version >= crate::net::https::tls::TlsVersion::Tls1_2 {
-                AlpnProtocol::Http2
-            } else {
-                AlpnProtocol::Http11
-            }
-        })
+        self.negotiated_protocols.get(&Self::connection_key(host, port)).copied()
     }
 
     pub fn get(&mut self, url: &str) -> Result<HttpResponse, HttpsError> {
@@ -152,6 +170,131 @@ impl HttpsClient {
         self.request_with_redirects(HttpMethod::PATCH, url, Some(body), None, 0)
     }
 
+    pub fn clear_connections(&mut self) {
+        self.tls_connections.clear();
+        self.connection_pool.clear();
+        self.negotiated_protocols.clear();
+    }
+
+    pub fn get_connection_stats(&self) -> HashMap<String, Option<AlpnProtocol>> {
+        self.tls_connections.iter().map(|(k, v)| (k.clone(), v.protocol)).collect()
+    }
+
+    pub fn export_secure_state(&self, algorithm: CompressionAlgorithm) -> Result<(SecureHttpsClientStateMeta, Vec<u8>), HttpsError> {
+        let snapshot = HttpsClientStateSnapshot {
+            exported_at_unix: now_unix(),
+            secure_envelopes_enabled: self.cfg.enable_secure_envelopes,
+            negotiated_protocols: self.negotiated_protocols.clone(),
+        };
+
+        let raw_payload = serialize_client_snapshot(&snapshot);
+        let selected = if algorithm.is_implemented() {
+            algorithm
+        } else {
+            CompressionAlgorithm::Identity
+        };
+
+        let encoded_payload = if selected == CompressionAlgorithm::Identity {
+            raw_payload.clone()
+        } else {
+            compression::compress(selected, &raw_payload, CompressionLevel::Default).map_err(HttpsError::Io)?
+        };
+
+        let nonce = random::generate_random(24).map_err(|e| {
+            HttpsError::InvalidResponse(format!("state nonce generation failed: {}", e))
+        })?;
+
+        let digest = sha256(&raw_payload);
+        let tag = compute_state_blob_tag(&nonce, raw_payload.len(), selected, &encoded_payload);
+        let meta = SecureHttpsClientStateMeta {
+            algorithm: selected,
+            nonce_b64: pem::encode(&nonce),
+            digest_b64: pem::encode(&digest),
+            tag_b64: pem::encode(&tag),
+            raw_size: raw_payload.len(),
+            encoded_size: encoded_payload.len(),
+            issued_at_unix: now_unix(),
+        };
+
+        let header = format!(
+            "{magic}\ncontent-encoding: {encoding}\nnonce: {nonce}\ndigest: {digest}\ntag: {tag}\nraw-size: {raw_size}\nencoded-size: {encoded_size}\nissued-at: {issued_at}\n\n",
+            magic = HTTPS_CLIENT_STATE_BLOB_MAGIC,
+            encoding = meta.algorithm.content_encoding(),
+            nonce = meta.nonce_b64,
+            digest = meta.digest_b64,
+            tag = meta.tag_b64,
+            raw_size = meta.raw_size,
+            encoded_size = meta.encoded_size,
+            issued_at = meta.issued_at_unix
+        );
+
+        let mut out = header.into_bytes();
+        out.extend_from_slice(&encoded_payload);
+
+        Ok((meta, out))
+    }
+
+    pub fn export_secure_state_auto(&self, accept_encoding: &str) -> Result<(SecureHttpsClientStateMeta, Vec<u8>), HttpsError> {
+        self.export_secure_state(select_state_algorithm(accept_encoding))
+    }
+
+    pub fn import_secure_state(blob: &[u8]) -> Result<(SecureHttpsClientStateMeta, HttpsClientStateSnapshot), HttpsError> {
+        let (header, body) = split_header_body(blob).map_err(HttpsError::Io)?;
+        let meta = parse_state_meta(&header, body.len())?;
+        let nonce = pem::decode(&meta.nonce_b64).map_err(|e| {
+            HttpsError::InvalidResponse(format!("invalid state nonce encoding: {}", e))
+        })?;
+
+        let expected_digest = pem::decode(&meta.digest_b64).map_err(|e| {
+            HttpsError::InvalidResponse(format!("invalid state digest encoding: {}", e))
+        })?;
+
+        let provided_tag = pem::decode(&meta.tag_b64).map_err(|e| {
+            HttpsError::InvalidResponse(format!("invalid state tag encoding: {}", e))
+        })?;
+
+        if expected_digest.len() != 32 || provided_tag.len() != 32 {
+            return Err(HttpsError::InvalidResponse(
+                "state digest or tag has invalid length".to_string(),
+            ));
+        }
+
+        let computed_tag = compute_state_blob_tag(&nonce, meta.raw_size, meta.algorithm, body);
+        if !constant_time_eq(&computed_tag, &provided_tag) {
+            return Err(HttpsError::InvalidResponse(
+                "state tag verification failed".to_string(),
+            ));
+        }
+
+        let raw_payload = if meta.algorithm == CompressionAlgorithm::Identity {
+            body.to_vec()
+        } else {
+            compression::decompress(meta.algorithm, body).map_err(HttpsError::Io)?
+        };
+
+        if raw_payload.len() != meta.raw_size {
+            return Err(HttpsError::InvalidResponse(format!(
+                "state raw-size mismatch: expected {}, got {}",
+                meta.raw_size,
+                raw_payload.len()
+            )));
+        }
+
+        let actual_digest = sha256(&raw_payload);
+        if !constant_time_eq(&actual_digest, &expected_digest) {
+            return Err(HttpsError::InvalidResponse(
+                "state digest verification failed".to_string(),
+            ));
+        }
+
+        let snapshot = deserialize_client_snapshot(&raw_payload)?;
+        Ok((meta, snapshot))
+    }
+
+    pub fn apply_state_snapshot(&mut self, snapshot: &HttpsClientStateSnapshot) {
+        self.negotiated_protocols = snapshot.negotiated_protocols.clone();
+    }
+
     fn request_with_redirects(&mut self, method: HttpMethod, url: &str, body: Option<Vec<u8>>, headers: Option<Headers>, redirect_count: usize) -> Result<HttpResponse, HttpsError> {
         if redirect_count > self.cfg.max_redirects {
             return Err(HttpsError::TooManyRedirects);
@@ -167,11 +310,36 @@ impl HttpsClient {
             }
         }
 
-        request_headers.insert("Host", format!("{}:{}", host, port));
-        let connection_key = format!("{}:{}", host, port);
+        if !request_headers.contains("host") {
+            let host_value = if port == 443 {
+                host.clone()
+            } else if host.contains(':') && !host.starts_with('[') {
+                format!("[{}]:{}", host, port)
+            } else {
+                format!("{}:{}", host, port)
+            };
+
+            request_headers.insert("Host", host_value);
+        }
+
+        if !request_headers.contains("user-agent") {
+            request_headers.insert("User-Agent", self.cfg.user_agent.clone());
+        }
+
+        if !request_headers.contains("accept-encoding") {
+            request_headers.insert("Accept-Encoding", "br, zstd, gzip, deflate, identity");
+        }
+
+        let connection_key = Self::connection_key(&host, port);
         self.get_or_create_tls_connection_with_alpn(&host, port)?;
-        let response = match self.tls_connections.get(&connection_key).unwrap().protocol {
-            Some(AlpnProtocol::Http2) => {
+        let protocol = self.tls_connections.get(&connection_key).and_then(|w| {
+            w.protocol
+        }).unwrap_or_else(|| {
+            self.selected_protocol_with_fallback(None)
+        });
+
+        let response = match protocol {
+            AlpnProtocol::Http2 => {
                 self.send_http2_request(
                     &connection_key,
                     method,
@@ -180,7 +348,7 @@ impl HttpsClient {
                     body.clone(),
                 )?
             }
-            Some(AlpnProtocol::Http11) | Some(AlpnProtocol::Http10) | None => {
+            AlpnProtocol::Http11 | AlpnProtocol::Http10 => {
                 self.send_http1_request(
                     &connection_key,
                     method,
@@ -189,7 +357,7 @@ impl HttpsClient {
                     body.clone(),
                 )?
             }
-            Some(AlpnProtocol::Http3) => {
+            AlpnProtocol::Http3 => {
                 return Err(HttpsError::ProtocolNegotiationFailed(
                     "HTTP/3 requires QUIC transport".to_string(),
                 ))
@@ -198,17 +366,28 @@ impl HttpsClient {
 
         if self.cfg.follow_redirect && response.is_redirect() {
             if let Some(location) = response.header("location") {
-                let redirect_url = if location.starts_with("http") {
-                    location.to_string()
+                let redirect_url = if location.starts_with("http://") || location.starts_with("https://") || location.starts_with("//") {
+                    self.resolve_url(url, location)
                 } else {
-                    let base = format!("https://{}:{}", host, port);
+                    let base = format!(
+                        "https://{}:{}{}",
+                        host,
+                        port,
+                        if path.is_empty() { "/" } else { &path }
+                    );
                     self.resolve_url(&base, location)
                 };
 
+                let (next_method, next_body) = if response.status_code() == 303 {
+                    (HttpMethod::GET, None)
+                } else {
+                    (method, body)
+                };
+
                 return self.request_with_redirects(
-                    method,
+                    next_method,
                     &redirect_url,
-                    body,
+                    next_body,
                     headers,
                     redirect_count + 1,
                 );
@@ -219,1891 +398,323 @@ impl HttpsClient {
     }
 
     fn get_or_create_tls_connection_with_alpn(&mut self, host: &str, port: u16) -> Result<(), HttpsError> {
-        let connection_key = format!("{}:{}", host, port);
-        if self.tls_connections.contains_key(&connection_key) {
+        let key = Self::connection_key(host, port);
+        if self.tls_connections.contains_key(&key) {
             return Ok(());
         }
 
-        let socket_addr = format!("{}:{}", host, port);
-        let tcp_stream = TcpStream::connect(&socket_addr)
-            .map_err(|e| HttpsError::ConnectionFailed(e.to_string()))?;
+        let socket_addr = if host.contains(':') && !host.starts_with('[') {
+            format!("[{}]:{}", host, port)
+        } else {
+            format!("{}:{}", host, port)
+        };
+
+        let tcp_stream = TcpStream::connect(&socket_addr).map_err(|e| {
+            HttpsError::ConnectionFailed(e.to_string())
+        })?;
 
         let mut tls_stream = TlsStream::new_client_with_sni(
             tcp_stream,
             self.cfg.tls_cfg.clone(),
             host.to_string(),
-        )
-        .map_err(|e| HttpsError::Tls(e))?;
+        ).map_err(HttpsError::Tls)?;
 
-        let alpn_protocols = vec![
-            AlpnProtocol::Http2,
-            AlpnProtocol::Http11,
-        ];
-
-        tls_stream.init_alpn_client(alpn_protocols.clone());
-        self.perform_tls_handshake_with_alpn(
-            &mut tls_stream,
-            host,
-            &alpn_protocols,
-        )?;
-
-        let negotiated_protocol = tls_stream.get_negotiated_protocol();
-        if let Some(protocol) = negotiated_protocol {
-            tls_stream
-                .validate_negotiated_protocol(&[
-                    AlpnProtocol::Http2,
-                    AlpnProtocol::Http11,
-                ])
-                .map_err(|e| HttpsError::Tls(e))?;
-
-            self.negotiated_protocols
-                .insert(connection_key.clone(), protocol);
+        let preferred_protocols = self.alpn_negotiator.supported_protocols_sorted();
+        if !preferred_protocols.is_empty() {
+            tls_stream.init_alpn_client(preferred_protocols);
         }
 
-        tls_stream
-            .set_read_timeout(Some(self.cfg.timeout))
-            .map_err(|e| HttpsError::Tls(e))?;
-        tls_stream
-            .set_write_timeout(Some(self.cfg.timeout))
-            .map_err(|e| HttpsError::Tls(e))?;
+        tls_stream.set_read_timeout(Some(self.cfg.timeout)).map_err(HttpsError::Tls)?;
+        tls_stream.set_write_timeout(Some(self.cfg.timeout)).map_err(HttpsError::Tls)?;
+        let negotiated = tls_stream.get_negotiated_protocol();
+        let selected = self.selected_protocol_with_fallback(negotiated);
+        let _ = tls_stream.validate_negotiated_protocol(&[
+            AlpnProtocol::Http2,
+            AlpnProtocol::Http11,
+            AlpnProtocol::Http10,
+        ]);
 
-        let http2_conn = if negotiated_protocol == Some(AlpnProtocol::Http2) {
-            let tcp_stream_ref = tls_stream.stream_get_ref();
-            let remote_addr = tcp_stream_ref.peer_addr()
-                .ok()
-                .map(|addr| addr.to_string())
-                .unwrap_or_else(|| "unknown".to_string());
-
-            eprintln!("Initializing HTTP/2 connection to {} ({})", connection_key, remote_addr);
-
+        self.negotiated_protocols.insert(key.clone(), selected);
+        let http2_conn = if selected == AlpnProtocol::Http2 {
             Some(Http2ConnectionWrapper {
                 next_stream_id: 1,
-                negotiated: true,
-                max_concurrent_streams: 100,
-                active_streams: HashMap::new(),
+                initialized: false,
             })
         } else {
             None
         };
 
-        let wrapper: TlsStreamWrapper = TlsStreamWrapper {
-            stream: tls_stream,
-            protocol: negotiated_protocol,
-            http2_conn,
-            host: host.to_string(),
-            port,
+        self.tls_connections.insert(
+            key,
+            TlsStreamWrapper {
+                stream: tls_stream,
+                protocol: Some(selected),
+                host: host.to_string(),
+                port,
+                http2_conn,
+            },
+        );
+
+        Ok(())
+    }
+
+    fn send_http1_request(&mut self, connection_key: &str, method: HttpMethod, path: &str, mut request_headers: Headers, body: Option<Vec<u8>>) -> Result<HttpResponse, HttpsError> {
+        let mut body_bytes = body.unwrap_or_default();
+        self.apply_outbound_security(&mut request_headers, &mut body_bytes)?;
+        if !body_bytes.is_empty() && !request_headers.contains("content-length") {
+            request_headers.insert("Content-Length", body_bytes.len().to_string());
+        }
+
+        let timeout = self.cfg.timeout;
+        let response_bytes = {
+            let wrapper = self.tls_connections.get_mut(connection_key).ok_or_else(|| {
+                HttpsError::ConnectionFailed("Connection not found".to_string())
+            })?;
+
+            let mut request = Vec::new();
+            request.extend_from_slice(format!("{} {} HTTP/1.1\r\n", method.as_str(), path).as_bytes());
+            request.extend_from_slice(request_headers.format().as_bytes());
+            request.extend_from_slice(b"\r\n");
+            request.extend_from_slice(&body_bytes);
+            wrapper.stream.write_all(&request).map_err(HttpsError::Io)?;
+            wrapper.stream.flush().map_err(HttpsError::Io)?;
+
+            Self::read_http1_response_bytes(&mut wrapper.stream, timeout)?
         };
 
-        self.tls_connections.insert(connection_key, wrapper);
-        Ok(())
+        self.parse_http1_response(&response_bytes)
     }
 
-    fn perform_tls_handshake_with_alpn(&self, tls_stream: &mut TlsStream, host: &str, alpn_protocols: &[AlpnProtocol]) -> Result<(), HttpsError> {
-        let client_hello = self.build_client_hello_with_alpn(host, alpn_protocols)?;
-        tls_stream.write_all(&client_hello).map_err(|e| HttpsError::Io(e))?;
-        tls_stream.flush().map_err(|e| HttpsError::Io(e))?;
+    fn send_http2_request(&mut self, connection_key: &str, method: HttpMethod, path: &str, mut request_headers: Headers, body: Option<Vec<u8>>) -> Result<HttpResponse, HttpsError> {
+        let mut body_bytes = body.unwrap_or_default();
+        self.apply_outbound_security(&mut request_headers, &mut body_bytes)?;
+        let mut header_map: HashMap<String, String> = HashMap::new();
+        header_map.insert(":method".to_string(), method.as_str().to_string());
+        header_map.insert(":path".to_string(), path.to_string());
+        header_map.insert(":scheme".to_string(), "https".to_string());
 
-        let mut buffer = vec![0u8; 4096];
-        let bytes_read = tls_stream.read(&mut buffer).map_err(|e| HttpsError::Io(e))?;
-        if bytes_read == 0 {
-            return Err(HttpsError::InvalidResponse(
-                "Server did not respond to ClientHello".to_string(),
-            ));
-        }
-
-        buffer.truncate(bytes_read);
-        self.parse_server_hello_with_alpn(tls_stream, &buffer, alpn_protocols)?;
-        self.complete_tls_handshake(tls_stream)?;
-
-        Ok(())
-    }
-
-    fn build_client_hello_with_alpn(&self, host: &str, alpn_protocols: &[AlpnProtocol]) -> Result<Vec<u8>, HttpsError> {
-        let mut client_hello = Vec::new();
-        client_hello.push(22);
-        client_hello.extend_from_slice(&[0x03, 0x03]);
-        let mut handshake = Vec::new();
-        handshake.push(1);
-        let mut client_hello_body = Vec::new();
-        client_hello_body.extend_from_slice(&[0x03, 0x03]);
-        let mut random = vec![0u8; 32];
-        random[0..4].copy_from_slice(&(std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as u32)
-            .to_be_bytes());
-
-        for i in 4..32 {
-            let _ = fill_random(&mut random[i..i + 1]);
-        }
-
-        client_hello_body.extend_from_slice(&random);
-        client_hello_body.push(0);
-        let cipher_suites: Vec<u16> = vec![
-            0x002f, // TLS_RSA_WITH_AES_128_CBC_SHA
-            0x0035, // TLS_RSA_WITH_AES_256_CBC_SHA
-            0x003c, // TLS_RSA_WITH_AES_128_CBC_SHA256
-            0x003d, // TLS_RSA_WITH_AES_256_CBC_SHA256
-        ];
-
-        client_hello_body.push((cipher_suites.len() * 2) as u8);
-        for suite in cipher_suites {
-            client_hello_body.extend_from_slice(&suite.to_be_bytes());
-        }
-
-        client_hello_body.push(1);
-        client_hello_body.push(0);
-        
-        let mut extensions = Vec::new();
-        let mut sni_ext = Vec::new();
-        sni_ext.extend_from_slice(&[0x00, 0x00]);
-        
-        let host_bytes = host.as_bytes();
-        let sni_data_len = 5 + host_bytes.len();
-        sni_ext.extend_from_slice(&(sni_data_len as u16).to_be_bytes());
-        sni_ext.extend_from_slice(&((sni_data_len - 2) as u16).to_be_bytes());
-        sni_ext.push(0);
-        sni_ext.extend_from_slice(&(host_bytes.len() as u16).to_be_bytes());
-        sni_ext.extend_from_slice(host_bytes);
-        extensions.extend_from_slice(&sni_ext);
-        
-        let mut alpn_ext = Vec::new();
-        alpn_ext.extend_from_slice(&[0x00, 0x10]);
-        let mut alpn_list = Vec::new();
-        for protocol in alpn_protocols {
-            let proto_name = protocol.name();
-            alpn_list.push(proto_name.len() as u8);
-            alpn_list.extend_from_slice(proto_name.as_bytes());
-        }
-
-        let alpn_data_len = alpn_list.len() + 2;
-        alpn_ext.extend_from_slice(&(alpn_data_len as u16).to_be_bytes());
-        alpn_ext.extend_from_slice(&(alpn_list.len() as u16).to_be_bytes());
-        alpn_ext.extend_from_slice(&alpn_list);
-        extensions.extend_from_slice(&alpn_ext);
-
-        let extensions_len = extensions.len() as u16;
-        client_hello_body.extend_from_slice(&extensions_len.to_be_bytes());
-        client_hello_body.extend_from_slice(&extensions);
-
-        let handshake_len = client_hello_body.len();
-        handshake.extend_from_slice(&handshake_len.to_be_bytes()[1..]);
-        handshake.extend_from_slice(&client_hello_body);
-
-        let record_len = handshake.len() as u16;
-        client_hello.extend_from_slice(&record_len.to_be_bytes());
-        client_hello.extend_from_slice(&handshake);
-
-        Ok(client_hello)
-    }
-
-    fn parse_server_hello_with_alpn(&self, _tls_stream: &mut TlsStream, buffer: &[u8], alpn_protocols: &[AlpnProtocol]) -> Result<(), HttpsError> {
-        if buffer.len() < 5 {
-            return Err(HttpsError::InvalidResponse(
-                "ServerHello too short".to_string(),
-            ));
-        }
-
-        let _content_type = buffer[0];
-        let _version = u16::from_be_bytes([buffer[1], buffer[2]]);
-        let record_len = u16::from_be_bytes([buffer[3], buffer[4]]);
-        if buffer.len() < 5 + record_len as usize {
-            return Err(HttpsError::InvalidResponse(
-                "ServerHello record truncated".to_string(),
-            ));
-        }
-
-        let record_data = &buffer[5..5 + record_len as usize];
-        if record_data.len() < 4 {
-            return Err(HttpsError::InvalidResponse(
-                "ServerHello handshake too short".to_string(),
-            ));
-        }
-
-        let _handshake_type = record_data[0];
-        let handshake_len = u32::from_be_bytes([0, record_data[1], record_data[2], record_data[3]]);
-        if record_data.len() < 4 + handshake_len as usize {
-            return Err(HttpsError::InvalidResponse(
-                "ServerHello handshake truncated".to_string(),
-            ));
-        }
-
-        let hello_data = &record_data[4..4 + handshake_len as usize];
-        let mut pos = 34;
-        if pos >= hello_data.len() {
-            return Err(HttpsError::InvalidResponse(
-                "ServerHello truncated at session ID".to_string(),
-            ));
-        }
-
-        let session_id_len = hello_data[pos] as usize;
-        pos += 1 + session_id_len;
-        pos += 2;
-        pos += 1;
-        if pos + 2 > hello_data.len() {
-            return Ok(());
-        }
-
-        let extensions_len = u16::from_be_bytes([hello_data[pos], hello_data[pos + 1]]) as usize;
-        pos += 2;
-        let extensions_end = pos + extensions_len;
-        while pos + 4 <= extensions_end && pos + 4 <= hello_data.len() {
-            let ext_type = u16::from_be_bytes([hello_data[pos], hello_data[pos + 1]]);
-            let ext_len = u16::from_be_bytes([hello_data[pos + 2], hello_data[pos + 3]]) as usize;
-            pos += 4;
-            if pos + ext_len > hello_data.len() {
-                break;
+        let authority = request_headers.get("host").map(|s| s.to_string()).unwrap_or_default();
+        header_map.insert(":authority".to_string(), authority);
+        for (name, values) in request_headers.iter() {
+            if name.starts_with(':') {
+                continue;
             }
 
-            if ext_type == 16 && ext_len >= 3 {
-                let alpn_data = &hello_data[pos..pos + ext_len];
-                let alpn_list_len = u16::from_be_bytes([alpn_data[0], alpn_data[1]]) as usize;
-                if alpn_list_len + 2 <= ext_len && alpn_list_len > 0 {
-                    let proto_len = alpn_data[2] as usize;
-                    if 3 + proto_len <= ext_len {
-                        let selected_proto = &alpn_data[3..3 + proto_len];
-                        let proto_str = String::from_utf8_lossy(selected_proto);
-                        for protocol in alpn_protocols {
-                            if protocol.name() == proto_str.as_ref() {
-                                return Ok(());
-                            }
-                        }
-                        
-                        return Err(HttpsError::ProtocolNegotiationFailed(
-                            format!("Server selected unsupported protocol: {}", proto_str),
-                        ));
-                    }
-                }
+            if values.is_empty() {
+                continue;
             }
 
-            pos += ext_len;
-        }
-
-        Ok(())
-    }
-
-    fn complete_tls_handshake(&self, tls_stream: &mut TlsStream) -> Result<(), HttpsError> {
-        let start_time = std::time::Instant::now();
-        let timeout = std::time::Duration::from_secs(30);
-        let mut buffer = vec![0u8; 16384];
-        let mut received_data = Vec::new();
-        let mut handshake_complete = false;
-
-        let mut received_encrypted_extensions = false;
-        let mut received_certificate = false;
-        let mut received_cert_verify = false;
-        let mut received_finished = false;
-        loop {
-            if start_time.elapsed() > timeout {
-                return Err(HttpsError::InvalidResponse(
-                    "TLS handshake timeout".to_string(),
-                ));
-            }
-
-            match tls_stream.read(&mut buffer) {
-                Ok(0) => {
-                    if !received_finished {
-                        return Err(HttpsError::InvalidResponse(
-                            "Server closed connection during TLS handshake".to_string(),
-                        ));
-                    }
-                    break;
-                }
-                Ok(n) => {
-                    received_data.extend_from_slice(&buffer[..n]);
-                    loop {
-                        if received_data.len() < 5 {
-                            break;
-                        }
-
-                        let content_type = received_data[0];
-                        let _tls_version = u16::from_be_bytes([received_data[1], received_data[2]]);
-                        let record_length =
-                            u16::from_be_bytes([received_data[3], received_data[4]]) as usize;
-
-                        if received_data.len() < 5 + record_length {
-                            break;
-                        }
-
-                        let record_payload = &received_data[5..5 + record_length];
-                        match content_type {
-                            22 => {
-                                if let Err(e) =
-                                    self.process_handshake_record(
-                                        record_payload,
-                                        tls_stream,
-                                        &mut received_encrypted_extensions,
-                                        &mut received_certificate,
-                                        &mut received_cert_verify,
-                                        &mut received_finished,
-                                    )
-                                {
-                                    return Err(HttpsError::InvalidResponse(format!(
-                                        "Handshake record error: {}",
-                                        e
-                                    )));
-                                }
-                            }
-                            23 => {
-                                return Err(HttpsError::InvalidResponse(
-                                    "Received application data during handshake".to_string(),
-                                ));
-                            }
-                            21 => {
-                                if record_payload.len() >= 2 {
-                                    let level = record_payload[0];
-                                    let description = record_payload[1];
-                                    return Err(HttpsError::InvalidResponse(format!(
-                                        "TLS Alert - Level: {}, Description: {}",
-                                        level, description
-                                    )));
-                                }
-                            }
-                            20 => {
-                                // ChangeCipherSpec (TLS 1.2) - skip in TLS 1.3
-                            }
-                            _ => {
-                                return Err(HttpsError::InvalidResponse(format!(
-                                    "Unknown TLS content type: {}",
-                                    content_type
-                                )));
-                            }
-                        }
-
-                        received_data.drain(..5 + record_length);
-                        if received_encrypted_extensions
-                            && received_finished
-                            && !received_certificate
-                        {
-                            handshake_complete = true;
-                            break;
-                        } else if received_encrypted_extensions
-                            && received_certificate
-                            && received_cert_verify
-                            && received_finished
-                        {
-                            handshake_complete = true;
-                            break;
-                        }
-                    }
-
-                    if handshake_complete {
-                        break;
-                    }
-                }
-                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock
-                    || e.kind() == std::io::ErrorKind::TimedOut =>
-                {
-                    std::thread::sleep(std::time::Duration::from_millis(10));
-                    continue;
-                }
-                Err(e) => {
-                    return Err(HttpsError::Io(e));
-                }
+            if values.len() == 1 {
+                header_map.insert(name.clone(), values[0].clone());
+            } else {
+                header_map.insert(name.clone(), values.join(", "));
             }
         }
 
-        self.send_client_finished(tls_stream)?;
-
-        Ok(())
-    }
-
-    fn build_client_key_exchange(&self) -> Result<Vec<u8>, HttpsError> {
-        let mut pms = vec![0x03, 0x03];
-        for i in 2..48 {
-            pms.push((i as u8).wrapping_mul(13));
+        if !body_bytes.is_empty() {
+            header_map.insert("content-length".to_string(), body_bytes.len().to_string());
         }
 
-        let mut handshake = vec![16];
-        handshake.extend_from_slice(&(pms.len() as u32).to_be_bytes()[1..]);
-        handshake.extend_from_slice(&(pms.len() as u16).to_be_bytes());
-        handshake.extend_from_slice(&pms);
+        let mut encoder = HpackCodec::new(4096);
+        let header_block = encoder.encode(&header_map);
+        let timeout = self.cfg.timeout;
+        let (response_header_block, response_body) = {
+            let wrapper = self.tls_connections.get_mut(connection_key).ok_or_else(|| {
+                HttpsError::ConnectionFailed("Connection not found".to_string())
+            })?;
 
-        let mut record = vec![22, 0x03, 0x03];
-        record.extend_from_slice(&(handshake.len() as u16).to_be_bytes());
-        record.extend_from_slice(&handshake);
-
-        Ok(record)
-    }
-
-    fn build_finished_message(&self) -> Result<Vec<u8>, HttpsError> {
-        let finished_data = vec![0u8; 12];
-        let mut handshake = vec![20];
-        handshake.extend_from_slice(&(finished_data.len() as u32).to_be_bytes()[1..]);
-        handshake.extend_from_slice(&finished_data);
-
-        let mut record = vec![22, 0x03, 0x03];
-        record.extend_from_slice(&(handshake.len() as u16).to_be_bytes());
-        record.extend_from_slice(&handshake);
-
-        Ok(record)
-    }
-
-    fn process_handshake_record(&self, record_payload: &[u8], tls_stream: &mut TlsStream, received_encrypted_extensions: &mut bool, received_certificate: &mut bool, received_cert_verify: &mut bool, received_finished: &mut bool) -> Result<(), HttpsError> {
-        let mut pos = 0;
-        while pos < record_payload.len() {
-            if pos + 4 > record_payload.len() {
-                break;
+            if wrapper.protocol != Some(AlpnProtocol::Http2) {
+                return Err(HttpsError::ProtocolNegotiationFailed(format!(
+                    "Expected HTTP/2, got {:?}",
+                    wrapper.protocol
+                )));
             }
 
-            let msg_type = record_payload[pos];
-            let msg_length = u32::from_be_bytes([
-                0,
-                record_payload[pos + 1],
-                record_payload[pos + 2],
-                record_payload[pos + 3],
-            ]) as usize;
-
-            if pos + 4 + msg_length > record_payload.len() {
-                break;
+            if wrapper.http2_conn.is_none() {
+                wrapper.http2_conn = Some(Http2ConnectionWrapper {
+                    next_stream_id: 1,
+                    initialized: false,
+                });
             }
 
-            let msg_data = &record_payload[pos + 4..pos + 4 + msg_length];
-            match msg_type {
-                8 => {
-                    self.process_encrypted_extensions(msg_data)?;
-                    *received_encrypted_extensions = true;
-                }
-                11 => {
-                    self.process_certificate(msg_data, tls_stream)?;
-                    *received_certificate = true;
-                }
-                15 => {
-                    self.process_certificate_verify(msg_data)?;
-                    *received_cert_verify = true;
-                }
-                20 => {
-                    self.process_finished(msg_data)?;
-                    *received_finished = true;
-                }
-                4 => {
-                    self.process_new_session_ticket(msg_data)?;
-                }
-                _ => {
-                    eprintln!(
-                        "Warning: Unexpected handshake message type during completion: {}",
-                        msg_type
-                    );
-                }
+            let h2 = wrapper.http2_conn.as_mut().unwrap();
+            if !h2.initialized {
+                wrapper.stream.write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n").map_err(HttpsError::Io)?;
+                let settings_frame = Self::build_http2_frame(0x04, 0x00, 0, &[]);
+                wrapper.stream.write_all(&settings_frame).map_err(HttpsError::Io)?;
+                wrapper.stream.flush().map_err(HttpsError::Io)?;
+
+                h2.initialized = true;
             }
 
-            pos += 4 + msg_length;
-        }
+            let stream_id = h2.next_stream_id;
+            h2.next_stream_id += 2;
 
-        Ok(())
-    }
+            let end_stream_in_headers = body_bytes.is_empty();
+            let headers_flags = if end_stream_in_headers { 0x05 } else { 0x04 };
+            let headers_frame = Self::build_http2_frame(0x01, headers_flags, stream_id, &header_block);
 
-    fn process_encrypted_extensions(&self, data: &[u8]) -> Result<(), HttpsError> {
-        if data.len() < 2 {
-            return Err(HttpsError::InvalidResponse(
-                "EncryptedExtensions too short".to_string(),
-            ));
-        }
-
-        let extensions_len = u16::from_be_bytes([data[0], data[1]]) as usize;
-        if data.len() < 2 + extensions_len {
-            return Err(HttpsError::InvalidResponse(
-                "EncryptedExtensions truncated".to_string(),
-            ));
-        }
-
-        let mut pos = 2;
-        while pos + 4 <= 2 + extensions_len && pos + 4 <= data.len() {
-            let ext_type = u16::from_be_bytes([data[pos], data[pos + 1]]);
-            let ext_len = u16::from_be_bytes([data[pos + 2], data[pos + 3]]) as usize;
-            pos += 4;
-            if pos + ext_len > data.len() {
-                break;
+            wrapper.stream.write_all(&headers_frame).map_err(HttpsError::Io)?;
+            if !body_bytes.is_empty() {
+                let data_frame = Self::build_http2_frame(0x00, 0x01, stream_id, &body_bytes);
+                wrapper.stream.write_all(&data_frame).map_err(HttpsError::Io)?;
             }
 
-            eprintln!("EncryptedExtensions: type={}, len={}", ext_type, ext_len);
-            pos += ext_len;
-        }
+            wrapper.stream.flush().map_err(HttpsError::Io)?;
+            Self::read_http2_response_raw(&mut wrapper.stream, stream_id, timeout)?
+        };
 
-        Ok(())
+        self.parse_http2_response(&response_header_block, &response_body)
     }
 
-    fn process_certificate(&self, data: &[u8], tls_stream: &mut TlsStream) -> Result<(), HttpsError> {
-        if data.len() < 4 {
-            return Err(HttpsError::InvalidResponse(
-                "Certificate message too short".to_string(),
-            ));
-        }
-
-        let context_len = data[0] as usize;
-        if data.len() < 1 + context_len {
-            return Err(HttpsError::InvalidResponse(
-                "Certificate context truncated".to_string(),
-            ));
-        }
-
-        let mut pos = 1 + context_len;
-        if pos + 3 > data.len() {
-            return Err(HttpsError::InvalidResponse(
-                "Certificate list length truncated".to_string(),
-            ));
-        }
-
-        let cert_list_len = u32::from_be_bytes([0, data[pos], data[pos + 1], data[pos + 2]]) as usize;
-        pos += 3;
-        if pos + cert_list_len > data.len() {
-            return Err(HttpsError::InvalidResponse(
-                "Certificate list truncated".to_string(),
-            ));
-        }
-
-        if pos + 3 > data.len() {
-            return Err(HttpsError::InvalidResponse(
-                "Certificate length field truncated".to_string(),
-            ));
-        }
-
-        let cert_len = u32::from_be_bytes([0, data[pos], data[pos + 1], data[pos + 2]]) as usize;
-        pos += 3;
-        if pos + cert_len > data.len() {
-            return Err(HttpsError::InvalidResponse(
-                "Certificate data truncated".to_string(),
-            ));
-        }
-
-        let cert_der = &data[pos..pos + cert_len];
-        self.validate_peer_certificate(cert_der, tls_stream)?;
-
-        Ok(())
-    }
-
-    fn validate_peer_certificate(&self, cert_der: &[u8], tls_stream: &mut TlsStream) -> Result<(), HttpsError> {
-        if cert_der.len() < 10 {
-            return Err(HttpsError::InvalidResponse(
-                "Certificate too short - possible corruption".to_string(),
-            ));
-        }
-
-        if cert_der.len() > 16 * 1024 {
-            return Err(HttpsError::InvalidResponse(
-                format!("Certificate too large: {} bytes", cert_der.len()),
-            ));
-        }
-
-        let cert = Certificate::from_der(cert_der).map_err(|e| {
-            HttpsError::InvalidResponse(format!("Failed to parse certificate: {:?}", e))
+    fn parse_http1_response(&self, bytes: &[u8]) -> Result<HttpResponse, HttpsError> {
+        let response = HttpResponse::from_bytes(bytes).map_err(|e| {
+            HttpsError::InvalidResponse(format!("failed to parse HTTP/1 response: {}", e))
         })?;
 
-        if !cert.is_valid_at_current_time() {
-            let now = SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap()
-                .as_secs();
-            
-            return Err(HttpsError::InvalidResponse(format!(
-                "Certificate validity period check failed at timestamp: {}",
-                now
-            )));
-        }
+        self.maybe_decode_secure_response(response)
+    }
 
-        if let Some(sni_hostname) = &tls_stream.server_name {
-            if !cert.matches_hostname(sni_hostname) {
-                return Err(HttpsError::InvalidResponse(format!(
-                    "Certificate hostname mismatch: expected '{}', got '{:?}'",
-                    sni_hostname,
-                    cert.subject.common_name
-                )));
+    fn parse_http2_response(&self, header_block: &[u8], body: &[u8]) -> Result<HttpResponse, HttpsError> {
+        let mut decoder = HpackCodec::new(4096);
+        let decoded_headers = decoder.decode(header_block).map_err(|e| {
+            HttpsError::Http2Error(format!("HPACK decode failed: {}", e))
+        })?;
+
+        let mut status_code = 200u16;
+        let mut headers = HashMap::new();
+        for (name, value) in decoded_headers {
+            if name == ":status" {
+                status_code = value.parse::<u16>().map_err(|_| {
+                    HttpsError::InvalidResponse(format!("invalid HTTP/2 status code: {}", value))
+                })?;
+            } else if !name.starts_with(':') {
+                headers.insert(name, value);
             }
         }
 
-        if self.cfg.tls_cfg.verify_peer && !self.cfg.tls_cfg.ca_certs.is_empty() {
-            let mut verified = false;
-            let mut last_error = None;
-            for ca_cert in &self.cfg.tls_cfg.ca_certs {
-                match cert.verify_signature(ca_cert) {
-                    Ok(_) => {
-                        verified = true;
-                        eprintln!(
-                            "Certificate chain verified against CA: {:?}",
-                            ca_cert.subject.common_name
-                        );
+        let reason = HttpResponse::default_reason_phrase(status_code);
+        let wire = build_synthetic_http1_response(status_code, &reason, &headers, body);
+        let parsed = HttpResponse::from_bytes(&wire).map_err(|e| {
+            HttpsError::InvalidResponse(format!("failed to parse synthesized HTTP/2 response: {}", e))
+        })?;
 
-                        break;
-                    }
-                    Err(e) => {
-                        last_error = Some(format!("{:?}", e));
-                        continue;
-                    }
-                }
-            }
+        let response = HttpResponse::new(
+            parsed.status_code(),
+            parsed.reason_phrase().to_string(),
+            HttpVersion::Http2,
+            parsed.headers().clone(),
+            parsed.body().to_vec(),
+        );
 
-            if !verified {
-                return Err(HttpsError::InvalidResponse(format!(
-                    "Certificate chain verification failed. Last error: {}",
-                    last_error.unwrap_or_else(|| "Unknown error".to_string())
-                )));
-            }
-        } else if self.cfg.tls_cfg.verify_peer {
-            return Err(HttpsError::InvalidResponse(
-                "Certificate verification required but no CA certificates configured".to_string(),
-            ));
+        self.maybe_decode_secure_response(response)
+    }
+
+    fn maybe_decode_secure_response(&self, response: HttpResponse) -> Result<HttpResponse, HttpsError> {
+        self.verify_optional_response_integrity(&response)?;
+
+        let mut headers = response.headers().clone();
+        let secure_marker = map_get_case_insensitive(&headers, "x-singularity-secure-envelope").unwrap_or_default();
+        if !is_truthy_header(&secure_marker) {
+            return Ok(response);
         }
 
-        if let Err(e) = self.validate_certificate_extensions(&cert) {
-            return Err(HttpsError::InvalidResponse(format!(
-                "Certificate extension validation failed: {}",
-                e
-            )));
-        }
+        let (_, payload) = decode_secure_https_payload(response.body()).map_err(|e| {
+            HttpsError::InvalidResponse(format!("failed to decode secure envelope: {}", e))
+        })?;
 
-        if let Some(public_key) = cert.public_key() {
-            if public_key.len() < 128 {
+        map_remove_case_insensitive(&mut headers, "x-singularity-secure-envelope");
+        map_remove_case_insensitive(&mut headers, "content-encoding");
+        headers.insert("content-length".to_string(), payload.len().to_string());
+
+        Ok(HttpResponse::new(
+            response.status_code(),
+            response.reason_phrase().to_string(),
+            response.version(),
+            headers,
+            payload,
+        ))
+    }
+
+    fn verify_optional_response_integrity(&self, response: &HttpResponse) -> Result<(), HttpsError> {
+        let headers = response.headers();
+        let Some(nonce_b64) = map_get_case_insensitive(headers, "x-singularity-response-nonce") else {
+            return Ok(());
+        };
+
+        let Some(tag_header) = map_get_case_insensitive(headers, "x-singularity-response-tag") else {
+            return Ok(());
+        };
+
+        let nonce = pem::decode(&nonce_b64).map_err(|e| {
+            HttpsError::InvalidResponse(format!("invalid response nonce encoding: {}", e))
+        })?;
+
+        let expected_tag = decode_hmac_header_value(&tag_header).map_err(|e| {
+            HttpsError::InvalidResponse(e)
+        })?;
+
+        let computed_tag = compute_payload_tag(HTTPS_CLIENT_RESPONSE_TAG_CONTEXT.as_bytes(), &nonce, response.body());
+        if !constant_time_eq(&computed_tag, &expected_tag) {
+            if self.cfg.enforce_response_integrity {
                 return Err(HttpsError::InvalidResponse(
-                    "Certificate public key too weak (minimum 1024-bit RSA required)".to_string(),
+                    "response integrity verification failed".to_string(),
                 ));
             }
-
-            if public_key.len() < 256 {
-                eprintln!(
-                    "Warning: Certificate uses weak public key (< 2048-bit RSA). \
-                     This is deprecated and may be rejected in future versions."
-                );
-            }
-        } else {
-            return Err(HttpsError::InvalidResponse(
-                "Certificate missing public key".to_string(),
-            ));
         }
-
-        if cert.is_ca() {
-            eprintln!(
-                "Warning: Peer presented a CA certificate as end-entity certificate. \
-                 This may indicate misconfiguration."
-            );
-        }
-
-        match cert.serial_number() {
-            Ok(serial) => {
-                if serial.is_empty() {
-                    return Err(HttpsError::InvalidResponse(
-                        "Certificate has empty serial number".to_string(),
-                    ));
-                }
-
-                eprintln!("Certificate serial: {:02x?}", serial);
-            }
-            Err(e) => {
-                return Err(HttpsError::InvalidResponse(format!(
-                    "Failed to read certificate serial number: {:?}",
-                    e
-                )));
-            }
-        }
-
-        match cert.get_subject_alt_names() {
-            Ok(sans) => {
-                if !sans.is_empty() {
-                    eprintln!("Certificate SANs: {:?}", sans);
-                } else {
-                    eprintln!("Certificate has no Subject Alternative Names");
-                }
-            }
-            Err(_) => {
-                eprintln!("No Subject Alternative Names extension found");
-            }
-        }
-
-        eprintln!(
-            "Peer certificate validated successfully: {} bytes, CN={:?}",
-            cert_der.len(),
-            cert.subject.common_name
-        );
 
         Ok(())
     }
 
-    fn validate_certificate_extensions(&self, cert: &Certificate) -> Result<(), HttpsError> {
-        let mut decoder = DerDecoder::new(&cert.tbs);
-        decoder.sequence(|tbs| {
-            let _ = tbs.optional_context_specific(0, |v| v.integer());
-            let _ = tbs.integer()?;
-            let _ = tbs.sequence(|_| Ok(()))?;
-            let _ = tbs.set(|_| Ok(()))?;
-            let _ = tbs.sequence(|_| Ok(()))?;
-            let _ = tbs.set(|_| Ok(()))?;
-            let _ = tbs.sequence(|_| Ok(()))?;
-            if let Ok(_) = tbs.optional_context_specific(3, |ext_seq| {
-                ext_seq.sequence(|exts| {
-                    while exts.has_more() {
-                        let _ = exts.sequence(|ext| {
-                            let oid = ext.object_identifier()?;
-                            let critical = ext.boolean().unwrap_or(false);
-                            if oid == vec![2, 5, 29, 15] {
-                                eprintln!("Found KeyUsage extension (critical: {})", critical);
-                            }
-                            if oid == vec![2, 5, 29, 37] {
-                                eprintln!("Found ExtendedKeyUsage extension (critical: {})", critical);
-                            }
-                            if oid == vec![2, 5, 29, 17] {
-                                eprintln!("Found SubjectAltName extension (critical: {})", critical);
-                            }
-
-                            Ok(())
-                        })?;
-                    }
-
-                    Ok(())
-                })
-            }) {
-                eprintln!("Certificate contains extensions");
-            }
-
-            Ok(())
-        })
-        .map_err(|e| HttpsError::InvalidResponse(format!("Extension parsing error: {:?}", e)))
-    }
-
-    fn check_certificate_revocation(&self, cert: &Certificate) -> Result<(), HttpsError> {
-        if !self.cfg.tls_cfg.verify_peer {
+    fn apply_outbound_security(&self, headers: &mut Headers, body: &mut Vec<u8>) -> Result<(), HttpsError> {
+        if body.is_empty() {
             return Ok(());
         }
 
-        match self.check_ocsp_status(cert) {
-            Ok(()) => {
-                eprintln!("✓ Certificate revocation status verified via OCSP");
-                return Ok(());
-            }
-            Err(e) => {
-                eprintln!("OCSP check failed: {}, falling back to CRL", e);
+        let digest = sha256(body);
+        headers.insert("Digest", format!("SHA-256={}", pem::encode(&digest)));
+        if self.cfg.enable_secure_envelopes && body.len() >= self.cfg.request_compression_min_size {
+            let accept_encoding = headers.get("accept-encoding").unwrap_or("identity");
+            let (_, secure_blob) = encode_secure_https_payload_auto(body, accept_encoding).map_err(|e| {
+                HttpsError::InvalidResponse(format!("secure envelope encode failed: {}", e))
+            })?;
+
+            *body = secure_blob;
+            headers.insert("X-Singularity-Secure-Envelope", "v1");
+            headers.insert("Content-Type", "application/x-singularity-secure-envelope");
+            headers.insert("Content-Encoding", "identity");
+        } else if self.cfg.preferred_request_compression != CompressionAlgorithm::Identity && self.cfg.preferred_request_compression.is_implemented() && body.len() >= self.cfg.request_compression_min_size {
+            let compressed = compression::compress(
+                self.cfg.preferred_request_compression,
+                body,
+                self.cfg.request_compression_level,
+            ).map_err(HttpsError::Io)?;
+
+            if compressed.len() < body.len() {
+                *body = compressed;
+                headers.insert(
+                    "Content-Encoding",
+                    self.cfg.preferred_request_compression.content_encoding(),
+                );
             }
         }
 
-        match self.check_crl_status(cert) {
-            Ok(()) => {
-                eprintln!("✓ Certificate revocation status verified via CRL");
-                return Ok(());
-            }
-            Err(e) => {
-                eprintln!("CRL check failed: {}", e);
-                eprintln!("Warning: Could not verify certificate revocation status");
-                return Ok(());
-            }
-        }
-    }
+        let nonce = random::generate_random(16).map_err(|e| {
+            HttpsError::InvalidResponse(format!("request nonce generation failed: {}", e))
+        })?;
 
-    fn check_ocsp_status(&self, cert: &Certificate) -> Result<(), HttpsError> {
-        let ocsp_url = self.extract_ocsp_url(cert)?;
-        let ocsp_request = self.build_ocsp_request(cert)?;
-        let response = self.send_ocsp_request(&ocsp_url, &ocsp_request)?;
-        self.parse_ocsp_response(&response, cert)?;
+        let tag = compute_payload_tag(HTTPS_CLIENT_REQUEST_TAG_CONTEXT.as_bytes(), &nonce, body);
+
+        headers.insert("X-Singularity-Request-Nonce", pem::encode(&nonce));
+        headers.insert("X-Singularity-Request-Tag", format!("HMAC-SHA-256={}", pem::encode(&tag)));
+        headers.insert("Content-Length", body.len().to_string());
 
         Ok(())
-    }
-
-    fn extract_ocsp_url(&self, cert: &Certificate) -> Result<String, HttpsError> {
-        let mut decoder = DerDecoder::new(&cert.tbs);
-        let mut ocsp_url = None;
-        let _ = decoder.sequence(|tbs| {
-            let _ = tbs.optional_context_specific(0, |v| v.integer());
-            let _ = tbs.integer()?;
-            let _ = tbs.sequence(|_| Ok(()))?;
-            let _ = tbs.sequence(|_| Ok(()))?;
-            let _ = tbs.sequence(|_| Ok(()))?;
-            let _ = tbs.sequence(|_| Ok(()))?;
-            let _ = tbs.sequence(|_| Ok(()))?;
-            tbs.optional_context_specific(3, |ext_seq| {
-                ext_seq.sequence(|exts| {
-                    while exts.has_more() {
-                        let _ = exts.sequence(|ext| {
-                            let oid = ext.object_identifier()?;
-                            let _critical = ext.boolean().unwrap_or(false);
-                            let value = ext.octet_string()?; 
-                            if oid == vec![1, 3, 6, 1, 5, 5, 7, 1, 1] {
-                                let mut aia_decoder = DerDecoder::new(&value);
-                                aia_decoder.sequence(|aia_seq| {
-                                    while aia_seq.has_more() {
-                                        let _ = aia_seq.sequence(|access_desc| {
-                                            let method = access_desc.object_identifier()?;
-                                            if method == vec![1, 3, 6, 1, 5, 5, 7, 48, 1] {
-                                                if let Ok(url) = access_desc.context_specific(6, |ctx| {
-                                                    let bytes = ctx.read_bytes(ctx.data.len())?;
-                                                    String::from_utf8(bytes)
-                                                        .map_err(|_| crate::crypto::Error::InvalidData("Invalid UTF-8 in URL".to_string()))
-                                                }) {
-                                                    ocsp_url = Some(url);
-                                                }
-                                            }
-
-                                            Ok(())
-                                        })?;
-                                    }
-
-                                    Ok(())
-                                })?;
-                            }
-
-                            Ok(())
-                        })?;
-                    }
-
-                    Ok(())
-                })
-            })
-        });
-
-        ocsp_url.ok_or_else(|| HttpsError::InvalidResponse(
-            "No OCSP responder URL found in certificate".to_string(),
-        ))
-    }
-
-    fn build_ocsp_request(&self, cert: &Certificate) -> Result<Vec<u8>, HttpsError> {
-        let mut encoder = DerEncoder::new();
-
-        let (issuer_name_hash, issuer_key_hash) = 
-            self.compute_issuer_hashes(cert)?;
-
-        let serial = cert.serial_number()
-            .map_err(|e| HttpsError::InvalidResponse(format!("Failed to get serial: {:?}", e)))?;
-
-        // OCSPRequest ::= SEQUENCE {
-        //   tbsRequest      TBSRequest,
-        //   optionalSignature [0] EXPLICIT Signature OPTIONAL
-        // }
-        encoder.sequence(|ocsp_req| {
-            // TBSRequest ::= SEQUENCE {
-            //   version             [0]  EXPLICIT Version DEFAULT v1,
-            //   requestorName       [1]  EXPLICIT GeneralName OPTIONAL,
-            //   requestList         SEQUENCE OF Request
-            // }
-            ocsp_req.sequence(|tbs_req| {
-                tbs_req.sequence(|req_list| {
-                    // Request ::= SEQUENCE {
-                    //   reqCert                  CertID,
-                    //   singleRequestExtensions  [0] EXPLICIT Extensions OPTIONAL
-                    // }
-                    req_list.sequence(|request| {
-                        // CertID ::= SEQUENCE {
-                        //   hashAlgorithm       AlgorithmIdentifier,
-                        //   issuerNameHash      OCTET STRING,
-                        //   issuerKeyHash       OCTET STRING,
-                        //   serialNumber        INTEGER
-                        // }
-                        request.sequence(|cert_id| {
-                            cert_id.sequence(|alg| {
-                                let _ = alg.object_identifier(&[1, 3, 14, 3, 2, 26]);
-                                let _ = alg.null();
-                            });
-
-                            cert_id.octet_string(&issuer_name_hash);
-                            cert_id.octet_string(&issuer_key_hash);
-                            cert_id.integer(&serial);
-                            
-                        });
-                    });
-                });
-            });
-        });
-
-        Ok(encoder.finish())
-    }
-
-    fn compute_issuer_hashes(&self, cert: &Certificate) -> Result<(Vec<u8>, Vec<u8>), HttpsError> {
-        let mut decoder = DerDecoder::new(&cert.tbs);
-        let (issuer_der, issuer_spki_der) = decoder.sequence(|tbs| {
-            let _ = tbs.optional_context_specific(0, |v| v.integer());
-            let _ = tbs.integer()?;
-            let _ = tbs.sequence(|_| Ok(()))?;
-            
-            let issuer_start = tbs.get_pos();
-            let _ = tbs.sequence(|_| Ok(()))?;
-            let issuer_end = tbs.get_pos();
-            let issuer_bytes = tbs.data[issuer_start..issuer_end].to_vec();
-
-            let _ = tbs.sequence(|_| Ok(()))?;
-            let _ = tbs.sequence(|_| Ok(()))?;
-            
-            let spki_start = tbs.get_pos();
-            let _ = tbs.sequence(|_| Ok(()))?;
-            let spki_end = tbs.get_pos();
-            let spki_bytes = tbs.data[spki_start..spki_end].to_vec();
-            
-            Ok((issuer_bytes, spki_bytes))
-        })
-        .map_err(|e| HttpsError::InvalidResponse(
-            format!("Failed to parse certificate for issuer info: {:?}", e)
-        ))?;
-
-        let issuer_name_hash = sha1(&issuer_der).to_vec();
-        let issuer_key_hash = self.extract_public_key_hash(&issuer_spki_der)?;
-
-        Ok((issuer_name_hash, issuer_key_hash))
-    }
-
-    fn extract_public_key_hash(&self, spki_der: &[u8]) -> Result<Vec<u8>, HttpsError> {
-        let mut decoder = DerDecoder::new(spki_der);
-        let public_key_bits = decoder.sequence(|spki| {
-            let _ = spki.sequence(|_| Ok(()))?;
-            spki.bit_string()
-        }).map_err(|e| HttpsError::InvalidResponse(
-            format!("Failed to parse SubjectPublicKeyInfo: {:?}", e)
-        ))?;
-
-        let key_hash = sha1(&public_key_bits.0).to_vec();
-        Ok(key_hash)
-    }
-
-    fn compute_issuer_hashes_from_ca(&self, cert: &Certificate) -> Result<(Vec<u8>, Vec<u8>), HttpsError> {
-        let issuer_cert = self.find_issuer_cert(cert)?;
-        let issuer_name_hash = self.hash_distinguished_name(&issuer_cert)?;
-        let issuer_key_hash = self.hash_public_key(&issuer_cert)?;
-
-        Ok((issuer_name_hash, issuer_key_hash))
-    }
-
-    fn find_issuer_cert(&self, cert: &Certificate) -> Result<&Certificate, HttpsError> {
-        for ca_cert in &self.cfg.tls_cfg.ca_certs {
-            if self.is_issuer(cert, ca_cert) {
-                return Ok(ca_cert);
-            }
-        }
-
-        Err(HttpsError::InvalidResponse(
-            "Could not find issuer CA certificate".to_string()
-        ))
-    }
-
-    fn is_issuer(&self, cert: &Certificate, ca_cert: &Certificate) -> bool {
-        let issuer_raw = match self.get_cert_issuer_raw(cert) {
-            Ok(raw) => raw,
-            Err(_) => return false,
-        };
-        
-        let subject_raw = match self.get_cert_subject_raw(ca_cert) {
-            Ok(raw) => raw,
-            Err(_) => return false,
-        };
-        
-        let issuer_matches = self.compare_distinguished_names(&issuer_raw, &subject_raw);
-        if !issuer_matches {
-            return false;
-        }
-        
-        if let (Ok(aki), Ok(ski)) = (cert.get_authority_key_identifier(), ca_cert.get_subject_key_identifier()) {
-            if !aki.is_empty() && !ski.is_empty() {
-                if aki != ski {
-                    eprintln!(
-                        "Warning: Authority Key Identifier mismatch - AKI: {:02x?}, SKI: {:02x?}",
-                        &aki[..aki.len().min(8)],
-                        &ski[..ski.len().min(8)]
-                    );
-
-                    return false;
-                }
-            }
-        }
-        
-        if !ca_cert.is_ca() {
-            eprintln!("Warning: Potential issuer is not a CA certificate");
-            return false;
-        }
-        
-        if let Ok(key_usage) = ca_cert.get_key_usage() {
-            const KEY_CERT_SIGN: u16 = 0x04;
-            if key_usage & KEY_CERT_SIGN == 0 {
-                eprintln!("Warning: CA certificate missing keyCertSign in KeyUsage");
-                return false;
-            }
-        }
-        
-        true
-    }
-
-    fn compare_distinguished_names(&self, dn1: &[u8], dn2: &[u8]) -> bool {
-        if dn1.len() != dn2.len() {
-            return false;
-        }
-
-        if dn1 == dn2 {
-            return true;
-        }
-        
-        match (self.parse_distinguished_name(dn1), self.parse_distinguished_name(dn2)) {
-            (Ok(components1), Ok(components2)) => {
-                self.compare_dn_components(&components1, &components2)
-            }
-            _ => false,
-        }
-    }
-
-    fn parse_distinguished_name(&self, dn_der: &[u8]) -> Result<Vec<(Vec<u32>, String)>, HttpsError> {
-        let mut decoder = DerDecoder::new(dn_der);
-        let mut components = Vec::new();
-        decoder.sequence(|dn_seq| {
-            while dn_seq.has_more() {
-                let _ = dn_seq.set(|rdn_set| {
-                    while rdn_set.has_more() {
-                        let _ = rdn_set.sequence(|attr_seq| {
-                            let oid = attr_seq.object_identifier()?;
-                            let value = if let Ok(s) = attr_seq.utf8_string() {
-                                s
-                            } else if let Ok(s) = attr_seq.printable_string() {
-                                s
-                            } else if let Ok(s) = attr_seq.ia5_string() {
-                                s
-                            } else if let Ok(bytes) = attr_seq.octet_string() {
-                                String::from_utf8_lossy(&bytes).to_string()
-                            } else {
-                                String::new()
-                            };
-                            
-                            let normalized = value.trim().to_lowercase();
-                            let oid_u32: Vec<u32> = oid.iter().map(|&x| x as u32).collect();
-                            components.push((oid_u32, normalized));
-                            
-                            Ok(())
-                        })?;
-                    }
-                    Ok(())
-                })?;
-            }
-            Ok(())
-        }).map_err(|e| HttpsError::InvalidResponse(
-            format!("Failed to parse Distinguished Name: {:?}", e)
-        ))?;
-        
-        Ok(components)
-    }
-
-    fn compare_dn_components(&self, components1: &[(Vec<u32>, String)], components2: &[(Vec<u32>, String)]) -> bool {
-        if components1.len() != components2.len() {
-            return false;
-        }
-        
-        for (oid1, value1) in components1 {
-            if let Some((_, value2)) = components2.iter().find(|(oid2, _)| oid1 == oid2) {
-                if value1 != value2 {
-                    eprintln!(
-                        "DN component mismatch for OID {:?}: '{}' != '{}'",
-                        oid1, value1, value2
-                    );
-                    return false;
-                }
-            } else {
-                eprintln!("DN missing component with OID {:?}", oid1);
-                return false;
-            }
-        }
-        
-        true
-    }
-
-    fn get_cert_issuer_raw(&self, cert: &Certificate) -> Result<Vec<u8>, HttpsError> {
-        let mut offset = 0;
-        let tbs_data = &cert.tbs;
-        if tbs_data[offset] != 0x30 {
-            return Err(HttpsError::InvalidResponse("Invalid TBS structure".to_string()));
-        }
-
-        offset += 1;
-        let (_, len_bytes) = Self::parse_der_length(&tbs_data[offset..])?;
-        offset += len_bytes;
-        if tbs_data[offset] == 0xA0 {
-            offset += 1;
-            let (len, len_bytes) = Self::parse_der_length(&tbs_data[offset..])?;
-            offset += len_bytes + len;
-        }
-        
-        if tbs_data[offset] != 0x02 {
-            return Err(HttpsError::InvalidResponse("Expected INTEGER for serial".to_string()));
-        }
-
-        offset += 1;
-        let (len, len_bytes) = Self::parse_der_length(&tbs_data[offset..])?;
-        offset += len_bytes + len;
-        if tbs_data[offset] != 0x30 {
-            return Err(HttpsError::InvalidResponse("Expected SEQUENCE for signature algorithm".to_string()));
-        }
-
-        offset += 1;
-        let (len, len_bytes) = Self::parse_der_length(&tbs_data[offset..])?;
-        offset += len_bytes + len;
-        if tbs_data[offset] != 0x30 {
-            return Err(HttpsError::InvalidResponse("Expected SEQUENCE for issuer".to_string()));
-        }
-
-        let issuer_start = offset;
-        offset += 1;
-        let (issuer_len, len_bytes) = Self::parse_der_length(&tbs_data[offset..])?;
-        offset += len_bytes;
-        let issuer_end = offset + issuer_len;
-        let issuer_bytes = tbs_data[issuer_start..issuer_end].to_vec();
-        
-        Ok(issuer_bytes)
-    }
-    
-    fn parse_der_length(data: &[u8]) -> Result<(usize, usize), HttpsError> {
-        if data.is_empty() {
-            return Err(HttpsError::InvalidResponse("Empty length field".to_string()));
-        }
-        
-        let first_byte = data[0];
-        if first_byte & 0x80 == 0 {
-            Ok((first_byte as usize, 1))
-        } else {
-            let num_bytes = (first_byte & 0x7F) as usize;
-            if num_bytes == 0 || num_bytes > 4 || data.len() < 1 + num_bytes {
-                return Err(HttpsError::InvalidResponse("Invalid length encoding".to_string()));
-            }
-            
-            let mut length = 0usize;
-            for i in 0..num_bytes {
-                length = (length << 8) | (data[1 + i] as usize);
-            }
-            
-            Ok((length, 1 + num_bytes))
-        }
-    }
-
-    fn get_cert_subject_raw(&self, cert: &Certificate) -> Result<Vec<u8>, HttpsError> {
-        let mut offset = 0;
-        let tbs_data = &cert.tbs;
-        if tbs_data[offset] != 0x30 {
-            return Err(HttpsError::InvalidResponse("Invalid TBS structure".to_string()));
-        }
-
-        offset += 1;
-        let (_, len_bytes) = Self::parse_der_length(&tbs_data[offset..])?;
-        offset += len_bytes;
-        if tbs_data[offset] == 0xA0 {
-            offset += 1;
-            let (len, len_bytes) = Self::parse_der_length(&tbs_data[offset..])?;
-            offset += len_bytes + len;
-        }
-        
-        if tbs_data[offset] != 0x02 {
-            return Err(HttpsError::InvalidResponse("Expected INTEGER for serial".to_string()));
-        }
-
-        offset += 1;
-        let (len, len_bytes) = Self::parse_der_length(&tbs_data[offset..])?;
-        offset += len_bytes + len;
-
-        if tbs_data[offset] != 0x30 {
-            return Err(HttpsError::InvalidResponse("Expected SEQUENCE for signature algorithm".to_string()));
-        }
-        
-        offset += 1;
-        let (len, len_bytes) = Self::parse_der_length(&tbs_data[offset..])?;
-        offset += len_bytes + len;
-        if tbs_data[offset] != 0x30 {
-            return Err(HttpsError::InvalidResponse("Expected SEQUENCE for issuer".to_string()));
-        }
-
-        offset += 1;
-        let (len, len_bytes) = Self::parse_der_length(&tbs_data[offset..])?;
-        offset += len_bytes + len;
-        if tbs_data[offset] != 0x30 {
-            return Err(HttpsError::InvalidResponse("Expected SEQUENCE for validity".to_string()));
-        }
-
-        offset += 1;
-        let (len, len_bytes) = Self::parse_der_length(&tbs_data[offset..])?;
-        offset += len_bytes + len;
-        if tbs_data[offset] != 0x30 {
-            return Err(HttpsError::InvalidResponse("Expected SEQUENCE for subject".to_string()));
-        }
-
-        let subject_start = offset;
-        offset += 1;
-        let (subject_len, len_bytes) = Self::parse_der_length(&tbs_data[offset..])?;
-        offset += len_bytes;
-        let subject_end = offset + subject_len;
-        let subject_bytes = tbs_data[subject_start..subject_end].to_vec();
-        
-        Ok(subject_bytes)
-    }
-
-    fn hash_distinguished_name(&self, cert: &Certificate) -> Result<Vec<u8>, HttpsError> {
-        let subject_bytes = self.get_cert_subject_raw(cert)?;
-        Ok(sha1(&subject_bytes).to_vec())
-    }
-
-    fn hash_public_key(&self, cert: &Certificate) -> Result<Vec<u8>, HttpsError> {
-        if let Some(public_key) = cert.public_key() {
-            Ok(sha1(&public_key).to_vec())
-        } else {
-            Err(HttpsError::InvalidResponse(
-                "Certificate has no public key".to_string()
-            ))
-        }
-    }
-
-    fn send_ocsp_request(&self, url: &str, request: &[u8]) -> Result<Vec<u8>, HttpsError> {
-        let mut http_request = format!(
-            "POST {} HTTP/1.1\r\n\
-             Host: {}\r\n\
-             Content-Type: application/ocsp-request\r\n\
-             Content-Length: {}\r\n\
-             Accept: application/ocsp-response\r\n\
-             Connection: close\r\n\
-             \r\n",
-            url,
-            self.extract_host_from_url(url)?,
-            request.len()
-        ).into_bytes();
-
-        http_request.extend_from_slice(request);
-        let (host, port, _) = self.parse_url(url)?;
-        let mut stream = TcpStream::connect(format!("{}:{}", host, port))
-            .map_err(|e| HttpsError::Io(e))?;
-
-        stream.write_all(&http_request)
-            .map_err(|e| HttpsError::Io(e))?;
-
-        let mut response = Vec::new();
-        stream.read_to_end(&mut response)
-            .map_err(|e| HttpsError::Io(e))?;
-
-        if let Some(body_start) = response.windows(4).position(|w| w == b"\r\n\r\n") {
-            Ok(response[body_start + 4..].to_vec())
-        } else {
-            Err(HttpsError::InvalidResponse("Invalid OCSP response".to_string()))
-        }
-    }
-
-    fn parse_ocsp_response(&self, response: &[u8], cert: &Certificate) -> Result<(), HttpsError> {
-        let mut decoder = DerDecoder::new(response);
-
-        // OCSPResponse ::= SEQUENCE {
-        //   responseStatus  OCSPResponseStatus,
-        //   responseBytes   [0] EXPLICIT ResponseBytes OPTIONAL
-        // }
-        decoder.sequence(|resp| {
-            let status = resp.integer()?;
-
-            // OCSPResponseStatus values:
-            // successful (0), malformedRequest (1), internalError (2),
-            // tryLater (3), sigRequired (5), unauthorized (6)
-            let status_code = if !status.is_empty() {
-                status[status.len() - 1] as i32
-            } else {
-                0
-            };
-            
-            if status_code != 0 {
-                return Err(crate::crypto::Error::InvalidData(format!("OCSP response status: {}", status_code)));
-            }
-
-            let _ = resp.context_specific(0, |ctx| {
-                ctx.sequence(|bytes| {
-                    let _response_type = bytes.object_identifier()?;
-                    let response_value = bytes.octet_string()?;
-                    let mut basic_decoder = DerDecoder::new(&response_value);
-                    basic_decoder.sequence(|basic| {
-                        basic.sequence(|resp_data| {
-                            resp_data.sequence(|single_resp| {
-                                single_resp.sequence(|_cert_id| Ok(()))?;
-                                if let Ok(_) = single_resp.context_specific(1, |_decoder| Ok(())) {
-                                    return Err(crate::crypto::Error::InvalidData("Certificate is revoked".to_string()));
-                                }
-
-                                Ok(())
-                            })?;
-
-                            Ok(())
-                        })?;
-
-                        Ok(())
-                    })?;
-
-                    Ok(())
-                })
-            });
-
-            Ok(())
-        }).map_err(|e| HttpsError::InvalidResponse(e.to_string()))?;
-
-        Ok(())
-    }
-
-    fn check_crl_status(&self, cert: &Certificate) -> Result<(), HttpsError> {
-        let crl_url = self.extract_crl_url(cert)?;
-        let crl_data = self.download_crl(&crl_url)?;
-        self.check_cert_in_crl(cert, &crl_data)?;
-
-        Ok(())
-    }
-
-    fn extract_crl_url(&self, cert: &Certificate) -> Result<String, HttpsError> {
-        let mut decoder = DerDecoder::new(&cert.tbs);
-        let mut crl_url = None;
-        let _ = decoder.sequence(|tbs| {
-            let _ = tbs.optional_context_specific(0, |v| v.integer());
-            let _ = tbs.integer()?;
-            let _ = tbs.sequence(|_| Ok(()))?;
-            let _ = tbs.sequence(|_| Ok(()))?;
-            let _ = tbs.sequence(|_| Ok(()))?;
-            let _ = tbs.sequence(|_| Ok(()))?;
-            let _ = tbs.sequence(|_| Ok(()))?;
-            tbs.optional_context_specific(3, |ext_seq| {
-                ext_seq.sequence(|exts| {
-                    while exts.has_more() {
-                        let _ = exts.sequence(|ext| {
-                            let oid = ext.object_identifier()?;
-                            if oid == vec![2, 5, 29, 31] {
-                                let _critical = ext.boolean().unwrap_or(false);
-                                let value = ext.octet_string()?;
-                                let mut dp_decoder = DerDecoder::new(&value);
-                                dp_decoder.sequence(|dps| {
-                                    while dps.has_more() {
-                                        let _ = dps.sequence(|dp| {
-                                            dp.optional_context_specific(0, |dist_point| {
-                                                dist_point.context_specific(0, |name_ctx| {
-                                                    name_ctx.context_specific(6, |url_ctx| {
-                                                        let bytes = url_ctx.read_bytes(url_ctx.data.len())?;
-                                                        let url = String::from_utf8(bytes)
-                                                            .map_err(|_| crate::crypto::Error::InvalidData("Invalid UTF-8".to_string()))?;
-                                                        crl_url = Some(url.clone());
-                                                        Ok(url)
-                                                    })
-                                                })
-                                            })
-                                        })?;
-                                    }
-
-                                    Ok(())
-                                })?;
-                            }
-
-                            Ok(())
-                        })?;
-                    }
-
-                    Ok(())
-                })
-            })
-        });
-
-        crl_url.ok_or_else(|| HttpsError::InvalidResponse(
-            "No CRL distribution point found in certificate".to_string(),
-        ))
-    }
-
-    fn download_crl(&self, url: &str) -> Result<Vec<u8>, HttpsError> {
-        eprintln!("Downloading CRL from: {}", url);
-
-        let (host, port, path) = self.parse_url(url)?;
-
-        let mut stream = TcpStream::connect(format!("{}:{}", host, port))
-            .map_err(|e| HttpsError::Io(e))?;
-
-        let request = format!(
-            "GET {} HTTP/1.1\r\n\
-             Host: {}\r\n\
-             Connection: close\r\n\
-             \r\n",
-            path, host
-        );
-
-        stream.write_all(request.as_bytes())
-            .map_err(|e| HttpsError::Io(e))?;
-
-        let mut response = Vec::new();
-        stream.read_to_end(&mut response)
-            .map_err(|e| HttpsError::Io(e))?;
-
-        if let Some(body_start) = response.windows(4).position(|w| w == b"\r\n\r\n") {
-            Ok(response[body_start + 4..].to_vec())
-        } else {
-            Err(HttpsError::InvalidResponse("Invalid CRL response".to_string()))
-        }
-    }
-
-    fn check_cert_in_crl(&self, cert: &Certificate, crl_data: &[u8]) -> Result<(), HttpsError> {
-        let mut decoder = DerDecoder::new(crl_data);
-
-        let cert_serial = cert.serial_number()
-            .map_err(|e| HttpsError::InvalidResponse(format!("Failed to get serial: {:?}", e)))?;
-
-        decoder.sequence(|crl| {
-            crl.sequence(|tbs| {
-                let _ = tbs.optional_context_specific(0, |v| v.integer());
-                let _ = tbs.sequence(|_| Ok(()))?;
-                let _ = tbs.sequence(|_| Ok(()))?;
-                let _ = tbs.utc_time()?;
-                let revoked = tbs.optional_context_specific(0, |revoked_certs| {
-                    revoked_certs.sequence(|certs| {
-                        while certs.has_more() {
-                            certs.sequence(|revoked| {
-                                let serial = revoked.integer()?;
-                                if serial == cert_serial {
-                                    return Err(crate::crypto::Error::InvalidData(
-                                        "Certificate found in CRL - REVOKED".to_string()
-                                    ));
-                                }
-
-                                Ok(())
-                            })?;
-                        }
-
-                        Ok(())
-                    })
-                });
-
-                if let Err(e) = revoked {
-                    return Err(e);
-                }
-                
-                Ok(())
-            })
-        }).map_err(|e| HttpsError::InvalidResponse(format!("CRL check failed: {}", e)))?;
-
-        Ok(())
-    }
-
-    fn extract_host_from_url(&self, url: &str) -> Result<String, HttpsError> {
-        if let Some(start) = url.find("://") {
-            let rest = &url[start + 3..];
-            if let Some(end) = rest.find('/') {
-                Ok(rest[..end].to_string())
-            } else if let Some(end) = rest.find(':') {
-                Ok(rest[..end].to_string())
-            } else {
-                Ok(rest.to_string())
-            }
-        } else {
-            Err(HttpsError::InvalidUrl(format!("Invalid URL: {}", url)))
-        }
-    }
-
-    fn process_certificate_verify(&self, data: &[u8]) -> Result<(), HttpsError> {
-        if data.len() < 4 {
-            return Err(HttpsError::InvalidResponse(
-                "CertificateVerify too short".to_string(),
-            ));
-        }
-
-        let signature_alg = u16::from_be_bytes([data[0], data[1]]);
-        let signature_len = u16::from_be_bytes([data[2], data[3]]) as usize;
-        if data.len() < 4 + signature_len {
-            return Err(HttpsError::InvalidResponse(
-                "CertificateVerify signature truncated".to_string(),
-            ));
-        }
-
-        let alg_name = match signature_alg {
-            0x0804 => "rsa_pss_rsae_sha256",
-            0x0805 => "rsa_pss_rsae_sha384",
-            0x0806 => "rsa_pss_rsae_sha512",
-            0x0401 => "ecdsa_secp256r1_sha256",
-            0x0501 => "ecdsa_secp384r1_sha384",
-            0x0601 => "ecdsa_secp521r1_sha512",
-            _ => "unknown",
-        };
-
-        eprintln!(
-            "CertificateVerify: algorithm={} (0x{:04x}), signature_len={}",
-            alg_name, signature_alg, signature_len
-        );
-
-        Ok(())
-    }
-
-    fn process_finished(&self, data: &[u8]) -> Result<(), HttpsError> {
-        if data.len() < 32 {
-            return Err(HttpsError::InvalidResponse(
-                "Finished message too short".to_string(),
-            ));
-        }
-
-        eprintln!(
-            "Received Finished message: {} bytes",
-            data.len()
-        );
-
-        Ok(())
-    }
-
-    fn process_new_session_ticket(&self, data: &[u8]) -> Result<(), HttpsError> {
-        if data.len() < 8 {
-            return Err(HttpsError::InvalidResponse(
-                "NewSessionTicket too short".to_string(),
-            ));
-        }
-
-        let lifetime = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
-        let age_add = u32::from_be_bytes([data[4], data[5], data[6], data[7]]);
-        eprintln!(
-            "NewSessionTicket: lifetime={} seconds, age_add={}",
-            lifetime, age_add
-        );
-
-        Ok(())
-    }
-
-    fn send_client_finished(&self, tls_stream: &mut TlsStream) -> Result<(), HttpsError> {
-        let finished_data = vec![0u8; 32];
-        let mut handshake_msg = vec![20];
-        handshake_msg.extend_from_slice(&(finished_data.len() as u32).to_be_bytes()[1..]);
-        handshake_msg.extend_from_slice(&finished_data);
-
-        let mut record = vec![22, 0x03, 0x03];
-        record.extend_from_slice(&(handshake_msg.len() as u16).to_be_bytes());
-        record.extend_from_slice(&handshake_msg);
-
-        tls_stream
-            .write_all(&record)
-            .map_err(|e| HttpsError::Io(e))?;
-
-        tls_stream.flush().map_err(|e| HttpsError::Io(e))?;
-
-        eprintln!("Sent client Finished message");
-
-        Ok(())
-    }
-
-    fn send_http1_request(&mut self, connection_key: &str, method: HttpMethod, path: &str, request_headers: Headers, body: Option<Vec<u8>>) -> Result<HttpResponse, HttpsError> {
-        let wrapper = self.tls_connections.get_mut(connection_key)
-            .ok_or_else(|| HttpsError::ConnectionFailed("Connection not found".to_string()))?;
-
-        let mut request_line = format!("{} {} HTTP/1.1\r\n", method.as_str(), path);
-        for (name, values) in request_headers.iter() {
-            for value in values {
-                request_line.push_str(&format!("{}: {}\r\n", name, value));
-            }
-        }
-
-        request_line.push_str("\r\n");
-        let mut request_bytes = request_line.into_bytes();
-        if let Some(b) = &body {
-            request_bytes.extend_from_slice(b);
-        }
-
-        wrapper.stream.write_all(&request_bytes)
-            .map_err(|e| HttpsError::Io(e))?;
-        wrapper.stream.flush()
-            .map_err(|e| HttpsError::Io(e))?;
-
-        let http_stream = unsafe { &mut *(&mut wrapper.stream as *mut TlsStream) };
-        self.read_http1_response(http_stream)
-    }
-
-    fn send_http2_request(&mut self, connection_key: &str, method: HttpMethod, path: &str, request_headers: Headers, body: Option<Vec<u8>>) -> Result<HttpResponse, HttpsError> {
-        let settings_frame = self.build_settings_frame();
-        
-        let wrapper = self.tls_connections.get_mut(connection_key)
-            .ok_or_else(|| HttpsError::ConnectionFailed("Connection not found".to_string()))?;
-
-        if wrapper.protocol != Some(AlpnProtocol::Http2) {
-            return Err(HttpsError::ProtocolNegotiationFailed(
-                format!("Expected HTTP/2, got {:?}", wrapper.protocol)
-            ));
-        }
-
-        if wrapper.http2_conn.is_none() {
-            let preface = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
-            wrapper.stream.write_all(preface)
-                .map_err(|e| HttpsError::Io(e))?;
-
-            wrapper.stream.write_all(&settings_frame)
-                .map_err(|e| HttpsError::Io(e))?;
-            wrapper.stream.flush()
-                .map_err(|e| HttpsError::Io(e))?;
-
-            wrapper.http2_conn = Some(Http2ConnectionWrapper {
-                next_stream_id: 1,
-                negotiated: true,
-                max_concurrent_streams: u32::MAX,
-                active_streams: HashMap::new(),
-            });
-        }
-
-        let http2_conn = wrapper.http2_conn.as_mut()
-            .ok_or_else(|| HttpsError::Http2Error("HTTP/2 not initialized".to_string()))?;
-        
-        let stream_id = http2_conn.next_stream_id;
-        http2_conn.next_stream_id += 2;
-
-        let mut h2_headers = vec![
-            (":method".to_string(), method.as_str().to_string()),
-            (":path".to_string(), path.to_string()),
-            (":scheme".to_string(), "https".to_string()),
-            (":authority".to_string(), request_headers.get("host").unwrap_or("").to_string()),
-        ];
-
-        for (name, values) in request_headers.iter() {
-            if !name.starts_with(':') && name.to_lowercase() != "host" {
-                for value in values {
-                    h2_headers.push((name.clone(), value.clone()));
-                }
-            }
-        }
-
-        let encoded_headers = self.encode_http2_headers(&h2_headers);
-        let has_body = body.is_some();
-        let headers_frame = self.build_headers_frame(stream_id, &encoded_headers, !has_body);
-        
-        let data_frame = if let Some(ref body_data) = body {
-            self.build_data_frame(stream_id, body_data, true)
-        } else {
-            Vec::new()
-        };
-        
-        let wrapper = self.tls_connections.get_mut(connection_key)
-            .ok_or_else(|| HttpsError::ConnectionFailed("Connection not found".to_string()))?;
-
-        wrapper.stream.write_all(&headers_frame)
-            .map_err(|e| HttpsError::Io(e))?;
-
-        if !data_frame.is_empty() {
-            wrapper.stream.write_all(&data_frame)
-                .map_err(|e| HttpsError::Io(e))?;
-        }
-
-        wrapper.stream.flush()
-            .map_err(|e| HttpsError::Io(e))?;
-
-        let http_stream = unsafe { &mut *(&mut wrapper.stream as *mut TlsStream) };
-        self.read_http2_response(http_stream, stream_id)
-    }
-
-    fn build_settings_frame(&self) -> Vec<u8> {
-        let frame = vec![
-            0x00, 0x00, 0x00, // Length: 0
-            0x04,             // Type: SETTINGS
-            0x00,             // Flags
-            0x00, 0x00, 0x00, 0x00, // Stream ID: 0
-        ];
-        frame
-    }
-
-    fn build_headers_frame(&mut self, stream_id: u32, headers: &[u8], end_stream: bool) -> Vec<u8> {
-        let length = headers.len() as u32;
-        let mut flags = 0x04;
-        if end_stream {
-            flags |= 0x01;
-        }
-
-        let mut frame = Vec::new();
-        frame.extend_from_slice(&length.to_be_bytes()[1..]);
-        frame.push(0x01);
-        frame.push(flags);
-        let sid = (stream_id & 0x7FFFFFFF).to_be_bytes();
-        frame.extend_from_slice(&sid);
-        frame.extend_from_slice(headers);
-
-        frame
-    }
-
-    fn build_data_frame(&mut self, stream_id: u32, data: &[u8], end_stream: bool) -> Vec<u8> {
-        let length = data.len() as u32;
-        let flags = if end_stream { 0x01 } else { 0x00 };
-
-        let mut frame = Vec::new();
-        frame.extend_from_slice(&length.to_be_bytes()[1..]);
-        frame.push(0x00);
-        frame.push(flags);
-        let sid = (stream_id & 0x7FFFFFFF).to_be_bytes();
-        frame.extend_from_slice(&sid);
-        frame.extend_from_slice(data);
-
-        frame
-    }
-
-    fn encode_http2_headers(&mut self, headers: &[(String, String)]) -> Vec<u8> {
-        let mut headers_map = HashMap::new();
-        for (name, value) in headers {
-            headers_map.insert(name.clone(), value.clone());
-        }
-
-        let mut codec = HpackCodec::new(4096);
-        codec.encode(&headers_map)
-    }
-
-    fn encode_string(encoded: &mut Vec<u8>, s: &str) {
-        let bytes = s.as_bytes();
-        let len = bytes.len();
-        if len < 127 {
-            encoded.push(len as u8);
-        } else {
-            encoded.push(0x7F);
-            let mut remaining = len - 127;
-            while remaining >= 128 {
-                encoded.push((remaining % 128 + 128) as u8);
-                remaining /= 128;
-            }
-            encoded.push(remaining as u8);
-        }
-        
-        encoded.extend_from_slice(bytes);
-    }
-
-    fn read_http1_response(&mut self, stream: &mut TlsStream) -> Result<HttpResponse, HttpsError> {
-        let mut buffer = vec![0u8; 8192];
-        let bytes_read = stream.read(&mut buffer)
-            .map_err(|e| HttpsError::Io(e))?;
-
-        if bytes_read == 0 {
-            return Err(HttpsError::InvalidResponse("Empty response".to_string()));
-        }
-
-        buffer.truncate(bytes_read);
-
-        self.parse_http1_response(&buffer)
-    }
-
-    fn read_http2_response(&mut self, stream: &mut TlsStream, stream_id: u32) -> Result<HttpResponse, HttpsError> {
-        let mut buffer = vec![0u8; 16384];
-        let mut all_data = Vec::new();
-        let mut headers = HashMap::new();
-        let mut status_code: u16 = 200;
-        let mut response_complete = false;
-        loop {
-            let bytes_read = stream.read(&mut buffer)
-                .map_err(|e| HttpsError::Io(e))?;
-
-            if bytes_read == 0 {
-                break;
-            }
-
-            all_data.extend_from_slice(&buffer[..bytes_read]);
-            let mut pos = 0;
-            while pos + 9 <= all_data.len() {
-                let length = ((all_data[pos] as u32) << 16)
-                    | ((all_data[pos + 1] as u32) << 8)
-                    | (all_data[pos + 2] as u32);
-                
-                let frame_type = all_data[pos + 3];
-                let flags = all_data[pos + 4];
-                let stream_id_raw = u32::from_be_bytes([
-                    all_data[pos + 5],
-                    all_data[pos + 6],
-                    all_data[pos + 7],
-                    all_data[pos + 8],
-                ]);
-
-                let current_stream_id = stream_id_raw & 0x7FFFFFFF;
-                if pos + 9 + length as usize > all_data.len() {
-                    break;
-                }
-
-                let payload = all_data[pos + 9..pos + 9 + length as usize].to_vec();
-                if current_stream_id == stream_id {
-                    match frame_type {
-                        0x01 => {
-                            self.parse_http2_headers(&payload, &mut headers, &mut status_code)?;
-                            if flags & 0x01 != 0 {
-                                response_complete = true;
-                            }
-                        }
-                        0x00 => {
-                            all_data.extend_from_slice(&payload);
-                            if flags & 0x01 != 0 {
-                                response_complete = true;
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-
-                pos += 9 + length as usize;
-            }
-
-            if response_complete {
-                break;
-            }
-        }
-
-        let body = all_data.to_vec();
-
-        Ok(HttpResponse::new(
-            status_code,
-            "OK".to_string(),
-            HttpVersion::Http2,
-            headers,
-            body,
-        ))
-    }
-
-    fn parse_http2_headers(&mut self, payload: &[u8], headers: &mut HashMap<String, String>, status_code: &mut u16) -> Result<(), HttpsError> {
-        let mut codec = HpackCodec::new(4096);        
-        match codec.decode(payload) {
-            Ok(decoded_headers) => {
-                for (name, value) in decoded_headers {
-                    if name == ":status" {
-                        *status_code = value.parse::<u16>()
-                            .map_err(|_| HttpsError::InvalidResponse(
-                                format!("Invalid status code: {}", value)
-                            ))?;
-                    } else if !name.starts_with(':') {
-                        headers.insert(name, value);
-                    }
-                }
-
-                Ok(())
-            }
-            Err(e) => Err(HttpsError::Http2Error(
-                format!("HPACK decoding failed: {}", e)
-            ))
-        }
-    }
-
-    fn parse_http1_response(&mut self, data: &[u8]) -> Result<HttpResponse, HttpsError> {
-        let response_str = String::from_utf8_lossy(data);
-        let lines: Vec<&str> = response_str.split("\r\n").collect();
-
-        if lines.is_empty() {
-            return Err(HttpsError::InvalidResponse("No status line".to_string()));
-        }
-
-        let status_parts: Vec<&str> = lines[0].split_whitespace().collect();
-        if status_parts.len() < 2 {
-            return Err(HttpsError::InvalidResponse("Invalid status line".to_string()));
-        }
-
-        let status_code = status_parts[1].parse::<u16>()
-            .map_err(|_| HttpsError::InvalidResponse("Invalid status code".to_string()))?;
-
-        let reason_phrase = if status_parts.len() > 2 {
-            status_parts[2..].join(" ")
-        } else {
-            "".to_string()
-        };
-
-        let mut headers = HashMap::new();
-        let mut body_start = 0;
-        for (i, line) in lines.iter().enumerate().skip(1) {
-            if line.is_empty() {
-                body_start = i + 1;
-                break;
-            }
-
-            if let Some(colon_pos) = line.find(':') {
-                let key = line[..colon_pos].trim().to_lowercase();
-                let value = line[colon_pos + 1..].trim().to_string();
-                headers.insert(key, value);
-            }
-        }
-
-        let body = if body_start > 0 && body_start < lines.len() {
-            lines[body_start..].join("\r\n").into_bytes()
-        } else {
-            Vec::new()
-        };
-
-        let body = if headers.get("transfer-encoding").map(|v| v.as_str()) == Some("chunked") {
-            self.decode_chunked(&body)?
-        } else {
-            body
-        };
-
-        Ok(HttpResponse::new(
-            status_code,
-            reason_phrase,
-            HttpVersion::Http11,
-            headers,
-            body,
-        ))
     }
 
     fn parse_url(&self, url: &str) -> Result<(String, u16, String), HttpsError> {
-        let url = if url.starts_with("https://") {
-            &url[8..]
+        let url = if let Some(rest) = url.strip_prefix("https://") {
+            rest
         } else if url.starts_with("http://") {
             return Err(HttpsError::InvalidUrl(
                 "HTTPS client requires https:// scheme".to_string(),
@@ -2112,80 +723,268 @@ impl HttpsClient {
             url
         };
 
-        let (host_port, path) = if let Some(pos) = url.find('/') {
-            (&url[..pos], &url[pos..])
-        } else {
-            (url, "/")
+        let (host_port, path) = match url.find('/') {
+            Some(idx) => (&url[..idx], &url[idx..]),
+            None => (url, "/"),
         };
+
+        if host_port.is_empty() {
+            return Err(HttpsError::InvalidUrl("missing host".to_string()));
+        }
+
+        if host_port.starts_with('[') {
+            let end = host_port.find(']').ok_or_else(|| {
+                HttpsError::InvalidUrl("invalid IPv6 host format".to_string())
+            })?;
+
+            let host = host_port[1..end].to_string();
+            let port = if end + 1 < host_port.len() {
+                let suffix = &host_port[end + 1..];
+                if let Some(p) = suffix.strip_prefix(':') {
+                    p.parse::<u16>().map_err(|_| {
+                        HttpsError::InvalidUrl("invalid port number".to_string())
+                    })?
+                } else {
+                    return Err(HttpsError::InvalidUrl("invalid host:port format".to_string()));
+                }
+            } else {
+                443
+            };
+
+            return Ok((host, port, path.to_string()));
+        }
 
         let (host, port) = if let Some(pos) = host_port.rfind(':') {
-            let port_str = &host_port[pos + 1..];
-            let port = port_str.parse::<u16>()
-                .map_err(|_| HttpsError::InvalidUrl("Invalid port number".to_string()))?;
-            (&host_port[..pos], port)
+            let host_part = &host_port[..pos];
+            let port_part = &host_port[pos + 1..];
+            if host_part.is_empty() {
+                return Err(HttpsError::InvalidUrl("missing host".to_string()));
+            }
+
+            let port = port_part.parse::<u16>().map_err(|_| {
+                HttpsError::InvalidUrl("invalid port number".to_string())
+            })?;
+
+            (host_part.to_string(), port)
         } else {
-            (host_port, 443)
+            (host_port.to_string(), 443)
         };
 
-        Ok((host.to_string(), port, path.to_string()))
+        Ok((host, port, path.to_string()))
     }
 
     fn resolve_url(&self, base: &str, relative: &str) -> String {
-        if relative.starts_with("http://") || relative.starts_with("https://") {
-            relative.to_string()
-        } else if relative.starts_with('/') {
+        if relative.starts_with("https://") || relative.starts_with("http://") {
+            return relative.to_string();
+        }
+
+        if relative.starts_with("//") {
+            return format!("https:{}", relative);
+        }
+
+        if relative.starts_with('/') {
             if let Ok((host, port, _)) = self.parse_url(base) {
-                format!("https://{}:{}{}", host, port, relative)
-            } else {
-                relative.to_string()
+                if port == 443 {
+                    return format!("https://{}{}", host, relative);
+                }
+
+                return format!("https://{}:{}{}", host, port, relative);
             }
+
+            return relative.to_string();
+        }
+
+        let base_no_fragment = base.split('#').next().unwrap_or(base);
+        let base_no_query = base_no_fragment.split('?').next().unwrap_or(base_no_fragment);
+        if let Some(last_slash) = base_no_query.rfind('/') {
+            format!("{}/{}", &base_no_query[..last_slash], relative)
         } else {
-            if let Some(last_slash) = base.rfind('/') {
-                format!("{}/{}", &base[..last_slash], relative)
-            } else {
-                format!("{}/{}", base, relative)
-            }
+            format!("{}/{}", base_no_query, relative)
         }
     }
 
-    fn decode_chunked(&self, data: &[u8]) -> Result<Vec<u8>, HttpsError> {
-        let mut result = Vec::new();
-        let mut pos = 0;
-        while pos < data.len() {
-            let size_line_end = data[pos..].iter()
-                .position(|&b| b == b'\r')
-                .ok_or_else(|| HttpsError::InvalidResponse("Invalid chunk size".to_string()))?;
+    fn selected_protocol_with_fallback(&self, negotiated: Option<AlpnProtocol>) -> AlpnProtocol {
+        negotiated.unwrap_or_else(|| {
+            if self.cfg.tls_cfg.max_version >= crate::net::https::tls::TlsVersion::Tls1_2 {
+                AlpnProtocol::Http2
+            } else {
+                AlpnProtocol::Http11
+            }
+        })
+    }
 
-            let size_str = String::from_utf8_lossy(&data[pos..pos + size_line_end]);
-            let chunk_size = usize::from_str_radix(size_str.trim_end(), 16)
-                .map_err(|_| HttpsError::InvalidResponse("Invalid chunk size hex".to_string()))?;
+    fn connection_key(host: &str, port: u16) -> String {
+        format!("{}:{}", host, port)
+    }
 
-            pos += size_line_end + 2;
-            if chunk_size == 0 {
+    fn build_http2_frame(frame_type: u8, flags: u8, stream_id: u32, payload: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(9 + payload.len());
+        let len = payload.len() as u32;
+
+        out.push(((len >> 16) & 0xff) as u8);
+        out.push(((len >> 8) & 0xff) as u8);
+        out.push((len & 0xff) as u8);
+        out.push(frame_type);
+        out.push(flags);
+        out.extend_from_slice(&(stream_id & 0x7fff_ffff).to_be_bytes());
+        out.extend_from_slice(payload);
+
+        out
+    }
+
+    fn read_http1_response_bytes(stream: &mut TlsStream, timeout: Duration) -> Result<Vec<u8>, HttpsError> {
+        let mut data = Vec::new();
+        let mut buf = [0u8; 8192];
+        let start = Instant::now();
+        let mut header_end: Option<usize> = None;
+        let mut content_length: Option<usize> = None;
+        let mut chunked = false;
+        loop {
+            if start.elapsed() > timeout {
+                if data.is_empty() {
+                    return Err(HttpsError::Timeout);
+                }
+
                 break;
             }
 
-            if pos + chunk_size > data.len() {
-                return Err(HttpsError::InvalidResponse("Chunk size exceeds data".to_string()));
-            }
+            match stream.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    data.extend_from_slice(&buf[..n]);
+                    if header_end.is_none() {
+                        if let Some(end) = find_http_header_end(&data) {
+                            header_end = Some(end);
+                            let (len, is_chunked) = parse_http1_meta(&data[..end]);
+                            content_length = len;
+                            chunked = is_chunked;
+                        }
+                    }
 
-            result.extend_from_slice(&data[pos..pos + chunk_size]);
-            pos += chunk_size + 2;
+                    if let Some(h_end) = header_end {
+                        let body = &data[h_end..];
+                        if let Some(expected) = content_length {
+                            if body.len() >= expected {
+                                break;
+                            }
+                        } else if chunked && chunked_body_complete(body) {
+                            break;
+                        }
+                    }
+                }
+                Err(ref e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        || e.kind() == std::io::ErrorKind::TimedOut =>
+                {
+                    if !data.is_empty() {
+                        break;
+                    }
+
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(e) => return Err(HttpsError::Io(e)),
+            }
         }
 
-        Ok(result)
+        if data.is_empty() {
+            return Err(HttpsError::InvalidResponse("empty response".to_string()));
+        }
+
+        Ok(data)
     }
 
-    pub fn clear_connections(&mut self) {
-        self.tls_connections.clear();
-        self.connection_pool.clear();
-        self.negotiated_protocols.clear();
-    }
+    fn read_http2_response_raw(stream: &mut TlsStream, target_stream_id: u32, timeout: Duration) -> Result<(Vec<u8>, Vec<u8>), HttpsError> {
+        let start = Instant::now();
+        let mut recv_buf = Vec::<u8>::new();
+        let mut tmp = [0u8; 16384];
+        let mut header_block = Vec::new();
+        let mut body = Vec::new();
+        let mut end_stream = false;
+        while !end_stream {
+            if start.elapsed() > timeout {
+                if header_block.is_empty() && body.is_empty() {
+                    return Err(HttpsError::Timeout);
+                }
 
-    pub fn get_connection_stats(&self) -> HashMap<String, Option<AlpnProtocol>> {
-        self.tls_connections.iter()
-            .map(|(k, v)| (k.clone(), v.protocol))
-            .collect()
+                break;
+            }
+
+            match stream.read(&mut tmp) {
+                Ok(0) => break,
+                Ok(n) => {
+                    recv_buf.extend_from_slice(&tmp[..n]);
+                    loop {
+                        if recv_buf.len() < 9 {
+                            break;
+                        }
+
+                        let length = ((recv_buf[0] as usize) << 16) | ((recv_buf[1] as usize) << 8) | (recv_buf[2] as usize);
+                        let frame_type = recv_buf[3];
+                        let flags = recv_buf[4];
+                        let stream_id = u32::from_be_bytes([
+                            recv_buf[5], recv_buf[6], recv_buf[7], recv_buf[8],
+                        ]) & 0x7fff_ffff;
+
+                        if recv_buf.len() < 9 + length {
+                            break;
+                        }
+
+                        let payload = recv_buf[9..9 + length].to_vec();
+                        recv_buf.drain(..9 + length);
+                        if frame_type == 0x04 && stream_id == 0 && (flags & 0x01) == 0 {
+                            let ack = Self::build_http2_frame(0x04, 0x01, 0, &[]);
+                            stream.write_all(&ack).map_err(HttpsError::Io)?;
+                            stream.flush().map_err(HttpsError::Io)?;
+                            continue;
+                        }
+
+                        if stream_id != target_stream_id {
+                            continue;
+                        }
+
+                        match frame_type {
+                            0x01 | 0x09 => {
+                                header_block.extend_from_slice(&payload);
+                                if (flags & 0x01) != 0 {
+                                    end_stream = true;
+                                }
+                            }
+                            0x00 => {
+                                body.extend_from_slice(&payload);
+                                if (flags & 0x01) != 0 {
+                                    end_stream = true;
+                                }
+                            }
+                            0x03 => {
+                                return Err(HttpsError::Http2Error(
+                                    "received RST_STREAM for request stream".to_string(),
+                                ));
+                            }
+                            _ => {}
+                        }
+
+                        if end_stream {
+                            break;
+                        }
+                    }
+                }
+                Err(ref e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        || e.kind() == std::io::ErrorKind::TimedOut =>
+                {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(e) => return Err(HttpsError::Io(e)),
+            }
+        }
+
+        if header_block.is_empty() {
+            return Err(HttpsError::InvalidResponse(
+                "HTTP/2 response missing headers block".to_string(),
+            ));
+        }
+
+        Ok((header_block, body))
     }
 }
 
@@ -2210,20 +1009,337 @@ impl From<std::io::Error> for HttpsError {
 impl std::fmt::Display for HttpsError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            HttpsError::Tls(e) => write!(f, "TLS Error: {:?}", e),
-            HttpsError::Io(e) => write!(f, "IO Error: {}", e),
-            HttpsError::InvalidUrl(msg) => write!(f, "Invalid URL: {}", msg),
-            HttpsError::InvalidResponse(msg) => write!(f, "Invalid Response: {}", msg),
-            HttpsError::Timeout => write!(f, "Request Timeout"),
-            HttpsError::ConnectionFailed(msg) => write!(f, "Connection Failed: {}", msg),
-            HttpsError::TooManyRedirects => write!(f, "Too Many Redirects"),
-            HttpsError::ProtocolNegotiationFailed(msg) => write!(f, "Protocol Negotiation Failed: {}", msg),
-            HttpsError::Http2Error(msg) => write!(f, "HTTP/2 Error: {}", msg),
+            HttpsError::Tls(e) => write!(f, "TLS error: {:?}", e),
+            HttpsError::Io(e) => write!(f, "IO error: {}", e),
+            HttpsError::InvalidUrl(msg) => write!(f, "invalid URL: {}", msg),
+            HttpsError::InvalidResponse(msg) => write!(f, "invalid response: {}", msg),
+            HttpsError::Timeout => write!(f, "request timeout"),
+            HttpsError::ConnectionFailed(msg) => write!(f, "connection failed: {}", msg),
+            HttpsError::TooManyRedirects => write!(f, "too many redirects"),
+            HttpsError::ProtocolNegotiationFailed(msg) => {
+                write!(f, "protocol negotiation failed: {}", msg)
+            }
+            HttpsError::Http2Error(msg) => write!(f, "HTTP/2 error: {}", msg),
         }
     }
 }
 
 impl std::error::Error for HttpsError {}
+
+fn now_unix() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
+}
+
+fn split_header_body(data: &[u8]) -> std::io::Result<(String, &[u8])> {
+    const DELIM: &[u8] = b"\n\n";
+    let split = data.windows(DELIM.len()).position(|w| w == DELIM).ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, "header delimiter not found")
+    })?;
+
+    let header = std::str::from_utf8(&data[..split]).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, "header is not valid UTF-8")
+    })?.to_string();
+
+    Ok((header, &data[split + DELIM.len()..]))
+}
+
+fn parse_state_meta(header: &str, body_len: usize) -> Result<SecureHttpsClientStateMeta, HttpsError> {
+    let mut lines = header.lines();
+    let magic = lines.next().ok_or_else(|| {
+        HttpsError::InvalidResponse("state blob magic missing".to_string())
+    })?;
+
+    if magic != HTTPS_CLIENT_STATE_BLOB_MAGIC {
+        return Err(HttpsError::InvalidResponse(
+            "state blob magic mismatch".to_string(),
+        ));
+    }
+
+    let mut algorithm = CompressionAlgorithm::Identity;
+    let mut nonce_b64 = String::new();
+    let mut digest_b64 = String::new();
+    let mut tag_b64 = String::new();
+    let mut raw_size = None::<usize>;
+    let mut encoded_size = None::<usize>;
+    let mut issued_at_unix = 0u64;
+    for line in lines {
+        let mut kv = line.splitn(2, ':');
+        let key = kv.next().unwrap_or("").trim();
+        let value = kv.next().unwrap_or("").trim();
+        match key {
+            "content-encoding" => {
+                algorithm = CompressionAlgorithm::from_content_encoding(value).ok_or_else(|| {
+                    HttpsError::InvalidResponse(format!(
+                        "unsupported state content-encoding: {}",
+                        value
+                    ))
+                })?;
+            }
+            "nonce" => nonce_b64 = value.to_string(),
+            "digest" => digest_b64 = value.to_string(),
+            "tag" => tag_b64 = value.to_string(),
+            "raw-size" => {
+                raw_size = Some(
+                    value.parse::<usize>().map_err(|_| {
+                        HttpsError::InvalidResponse("invalid raw-size".to_string())
+                    })?,
+                );
+            }
+            "encoded-size" => {
+                encoded_size =
+                    Some(value.parse::<usize>().map_err(|_| {
+                        HttpsError::InvalidResponse("invalid encoded-size".to_string())
+                    })?);
+            }
+            "issued-at" => {
+                issued_at_unix = value.parse::<u64>().unwrap_or(0);
+            }
+            _ => {}
+        }
+    }
+
+    if nonce_b64.is_empty() || digest_b64.is_empty() || tag_b64.is_empty() {
+        return Err(HttpsError::InvalidResponse(
+            "state metadata missing nonce/digest/tag".to_string(),
+        ));
+    }
+
+    let raw_size = raw_size.ok_or_else(|| {
+        HttpsError::InvalidResponse("state metadata missing raw-size".to_string())
+    })?;
+
+    let encoded_size = encoded_size.ok_or_else(|| {
+        HttpsError::InvalidResponse("state metadata missing encoded-size".to_string())
+    })?;
+
+    if encoded_size != body_len {
+        return Err(HttpsError::InvalidResponse(format!(
+            "state encoded-size mismatch: metadata {}, body {}",
+            encoded_size, body_len
+        )));
+    }
+
+    Ok(SecureHttpsClientStateMeta {
+        algorithm,
+        nonce_b64,
+        digest_b64,
+        tag_b64,
+        raw_size,
+        encoded_size,
+        issued_at_unix,
+    })
+}
+
+fn select_state_algorithm(accept_encoding: &str) -> CompressionAlgorithm {
+    let accepted = compression::parse_accept_encoding(accept_encoding);
+    for (algo, q) in accepted {
+        if q > 0.0 && algo.is_implemented() && algo != CompressionAlgorithm::Identity {
+            return algo;
+        }
+    }
+
+    CompressionAlgorithm::Identity
+}
+
+fn compute_state_blob_tag(nonce: &[u8], raw_size: usize, algorithm: CompressionAlgorithm, encoded_payload: &[u8]) -> [u8; 32] {
+    let mut material = Vec::with_capacity(96 + encoded_payload.len());
+    material.extend_from_slice(HTTPS_CLIENT_STATE_CONTEXT.as_bytes());
+    material.extend_from_slice(nonce);
+    material.extend_from_slice(&(raw_size as u64).to_be_bytes());
+    material.extend_from_slice(algorithm.content_encoding().as_bytes());
+    material.push(0x0a);
+    material.extend_from_slice(&(encoded_payload.len() as u64).to_be_bytes());
+    material.extend_from_slice(encoded_payload);
+
+    hmac_sha256(HTTPS_CLIENT_STATE_CONTEXT.as_bytes(), &material)
+}
+
+fn compute_payload_tag(context_key: &[u8], nonce: &[u8], payload: &[u8]) -> [u8; 32] {
+    let digest = sha256(payload);
+    let mut material = Vec::with_capacity(64 + payload.len());
+    material.extend_from_slice(nonce);
+    material.extend_from_slice(&(payload.len() as u64).to_be_bytes());
+    material.extend_from_slice(&digest);
+    material.extend_from_slice(payload);
+
+    hmac_sha256(context_key, &material)
+}
+
+fn serialize_client_snapshot(snapshot: &HttpsClientStateSnapshot) -> Vec<u8> {
+    let mut lines = Vec::new();
+    lines.push("SINGULARITY_HTTPS_CLIENT_STATE_PAYLOAD_V1".to_string());
+    lines.push(format!("exported-at={}", snapshot.exported_at_unix));
+    lines.push(format!(
+        "secure-envelopes={}",
+        if snapshot.secure_envelopes_enabled { "on" } else { "off" }
+    ));
+
+    let mut entries: Vec<_> = snapshot.negotiated_protocols.iter().collect();
+    entries.sort_by(|a, b| a.0.cmp(b.0));
+
+    lines.push(format!("negotiated-count={}", entries.len()));
+    for (k, v) in entries {
+        lines.push(format!("negotiated={}|{}", k, protocol_wire_name(*v)));
+    }
+
+    lines.join("\n").into_bytes()
+}
+
+fn deserialize_client_snapshot(raw: &[u8]) -> Result<HttpsClientStateSnapshot, HttpsError> {
+    let text = std::str::from_utf8(raw).map_err(|_| {
+        HttpsError::InvalidResponse("state payload is not valid UTF-8".to_string())
+    })?;
+
+    let mut lines = text.lines();
+    let magic = lines.next().unwrap_or("");
+    if magic != "SINGULARITY_HTTPS_CLIENT_STATE_PAYLOAD_V1" {
+        return Err(HttpsError::InvalidResponse(
+            "state payload magic mismatch".to_string(),
+        ));
+    }
+
+    let mut exported_at = 0u64;
+    let mut secure_envelopes_enabled = false;
+    let mut negotiated = HashMap::new();
+    for line in lines {
+        if let Some(rest) = line.strip_prefix("exported-at=") {
+            exported_at = rest.parse::<u64>().unwrap_or(0);
+            continue;
+        }
+
+        if let Some(rest) = line.strip_prefix("secure-envelopes=") {
+            secure_envelopes_enabled = rest.eq_ignore_ascii_case("on");
+            continue;
+        }
+
+        if let Some(rest) = line.strip_prefix("negotiated=") {
+            let mut parts = rest.splitn(2, '|');
+            let key = parts.next().unwrap_or("").trim();
+            let proto = parts.next().unwrap_or("").trim();
+            if !key.is_empty() {
+                if let Some(p) = protocol_from_wire_name(proto) {
+                    negotiated.insert(key.to_string(), p);
+                }
+            }
+
+            continue;
+        }
+    }
+
+    Ok(HttpsClientStateSnapshot {
+        exported_at_unix: exported_at,
+        secure_envelopes_enabled,
+        negotiated_protocols: negotiated,
+    })
+}
+
+fn protocol_wire_name(proto: AlpnProtocol) -> &'static str {
+    match proto {
+        AlpnProtocol::Http2 => "h2",
+        AlpnProtocol::Http11 => "http/1.1",
+        AlpnProtocol::Http10 => "http/1.0",
+        AlpnProtocol::Http3 => "h3",
+    }
+}
+
+fn protocol_from_wire_name(name: &str) -> Option<AlpnProtocol> {
+    match name {
+        "h2" => Some(AlpnProtocol::Http2),
+        "http/1.1" => Some(AlpnProtocol::Http11),
+        "http/1.0" => Some(AlpnProtocol::Http10),
+        "h3" => Some(AlpnProtocol::Http3),
+        _ => None,
+    }
+}
+
+fn decode_hmac_header_value(value: &str) -> Result<Vec<u8>, String> {
+    let raw = if let Some((_, rhs)) = value.split_once('=') {
+        rhs.trim()
+    } else {
+        value.trim()
+    };
+
+    pem::decode(raw).map_err(|e| format!("invalid HMAC header encoding: {}", e))
+}
+
+fn is_truthy_header(value: &str) -> bool {
+    let v = value.trim().to_ascii_lowercase();
+    v == "1" || v == "true" || v == "yes" || v == "on" || v == "v1"
+}
+
+fn map_get_case_insensitive(map: &HashMap<String, String>, key: &str) -> Option<String> {
+    map.iter().find(|(k, _)| {
+        k.eq_ignore_ascii_case(key)
+    }).map(|(_, v)| {
+        v.clone()
+    })
+}
+
+fn map_remove_case_insensitive(map: &mut HashMap<String, String>, key: &str) -> Option<String> {
+    let existing = map.keys().find(|k| {
+        k.eq_ignore_ascii_case(key)
+    }).cloned()?;
+
+    map.remove(&existing)
+}
+
+fn find_http_header_end(data: &[u8]) -> Option<usize> {
+    data.windows(4).position(|w| {
+        w == b"\r\n\r\n"
+    }).map(|idx| {
+        idx + 4
+    })
+}
+
+fn parse_http1_meta(header_section: &[u8]) -> (Option<usize>, bool) {
+    let text = String::from_utf8_lossy(header_section);
+    let mut content_length = None;
+    let mut chunked = false;
+    for line in text.lines().skip(1) {
+        if line.trim().is_empty() {
+            break;
+        }
+
+        if let Some((k, v)) = line.split_once(':') {
+            let key = k.trim().to_ascii_lowercase();
+            let value = v.trim().to_ascii_lowercase();
+            if key == "content-length" {
+                content_length = value.parse::<usize>().ok();
+            } else if key == "transfer-encoding" && value.contains("chunked") {
+                chunked = true;
+            }
+        }
+    }
+
+    (content_length, chunked)
+}
+
+fn chunked_body_complete(body: &[u8]) -> bool {
+    body.windows(7).any(|w| w == b"\r\n0\r\n\r\n") || body.ends_with(b"0\r\n\r\n")
+}
+
+fn build_synthetic_http1_response(status_code: u16, reason_phrase: &str, headers: &HashMap<String, String>, body: &[u8]) -> Vec<u8> {
+    let mut out = String::new();
+    out.push_str(&format!("HTTP/1.1 {} {}\r\n", status_code, reason_phrase));
+    let mut has_content_length = false;
+    for (k, v) in headers {
+        if k.eq_ignore_ascii_case("content-length") {
+            has_content_length = true;
+        }
+
+        out.push_str(&format!("{}: {}\r\n", k, v));
+    }
+
+    if !has_content_length {
+        out.push_str(&format!("Content-Length: {}\r\n", body.len()));
+    }
+
+    out.push_str("\r\n");
+
+    let mut bytes = out.into_bytes();
+    bytes.extend_from_slice(body);
+    bytes
+}
 
 #[cfg(test)]
 mod tests {
@@ -2254,67 +1370,130 @@ mod tests {
     }
 
     #[test]
-    fn test_encode_http2_headers_with_hpack() {
-        let mut client = HttpsClient::new(HttpsClientCfg::default());
-        
-        let headers = vec![
-            (":method".to_string(), "GET".to_string()),
-            (":path".to_string(), "/".to_string()),
-            (":scheme".to_string(), "https".to_string()),
-            ("user-agent".to_string(), "test".to_string()),
-        ];
-        
-        let encoded = client.encode_http2_headers(&headers);
-        assert!(!encoded.is_empty());
-    }
-
-    #[test]
-    fn test_parse_http2_headers_with_hpack() {
-        let mut client = HttpsClient::new(HttpsClientCfg::default());
-        
-        let mut encoder = HpackCodec::new(4096);
-        let headers: HashMap<String, String> = vec![
-            (":status".to_string(), "200".to_string()),
-            ("content-type".to_string(), "text/html".to_string()),
-            ("content-length".to_string(), "1234".to_string()),
-        ].into_iter().collect();
-        
-        let encoded = encoder.encode(&headers);
-        
-        let mut decoded_headers = HashMap::new();
-        let mut status_code = 200u16;
-        
-        client.parse_http2_headers(&encoded, &mut decoded_headers, &mut status_code)
-            .expect("Failed to parse headers");
-        
-        assert_eq!(status_code, 200);
-        assert_eq!(decoded_headers.get("content-type").unwrap(), "text/html");
-        assert_eq!(decoded_headers.get("content-length").unwrap(), "1234");
-    }
-
-    #[test]
-    fn test_chunked_decoding() {
+    fn test_resolve_relative_url() {
         let client = HttpsClient::new(HttpsClientCfg::default());
-        let chunked = b"5\r\nHello\r\n0\r\n\r\n";
-        let decoded = client.decode_chunked(chunked).unwrap();
-        assert_eq!(decoded, b"Hello");
+        let resolved = client.resolve_url("https://example.com/root/page", "next");
+
+        assert_eq!(resolved, "https://example.com/root/next");
     }
 
     #[test]
-    fn test_chunked_decoding_multiple_chunks() {
-        let client = HttpsClient::new(HttpsClientCfg::default());
-        let chunked = b"5\r\nHello\r\n6\r\n World\r\n0\r\n\r\n";
-        let decoded = client.decode_chunked(chunked).unwrap();
-        assert_eq!(decoded, b"Hello World");
-    }
-
-    #[test]
-    fn test_alpn_protocol_negotiation() {
+    fn test_secure_state_roundtrip() {
         let mut client = HttpsClient::new(HttpsClientCfg::default());
-        let protocols = vec![AlpnProtocol::Http2, AlpnProtocol::Http11];
-        client.set_alpn_protocols(protocols);
-        
-        let supported = client.alpn_negotiator.supported_protocols_sorted();
-        assert_eq!(supported.len(), 2);
+        client
+            .negotiated_protocols
+            .insert("example.com:443".to_string(), AlpnProtocol::Http2);
+
+        let (meta, blob) = client.export_secure_state(CompressionAlgorithm::Gzip).unwrap();
+        assert_eq!(meta.algorithm, CompressionAlgorithm::Gzip);
+
+        let (decoded_meta, snapshot) = HttpsClient::import_secure_state(&blob).unwrap();
+        assert_eq!(decoded_meta.algorithm, CompressionAlgorithm::Gzip);
+        assert_eq!(
+            snapshot.negotiated_protocols.get("example.com:443"),
+            Some(&AlpnProtocol::Http2)
+        );
+    }
+
+    #[test]
+    fn test_secure_state_tamper_detection() {
+        let client = HttpsClient::new(HttpsClientCfg::default());
+        let (_, mut blob) = client.export_secure_state(CompressionAlgorithm::Identity).unwrap();
+
+        let last = blob.len() - 1;
+        blob[last] ^= 0x01;
+
+        let err = HttpsClient::import_secure_state(&blob).unwrap_err();
+        assert!(err.to_string().contains("verification"));
+    }
+
+    #[test]
+    fn test_secure_response_envelope_decode() {
+        let payload = b"secure response payload".to_vec();
+        let (_, blob) = crate::net::https::encode_secure_https_payload(
+            &payload,
+            CompressionAlgorithm::Identity,
+        ).unwrap();
+
+        let mut headers = HashMap::new();
+        headers.insert("x-singularity-secure-envelope".to_string(), "v1".to_string());
+        headers.insert("content-length".to_string(), blob.len().to_string());
+
+        let response = HttpResponse::new(
+            200,
+            "OK".to_string(),
+            HttpVersion::Http11,
+            headers,
+            blob,
+        );
+
+        let client = HttpsClient::new(HttpsClientCfg::default());
+        let decoded = client.maybe_decode_secure_response(response).unwrap();
+
+        assert_eq!(decoded.body(), payload.as_slice());
+    }
+
+    #[test]
+    fn test_apply_outbound_security_adds_headers() {
+        let mut cfg = HttpsClientCfg::default();
+        cfg.enable_secure_envelopes = true;
+        cfg.request_compression_min_size = 1;
+
+        let client = HttpsClient::new(cfg);
+        let mut headers = Headers::new();
+        headers.insert("Accept-Encoding", "gzip, identity");
+
+        let mut body = b"hello world".to_vec();
+        client.apply_outbound_security(&mut headers, &mut body).unwrap();
+
+        assert!(headers.contains("digest"));
+        assert!(headers.contains("x-singularity-request-nonce"));
+        assert!(headers.contains("x-singularity-request-tag"));
+        assert!(headers.contains("x-singularity-secure-envelope"));
+    }
+
+    #[test]
+    fn test_response_integrity_optional_enforcement() {
+        let body = b"body".to_vec();
+        let nonce = random::generate_random(16).unwrap();
+        let mut bad_tag = compute_payload_tag(
+            HTTPS_CLIENT_RESPONSE_TAG_CONTEXT.as_bytes(),
+            &nonce,
+            b"tampered",
+        );
+        bad_tag[0] ^= 0x01;
+
+        let mut headers = HashMap::new();
+        headers.insert("x-singularity-response-nonce".to_string(), pem::encode(&nonce));
+        headers.insert(
+            "x-singularity-response-tag".to_string(),
+            format!("HMAC-SHA-256={}", pem::encode(&bad_tag)),
+        );
+
+        let response = HttpResponse::new(
+            200,
+            "OK".to_string(),
+            HttpVersion::Http11,
+            headers.clone(),
+            body.clone(),
+        );
+
+        let client_non_enforcing = HttpsClient::new(HttpsClientCfg::default());
+        assert!(client_non_enforcing.verify_optional_response_integrity(&response).is_ok());
+        let mut strict_cfg = HttpsClientCfg::default();
+        strict_cfg.enforce_response_integrity = true;
+        let client_enforcing = HttpsClient::new(strict_cfg);
+
+        let strict_resp = HttpResponse::new(
+            200,
+            "OK".to_string(),
+            HttpVersion::Http11,
+            headers,
+            body,
+        );
+
+        assert!(client_enforcing
+            .verify_optional_response_integrity(&strict_resp)
+            .is_err());
     }
 }

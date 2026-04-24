@@ -1,5 +1,27 @@
 use super::priority::Priority;
+use crate::crypto::constant_time_eq;
+use crate::crypto::encoding::pem;
+use crate::crypto::hash::hmac::hmac_sha256;
+use crate::crypto::hash::sha2::sha256;
+use crate::crypto::random;
+use crate::net::http::compression::{self, CompressionAlgorithm, CompressionLevel};
 use std::collections::{HashMap, VecDeque};
+use std::io;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+const PRIORITY_SCHEDULER_BLOB_MAGIC: &str = "SINGULARITY_HTTP2_PRIORITY_SCHEDULER_BLOB_V1";
+const PRIORITY_SCHEDULER_BLOB_CONTEXT: &str = "SINGULARITY_HTTP2_PRIORITY_SCHEDULER_BLOB_BINDING_V1";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SecurePrioritySchedulerBlobMeta {
+    pub algorithm: CompressionAlgorithm,
+    pub nonce_b64: String,
+    pub digest_b64: String,
+    pub tag_b64: String,
+    pub raw_size: usize,
+    pub encoded_size: usize,
+    pub issued_at_unix: u64,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StreamScheduleState {
@@ -62,7 +84,7 @@ impl DependencyNode {
 }
 
 pub struct PriorityScheduler {
-    streams: HashMap<u32, ScheduleStream>, 
+    streams: HashMap<u32, ScheduleStream>,
     dependencies: HashMap<u32, DependencyNode>,
     root_stream_id: u32,
     active_queue: VecDeque<u32>,
@@ -113,7 +135,6 @@ impl PriorityScheduler {
                 let mut new_node = DependencyNode::new(stream_id, parent_id, true);
                 new_node.children = old_children.clone();
                 self.dependencies.insert(stream_id, new_node);
-                
                 for child_id in &old_children {
                     if let Some(child_node) = self.dependencies.get_mut(child_id) {
                         child_node.parent_id = stream_id;
@@ -182,7 +203,9 @@ impl PriorityScheduler {
             if stream.state == StreamScheduleState::Ready {
                 stream.state = StreamScheduleState::Blocked;
                 self.active_queue.retain(|&id| id != stream_id);
-                self.blocked_streams.push(stream_id);
+                if !self.blocked_streams.contains(&stream_id) {
+                    self.blocked_streams.push(stream_id);
+                }
             }
         }
     }
@@ -221,11 +244,7 @@ impl PriorityScheduler {
         for &child_id in &children {
             if let Some(stream) = self.streams.get(&child_id) {
                 if stream.state == StreamScheduleState::Ready && stream.pending_bytes > 0 {
-                    weighted_children.push((
-                        child_id,
-                        stream.quantum,
-                        stream.deficit,
-                    ));
+                    weighted_children.push((child_id, stream.quantum, stream.deficit));
                 }
             }
         }
@@ -263,6 +282,9 @@ impl PriorityScheduler {
             if stream.pending_bytes == 0 {
                 stream.state = StreamScheduleState::Blocked;
                 self.active_queue.retain(|&id| id != stream_id);
+                if !self.blocked_streams.contains(&stream_id) {
+                    self.blocked_streams.push(stream_id);
+                }
             }
         }
     }
@@ -326,15 +348,670 @@ impl PriorityScheduler {
                 return current_depth;
             }
             
-            node.children
-                .iter()
-                .map(|&child_id| self.calculate_tree_depth(child_id, current_depth + 1))
-                .max()
-                .unwrap_or(current_depth)
+            node.children.iter().map(|&child_id| {
+                self.calculate_tree_depth(child_id, current_depth + 1)
+            }).max().unwrap_or(current_depth)
         } else {
             current_depth
         }
     }
+
+    pub fn to_secure_blob(&self, algorithm: CompressionAlgorithm) -> io::Result<(SecurePrioritySchedulerBlobMeta, Vec<u8>)> {
+        encode_secure_priority_scheduler(self, algorithm)
+    }
+
+    pub fn to_secure_blob_auto(&self, accept_encoding: &str) -> io::Result<(SecurePrioritySchedulerBlobMeta, Vec<u8>)> {
+        encode_secure_priority_scheduler_auto(self, accept_encoding)
+    }
+
+    pub fn from_secure_blob(data: &[u8]) -> io::Result<(SecurePrioritySchedulerBlobMeta, Self)> {
+        decode_secure_priority_scheduler(data)
+    }
+}
+
+pub fn select_secure_priority_scheduler_algorithm(accept_encoding: &str) -> CompressionAlgorithm {
+    compression::parse_accept_encoding(accept_encoding).into_iter().find_map(|(algorithm, quality)| {
+        if quality > 0.0 && algorithm.is_implemented() {
+            Some(algorithm)
+        } else {
+            None
+        }
+    }).unwrap_or(CompressionAlgorithm::Identity)
+}
+
+pub fn encode_secure_priority_scheduler(scheduler: &PriorityScheduler, algorithm: CompressionAlgorithm) -> io::Result<(SecurePrioritySchedulerBlobMeta, Vec<u8>)> {
+    let mut selected_algorithm = algorithm;
+    if !selected_algorithm.is_implemented() {
+        selected_algorithm = CompressionAlgorithm::Identity;
+    }
+
+    let raw_payload = serialize_priority_scheduler(scheduler)?;
+    let encoded_payload = if selected_algorithm == CompressionAlgorithm::Identity {
+        raw_payload.clone()
+    } else {
+        compression::compress(selected_algorithm, &raw_payload, CompressionLevel::Default)?
+    };
+
+    let nonce = random::generate_random(24).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::Other,
+            format!("failed to generate scheduler blob nonce: {}", e),
+        )
+    })?;
+
+    let digest = sha256(&raw_payload);
+    let tag = compute_priority_scheduler_blob_tag(
+        &nonce,
+        selected_algorithm,
+        raw_payload.len(),
+        &encoded_payload,
+    );
+
+    let nonce_b64 = pem::encode(&nonce);
+    let digest_b64 = pem::encode(&digest);
+    let tag_b64 = pem::encode(&tag);
+    let issued_at_unix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    let header = format!(
+        "{magic}\ncontent-encoding={encoding}\nnonce={nonce}\ndigest=SHA-256={digest}\ntag=HMAC-SHA-256={tag}\nraw-size={raw_size}\nencoded-size={encoded_size}\nissued-at={issued_at}\n\n",
+        magic = PRIORITY_SCHEDULER_BLOB_MAGIC,
+        encoding = selected_algorithm.content_encoding(),
+        nonce = nonce_b64,
+        digest = digest_b64,
+        tag = tag_b64,
+        raw_size = raw_payload.len(),
+        encoded_size = encoded_payload.len(),
+        issued_at = issued_at_unix
+    );
+
+    let mut blob = header.into_bytes();
+    blob.extend_from_slice(&encoded_payload);
+
+    Ok((
+        SecurePrioritySchedulerBlobMeta {
+            algorithm: selected_algorithm,
+            nonce_b64,
+            digest_b64,
+            tag_b64,
+            raw_size: raw_payload.len(),
+            encoded_size: encoded_payload.len(),
+            issued_at_unix,
+        },
+        blob,
+    ))
+}
+
+pub fn encode_secure_priority_scheduler_auto(scheduler: &PriorityScheduler, accept_encoding: &str) -> io::Result<(SecurePrioritySchedulerBlobMeta, Vec<u8>)> {
+    let selected = select_secure_priority_scheduler_algorithm(accept_encoding);
+    encode_secure_priority_scheduler(scheduler, selected)
+}
+
+pub fn decode_secure_priority_scheduler(data: &[u8]) -> io::Result<(SecurePrioritySchedulerBlobMeta, PriorityScheduler)> {
+    let (header, body) = split_header_body(data)?;
+    let meta = parse_secure_priority_scheduler_meta(&header, body.len())?;
+    let nonce = pem::decode(&meta.nonce_b64).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid nonce encoding: {}", e),
+        )
+    })?;
+
+    let expected_digest = pem::decode(&meta.digest_b64).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid digest encoding: {}", e),
+        )
+    })?;
+
+    let provided_tag = pem::decode(&meta.tag_b64).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid tag encoding: {}", e),
+        )
+    })?;
+
+    if expected_digest.len() != 32 || provided_tag.len() != 32 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "digest or tag has invalid length",
+        ));
+    }
+
+    let expected_tag = compute_priority_scheduler_blob_tag(&nonce, meta.algorithm, meta.raw_size, body);
+    if !constant_time_eq(&expected_tag, &provided_tag) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "scheduler blob HMAC mismatch",
+        ));
+    }
+
+    let raw_payload = if meta.algorithm == CompressionAlgorithm::Identity {
+        body.to_vec()
+    } else {
+        compression::decompress(meta.algorithm, body)?
+    };
+
+    if raw_payload.len() != meta.raw_size {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "raw-size mismatch: expected {}, got {}",
+                meta.raw_size,
+                raw_payload.len()
+            ),
+        ));
+    }
+
+    let actual_digest = sha256(&raw_payload);
+    if !constant_time_eq(&actual_digest, &expected_digest) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "scheduler blob digest mismatch",
+        ));
+    }
+
+    let scheduler = deserialize_priority_scheduler(&raw_payload)?;
+    Ok((meta, scheduler))
+}
+
+fn serialize_priority_scheduler(scheduler: &PriorityScheduler) -> io::Result<Vec<u8>> {
+    let mut lines = Vec::new();
+    lines.push(format!("root-stream-id={}", scheduler.root_stream_id));
+    lines.push(format!("total-pending={}", scheduler.total_pending));
+    let active_csv = scheduler.active_queue.iter().map(|id| {
+        id.to_string()
+    }).collect::<Vec<_>>().join(",");
+
+    lines.push(format!("active-queue={}", pem::encode(active_csv.as_bytes())));
+    let blocked_csv = scheduler.blocked_streams.iter().map(|id| {
+        id.to_string()
+    }).collect::<Vec<_>>().join(",");
+
+    lines.push(format!(
+        "blocked-streams={}",
+        pem::encode(blocked_csv.as_bytes())
+    ));
+
+    let mut stream_ids: Vec<u32> = scheduler.streams.keys().copied().collect();
+    stream_ids.sort_unstable();
+    lines.push(format!("stream-count={}", stream_ids.len()));
+    for (idx, stream_id) in stream_ids.iter().enumerate() {
+        let stream = scheduler.streams.get(stream_id).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "missing stream in scheduler map")
+        })?;
+
+        lines.push(format!("stream-{}-id={}", idx, stream.stream_id));
+        lines.push(format!(
+            "stream-{}-state={}",
+            idx,
+            stream_schedule_state_as_str(stream.state)
+        ));
+
+        lines.push(format!(
+            "stream-{}-priority-stream-dependency={}",
+            idx, stream.priority.stream_dependency
+        ));
+
+        lines.push(format!(
+            "stream-{}-priority-weight={}",
+            idx, stream.priority.weight
+        ));
+
+        lines.push(format!(
+            "stream-{}-priority-exclusive={}",
+            idx, stream.priority.exclusive
+        ));
+
+        lines.push(format!(
+            "stream-{}-pending-bytes={}",
+            idx, stream.pending_bytes
+        ));
+
+        lines.push(format!("stream-{}-quantum={}", idx, stream.quantum));
+        lines.push(format!("stream-{}-deficit={}", idx, stream.deficit));
+    }
+
+    let mut dep_ids: Vec<u32> = scheduler.dependencies.keys().copied().collect();
+    dep_ids.sort_unstable();
+    lines.push(format!("dependency-count={}", dep_ids.len()));
+    for (idx, dep_id) in dep_ids.iter().enumerate() {
+        let dep = scheduler.dependencies.get(dep_id).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "missing dependency in scheduler map",
+            )
+        })?;
+
+        let children_csv = dep.children.iter().map(|id| {
+            id.to_string()
+        }).collect::<Vec<_>>().join(",");
+
+        lines.push(format!("dependency-{}-stream-id={}", idx, dep.stream_id));
+        lines.push(format!("dependency-{}-parent-id={}", idx, dep.parent_id));
+        lines.push(format!("dependency-{}-exclusive={}", idx, dep.exclusive));
+        lines.push(format!(
+            "dependency-{}-children={}",
+            idx,
+            pem::encode(children_csv.as_bytes())
+        ));
+    }
+
+    Ok(lines.join("\n").into_bytes())
+}
+
+fn deserialize_priority_scheduler(raw_payload: &[u8]) -> io::Result<PriorityScheduler> {
+    let text = String::from_utf8(raw_payload.to_vec()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "scheduler payload is not valid UTF-8",
+        )
+    })?;
+
+    let mut kv: HashMap<String, String> = HashMap::new();
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        let (key, value) = trimmed.split_once('=').ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid scheduler payload line '{}'", trimmed),
+            )
+        })?;
+
+        kv.insert(key.to_string(), value.to_string());
+    }
+
+    let root_stream_id = parse_u32(required_field(&kv, "root-stream-id")?, "root-stream-id")?;
+    let serialized_total_pending = parse_usize(required_field(&kv, "total-pending")?, "total-pending")?;
+    let active_queue = decode_id_list(required_field(&kv, "active-queue")?, "active-queue")?;
+    let blocked_streams = decode_id_list(required_field(&kv, "blocked-streams")?, "blocked-streams")?;
+    let stream_count = parse_usize(required_field(&kv, "stream-count")?, "stream-count")?;
+    let mut streams = HashMap::new();
+    for idx in 0..stream_count {
+        let id = parse_u32(
+            required_field(&kv, &format!("stream-{}-id", idx))?,
+            &format!("stream-{}-id", idx),
+        )?;
+
+        let state = parse_stream_schedule_state(required_field(
+            &kv,
+            &format!("stream-{}-state", idx),
+        )?)?;
+        
+        let priority_dep = parse_u32(
+            required_field(&kv, &format!("stream-{}-priority-stream-dependency", idx))?,
+            &format!("stream-{}-priority-stream-dependency", idx),
+        )?;
+        
+        let priority_weight = parse_u8(
+            required_field(&kv, &format!("stream-{}-priority-weight", idx))?,
+            &format!("stream-{}-priority-weight", idx),
+        )?;
+        
+        let priority_exclusive = parse_bool(required_field(
+            &kv,
+            &format!("stream-{}-priority-exclusive", idx),
+        )?)?;
+        
+        let pending_bytes = parse_usize(
+            required_field(&kv, &format!("stream-{}-pending-bytes", idx))?,
+            &format!("stream-{}-pending-bytes", idx),
+        )?;
+        
+        let quantum = parse_usize(
+            required_field(&kv, &format!("stream-{}-quantum", idx))?,
+            &format!("stream-{}-quantum", idx),
+        )?;
+        
+        let deficit = parse_i64(
+            required_field(&kv, &format!("stream-{}-deficit", idx))?,
+            &format!("stream-{}-deficit", idx),
+        )?;
+
+        streams.insert(
+            id,
+            ScheduleStream {
+                stream_id: id,
+                state,
+                priority: Priority::new(priority_dep, priority_weight, priority_exclusive),
+                pending_bytes,
+                quantum,
+                deficit,
+            },
+        );
+    }
+
+    let dependency_count = parse_usize(required_field(&kv, "dependency-count")?, "dependency-count")?;
+    let mut dependencies = HashMap::new();
+    for idx in 0..dependency_count {
+        let stream_id = parse_u32(
+            required_field(&kv, &format!("dependency-{}-stream-id", idx))?,
+            &format!("dependency-{}-stream-id", idx),
+        )?;
+
+        let parent_id = parse_u32(
+            required_field(&kv, &format!("dependency-{}-parent-id", idx))?,
+            &format!("dependency-{}-parent-id", idx),
+        )?;
+        
+        let exclusive = parse_bool(required_field(
+            &kv,
+            &format!("dependency-{}-exclusive", idx),
+        )?)?;
+        
+        let children = decode_id_list(
+            required_field(&kv, &format!("dependency-{}-children", idx))?,
+            &format!("dependency-{}-children", idx),
+        )?;
+
+        dependencies.insert(
+            stream_id,
+            DependencyNode {
+                stream_id,
+                parent_id,
+                children,
+                exclusive,
+            },
+        );
+    }
+
+    if !dependencies.contains_key(&root_stream_id) {
+        dependencies.insert(
+            root_stream_id,
+            DependencyNode::new(root_stream_id, root_stream_id, false),
+        );
+    }
+
+    let active_queue: VecDeque<u32> = active_queue.into_iter().filter(|id| {
+        streams.contains_key(id)
+    }).collect();
+
+    let blocked_streams: Vec<u32> = blocked_streams.into_iter().filter(|id| {
+        streams.contains_key(id)
+    }).collect();
+
+    let computed_total_pending = streams.values().map(|s| s.pending_bytes).sum::<usize>();
+    if serialized_total_pending != computed_total_pending {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "total-pending mismatch: payload {}, computed {}",
+                serialized_total_pending, computed_total_pending
+            ),
+        ));
+    }
+
+    Ok(PriorityScheduler {
+        streams,
+        dependencies,
+        root_stream_id,
+        active_queue,
+        blocked_streams,
+        total_pending: computed_total_pending,
+    })
+}
+
+fn required_field<'a>(kv: &'a HashMap<String, String>, key: &str) -> io::Result<&'a str> {
+    kv.get(key).map(|v| v.as_str()).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("missing {} in scheduler payload", key),
+        )
+    })
+}
+
+fn parse_u32(v: &str, field: &str) -> io::Result<u32> {
+    v.parse::<u32>().map_err(|_| {
+        io::Error::new(io::ErrorKind::InvalidData, format!("invalid {}", field))
+    })
+}
+
+fn parse_u8(v: &str, field: &str) -> io::Result<u8> {
+    v.parse::<u8>().map_err(|_| {
+        io::Error::new(io::ErrorKind::InvalidData, format!("invalid {}", field))
+    })
+}
+
+fn parse_usize(v: &str, field: &str) -> io::Result<usize> {
+    v.parse::<usize>().map_err(|_| {
+        io::Error::new(io::ErrorKind::InvalidData, format!("invalid {}", field))
+    })
+}
+
+fn parse_i64(v: &str, field: &str) -> io::Result<i64> {
+    v.parse::<i64>().map_err(|_| {
+        io::Error::new(io::ErrorKind::InvalidData, format!("invalid {}", field))
+    })
+}
+
+fn parse_bool(v: &str) -> io::Result<bool> {
+    match v {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid bool '{}'", v),
+        )),
+    }
+}
+
+fn stream_schedule_state_as_str(state: StreamScheduleState) -> &'static str {
+    match state {
+        StreamScheduleState::Ready => "ready",
+        StreamScheduleState::Blocked => "blocked",
+        StreamScheduleState::Idle => "idle",
+        StreamScheduleState::Closed => "closed",
+    }
+}
+
+fn parse_stream_schedule_state(v: &str) -> io::Result<StreamScheduleState> {
+    match v {
+        "ready" => Ok(StreamScheduleState::Ready),
+        "blocked" => Ok(StreamScheduleState::Blocked),
+        "idle" => Ok(StreamScheduleState::Idle),
+        "closed" => Ok(StreamScheduleState::Closed),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid stream schedule state '{}'", v),
+        )),
+    }
+}
+
+fn decode_id_list(encoded: &str, field: &str) -> io::Result<Vec<u32>> {
+    let raw = pem::decode(encoded).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid {} encoding: {}", field, e),
+        )
+    })?;
+
+    let text = String::from_utf8(raw).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{} is not valid UTF-8", field),
+        )
+    })?;
+
+    if text.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+
+    text.split(',').map(|chunk| {
+        chunk.trim().parse::<u32>().map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid {} entry '{}'", field, chunk),
+            )
+        })
+    }).collect()
+}
+
+fn compute_priority_scheduler_blob_tag(nonce: &[u8], algorithm: CompressionAlgorithm, raw_size: usize, encoded_payload: &[u8]) -> [u8; 32] {
+    let mut mac_input = Vec::new();
+    mac_input.extend_from_slice(PRIORITY_SCHEDULER_BLOB_CONTEXT.as_bytes());
+    mac_input.extend_from_slice(algorithm.content_encoding().as_bytes());
+    mac_input.extend_from_slice(&(raw_size as u64).to_be_bytes());
+    mac_input.extend_from_slice(nonce);
+    mac_input.extend_from_slice(encoded_payload);
+    hmac_sha256(PRIORITY_SCHEDULER_BLOB_CONTEXT.as_bytes(), &mac_input)
+}
+
+fn split_header_body(data: &[u8]) -> io::Result<(String, &[u8])> {
+    if let Some(pos) = data.windows(2).position(|w| w == b"\n\n") {
+        let header = std::str::from_utf8(&data[..pos]).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidData, "header is not valid UTF-8")
+        })?;
+
+        return Ok((header.to_string(), &data[pos + 2..]));
+    }
+
+    if let Some(pos) = data.windows(4).position(|w| w == b"\r\n\r\n") {
+        let header = std::str::from_utf8(&data[..pos]).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidData, "header is not valid UTF-8")
+        })?;
+
+        return Ok((header.to_string(), &data[pos + 4..]));
+    }
+
+    Err(io::Error::new(
+        io::ErrorKind::InvalidData,
+        "missing blob header/body separator",
+    ))
+}
+
+fn parse_secure_priority_scheduler_meta(header: &str, body_len: usize) -> io::Result<SecurePrioritySchedulerBlobMeta> {
+    let mut lines = header.lines();
+    let magic = lines.next().unwrap_or_default();
+    if magic != PRIORITY_SCHEDULER_BLOB_MAGIC {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "secure scheduler blob magic mismatch",
+        ));
+    }
+
+    let mut algorithm = CompressionAlgorithm::Identity;
+    let mut nonce_b64 = None::<String>;
+    let mut digest_b64 = None::<String>;
+    let mut tag_b64 = None::<String>;
+    let mut raw_size = None::<usize>;
+    let mut encoded_size = None::<usize>;
+    let mut issued_at_unix = None::<u64>;
+    for line in lines {
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        let (key, value) = line.split_once('=').ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid secure scheduler header line '{}'", line),
+            )
+        })?;
+
+        match key.trim() {
+            "content-encoding" => {
+                algorithm =
+                    CompressionAlgorithm::from_content_encoding(value.trim()).ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("unsupported content-encoding '{}'", value.trim()),
+                        )
+                    })?;
+            }
+            "nonce" => nonce_b64 = Some(value.trim().to_string()),
+            "digest" => {
+                let parsed = value.trim().strip_prefix("SHA-256=").ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "invalid digest header")
+                })?.to_string();
+
+                digest_b64 = Some(parsed);
+            }
+            "tag" => {
+                let parsed = value.trim().strip_prefix("HMAC-SHA-256=").ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "invalid tag header")
+                })?.to_string();
+
+                tag_b64 = Some(parsed);
+            }
+            "raw-size" => {
+                raw_size = Some(value.trim().parse::<usize>().map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidData, "invalid raw-size")
+                })?);
+            }
+            "encoded-size" => {
+                encoded_size = Some(value.trim().parse::<usize>().map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidData, "invalid encoded-size")
+                })?);
+            }
+            "issued-at" => {
+                issued_at_unix = Some(value.trim().parse::<u64>().map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidData, "invalid issued-at")
+                })?);
+            }
+            _ => {}
+        }
+    }
+
+    let nonce_b64 = nonce_b64.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "missing nonce in secure scheduler blob",
+        )
+    })?;
+
+    let digest_b64 = digest_b64.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "missing digest in secure scheduler blob",
+        )
+    })?;
+
+    let tag_b64 = tag_b64.ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidData, "missing tag in secure scheduler blob")
+    })?;
+
+    let raw_size = raw_size.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "missing raw-size in secure scheduler blob",
+        )
+    })?;
+
+    let encoded_size = encoded_size.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "missing encoded-size in secure scheduler blob",
+        )
+    })?;
+
+    if encoded_size != body_len {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "encoded-size mismatch: metadata {}, actual {}",
+                encoded_size, body_len
+            ),
+        ));
+    }
+
+    let issued_at_unix = issued_at_unix.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "missing issued-at in secure scheduler blob",
+        )
+    })?;
+
+    Ok(SecurePrioritySchedulerBlobMeta {
+        algorithm,
+        nonce_b64,
+        digest_b64,
+        tag_b64,
+        raw_size,
+        encoded_size,
+        issued_at_unix,
+    })
 }
 
 impl Default for PriorityScheduler {
@@ -481,5 +1158,43 @@ mod tests {
         assert_eq!(stats.active_streams, 2);
         assert_eq!(stats.tree_depth, 3);
         assert_eq!(stats.total_pending_bytes, 3000);
+    }
+
+    #[test]
+    fn test_secure_priority_scheduler_roundtrip_identity() {
+        let mut scheduler = PriorityScheduler::new();
+        scheduler.add_stream(1, Priority::new(0, 32, false));
+        scheduler.add_stream(3, Priority::new(1, 16, false));
+        scheduler.mark_ready(1, 1200);
+        scheduler.mark_ready(3, 800);
+        scheduler.bytes_sent(1, 200);
+
+        let (_meta, blob) =
+            encode_secure_priority_scheduler(&scheduler, CompressionAlgorithm::Identity).unwrap();
+        let (_decoded_meta, decoded) = decode_secure_priority_scheduler(&blob).unwrap();
+
+        assert_eq!(decoded.total_pending_bytes(), scheduler.total_pending_bytes());
+        assert_eq!(decoded.get_state(1), scheduler.get_state(1));
+        assert_eq!(decoded.get_state(3), scheduler.get_state(3));
+        assert_eq!(decoded.active_count(), scheduler.active_count());
+        assert_eq!(
+            decoded.get_tree_stats().tree_depth,
+            scheduler.get_tree_stats().tree_depth
+        );
+    }
+
+    #[test]
+    fn test_secure_priority_scheduler_tamper_detected() {
+        let mut scheduler = PriorityScheduler::new();
+        scheduler.add_stream(1, Priority::new(0, 16, false));
+        scheduler.mark_ready(1, 1000);
+
+        let (_meta, mut blob) =
+            encode_secure_priority_scheduler(&scheduler, CompressionAlgorithm::Identity).unwrap();
+
+        let last = blob.len() - 1;
+        blob[last] ^= 0x01;
+
+        assert!(decode_secure_priority_scheduler(&blob).is_err());
     }
 }

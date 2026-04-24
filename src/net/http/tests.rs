@@ -79,12 +79,10 @@ mod integration_tests {
         let _get = client.get("http://example.com");
         let _post = client.post("http://example.com", vec![1, 2, 3]);
         
-        let mut request = HttpRequest::new(HttpMethod::PUT, "http://example.com");
-        request.set_body(b"test data".to_vec());
-        let _put = client.execute(request);
+        let _put = client.execute(HttpRequest::new(HttpMethod::PUT, "http://example.com"));
 
-        let request = HttpRequest::new(HttpMethod::DELETE, "http://example.com");
-        let _delete = client.execute(request);
+        let delete_request = HttpRequest::new(HttpMethod::DELETE, "http://example.com");
+        let _delete = client.execute(delete_request);
     }
 
     #[test]
@@ -100,10 +98,10 @@ mod integration_tests {
 
     #[test]
     fn test_request_body() {
-        let mut request = HttpRequest::new(HttpMethod::POST, "http://example.com");
+        let request = HttpRequest::new(HttpMethod::POST, "http://example.com");
         let body_data = b"test request body".to_vec();
         
-        request.set_body(body_data.clone());
+        let request = request.set_body(body_data.clone());
         
         assert_eq!(request.headers().get("Content-Length"), Some("17"));
     }

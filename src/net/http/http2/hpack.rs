@@ -1,4 +1,12 @@
+use crate::crypto::constant_time_eq;
+use crate::crypto::encoding::pem;
+use crate::crypto::hash::hmac::hmac_sha256;
+use crate::crypto::hash::sha2::sha256;
+use crate::crypto::random;
+use crate::net::http::compression::{self, CompressionAlgorithm, CompressionLevel};
 use std::collections::HashMap;
+use std::io;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 // HPACK static table as per RFC 7541 Appendix A
 const STATIC_TABLE: &[(&str, &str)] = &[
@@ -65,6 +73,20 @@ const STATIC_TABLE: &[(&str, &str)] = &[
     ("www-authenticate", ""),
 ];
 
+const HPACK_CODEC_BLOB_MAGIC: &str = "SINGULARITY_HTTP2_HPACK_CODEC_BLOB_V1";
+const HPACK_CODEC_BLOB_CONTEXT: &str = "SINGULARITY_HTTP2_HPACK_CODEC_BLOB_BINDING_V1";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SecureHpackCodecBlobMeta {
+    pub algorithm: CompressionAlgorithm,
+    pub nonce_b64: String,
+    pub digest_b64: String,
+    pub tag_b64: String,
+    pub raw_size: usize,
+    pub encoded_size: usize,
+    pub issued_at_unix: u64,
+}
+
 #[derive(Debug, Clone)]
 struct HuffmanNode {
     symbol: Option<u16>,
@@ -115,8 +137,19 @@ impl HpackCodec {
         }
     }
 
-    fn build_huffman_tree(codes: &[(u8, u32, u8)]) -> HuffmanNode {
+    pub fn to_secure_blob(&self, algorithm: CompressionAlgorithm) -> io::Result<(SecureHpackCodecBlobMeta, Vec<u8>)> {
+        encode_secure_hpack_codec(self, algorithm)
+    }
 
+    pub fn to_secure_blob_auto(&self, accept_encoding: &str) -> io::Result<(SecureHpackCodecBlobMeta, Vec<u8>)> {
+        encode_secure_hpack_codec_auto(self, accept_encoding)
+    }
+
+    pub fn from_secure_blob(data: &[u8]) -> io::Result<(SecureHpackCodecBlobMeta, Self)> {
+        decode_secure_hpack_codec(data)
+    }
+
+    fn build_huffman_tree(codes: &[(u8, u32, u8)]) -> HuffmanNode {
         // Huffman codes from RFC 7541 Appendix B
         // Format: (symbol, code_bits, code_length)
         let mut root = HuffmanNode::new();
@@ -132,19 +165,16 @@ impl HpackCodec {
                     } else {
                         node.right = Some(Box::new(HuffmanNode::leaf(symbol)));
                     }
-                } else {
-                    // Intermediate node
-                    if bit == 0 {
-                        if node.left.is_none() {
-                            node.left = Some(Box::new(HuffmanNode::new()));
-                        }
-                        node = node.left.as_mut().unwrap();
-                    } else {
-                        if node.right.is_none() {
-                            node.right = Some(Box::new(HuffmanNode::new()));
-                        }
-                        node = node.right.as_mut().unwrap();
+                } else if bit == 0 {
+                    if node.left.is_none() {
+                        node.left = Some(Box::new(HuffmanNode::new()));
                     }
+                    node = node.left.as_mut().expect("left exists");
+                } else {
+                    if node.right.is_none() {
+                        node.right = Some(Box::new(HuffmanNode::new()));
+                    }
+                    node = node.right.as_mut().expect("right exists");
                 }
             }
         }
@@ -417,7 +447,6 @@ impl HpackCodec {
     }
 
     pub fn encode(&mut self, headers: &HashMap<String, String>) -> Vec<u8> {
-
         // Encoding HPACK headers
         // Done by checking static table first
         // then encoding as indexed or literal header fields
@@ -445,14 +474,13 @@ impl HpackCodec {
     }
 
     pub fn decode(&mut self, data: &[u8]) -> Result<HashMap<String, String>, String> {
-
         // Decoding HPACK encoded headers
         // Done by reading the bytes and interpreting them
         // according to the HPACK specification
         let mut headers = HashMap::new();
         let mut pos = 0;
         while pos < data.len() {
-            let byte = data[pos];            
+            let byte = data[pos];
             if byte & 0x80 != 0 {
                 let (index, consumed) = self.decode_integer(&data[pos..], 7)?;
                 pos += consumed;
@@ -540,8 +568,9 @@ impl HpackCodec {
         }
         
         let dynamic_index = index - STATIC_TABLE.len() - 1;
-        self.dynamic_table.get(dynamic_index)
-            .map(|(n, v)| (n.clone(), v.clone()))
+        self.dynamic_table.get(dynamic_index).map(|(n, v)| {
+            (n.clone(), v.clone())
+        })
     }
 
     fn add_to_dynamic_table(&mut self, name: String, value: String) {
@@ -550,19 +579,18 @@ impl HpackCodec {
     }
 
     fn evict_to_fit(&mut self) {
-        while self.current_dynamic_table_size() > self.max_dynamic_table_size 
-            && !self.dynamic_table.is_empty() {
+        while self.current_dynamic_table_size() > self.max_dynamic_table_size && !self.dynamic_table.is_empty() {
             self.dynamic_table.pop();
         }
     }
 
     fn current_dynamic_table_size(&self) -> usize {
-        self.dynamic_table.iter()
-            .map(|(n, v)| n.len() + v.len() + 32)
-            .sum()
+        self.dynamic_table.iter().map(|(n, v)| {
+            n.len() + v.len() + 32
+        }).sum()
     }
 
-    fn encode_integer(&self, output: &mut Vec<u8>, mut value: usize, prefix_bits: u8) {        
+    fn encode_integer(&self, output: &mut Vec<u8>, mut value: usize, prefix_bits: u8) {
         // Encoding var-length integer
         // Done by using the prefix bits and continuing with bytes
         // with MSB set until the value is fully encoded
@@ -570,14 +598,14 @@ impl HpackCodec {
         if value < max_prefix {
             if output.is_empty() {
                 output.push(value as u8);
-            } else {
-                *output.last_mut().unwrap() |= value as u8;
+            } else if let Some(last) = output.last_mut() {
+                *last |= value as u8;
             }
         } else {
             if output.is_empty() {
                 output.push(max_prefix as u8);
-            } else {
-                *output.last_mut().unwrap() |= max_prefix as u8;
+            } else if let Some(last) = output.last_mut() {
+                *last |= max_prefix as u8;
             }
             
             value -= max_prefix;
@@ -585,6 +613,7 @@ impl HpackCodec {
                 output.push((value % 128 + 128) as u8);
                 value /= 128;
             }
+
             output.push(value as u8);
         }
     }
@@ -596,14 +625,12 @@ impl HpackCodec {
         
         let mask = (1 << prefix_bits) - 1;
         let mut value = (data[0] & mask as u8) as usize;
-        
         if value < mask {
             return Ok((value, 1));
         }
         
         let mut pos = 1;
         let mut m = 0;
-        
         loop {
             if pos >= data.len() {
                 return Err("Incomplete integer".to_string());
@@ -611,14 +638,12 @@ impl HpackCodec {
             
             let byte = data[pos] as usize;
             value += (byte & 0x7F) << m;
-            
             if byte & 0x80 == 0 {
                 return Ok((value, pos + 1));
             }
             
             pos += 1;
             m += 7;
-            
             if m > 28 {
                 return Err("Integer overflow".to_string());
             }
@@ -628,7 +653,6 @@ impl HpackCodec {
     fn encode_string_with_huffman(&self, output: &mut Vec<u8>, s: &str) {
         let bytes = s.as_bytes();
         let huffman_encoded = self.huffman_encode(bytes);
-        
         if huffman_encoded.len() < bytes.len() {
             let len_byte = 0x80 | (huffman_encoded.len() as u8);
             output.push(len_byte);
@@ -643,14 +667,13 @@ impl HpackCodec {
         if data.is_empty() {
             return Err("Empty data for string decode".to_string());
         }
-        
+
         let huffman = data[0] & 0x80 != 0;
         let (length, consumed) = self.decode_integer(data, 7)?;
-        
         if data.len() < consumed + length {
             return Err("Incomplete string data".to_string());
         }
-        
+
         let string_data = &data[consumed..consumed + length];
         let s = if huffman {
             self.huffman_decode(string_data)?
@@ -658,7 +681,7 @@ impl HpackCodec {
             String::from_utf8(string_data.to_vec())
                 .map_err(|_| "Invalid UTF-8 in header string".to_string())?
         };
-        
+
         Ok((s, consumed + length))
     }
 
@@ -674,7 +697,7 @@ impl HpackCodec {
                 let bits_to_write = (8 - bits_used).min(remaining_bits);
                 let shift = remaining_bits - bits_to_write;
                 let bits = ((code_bits >> shift) & ((1 << bits_to_write) - 1)) as u8;
-                
+
                 current_byte |= bits << (8 - bits_used - bits_to_write);
                 bits_used += bits_to_write;
                 remaining_bits -= bits_to_write;
@@ -685,23 +708,21 @@ impl HpackCodec {
                 }
             }
         }
-        
+
         if bits_used > 0 {
             current_byte |= (1 << (8 - bits_used)) - 1;
             output.push(current_byte);
         }
-        
+
         output
     }
 
     fn huffman_decode(&self, data: &[u8]) -> Result<String, String> {
         let mut output = Vec::new();
         let mut node = &self.huffman_root;
-        
         for &byte in data {
             for i in (0..8).rev() {
                 let bit = (byte >> i) & 1;
-                
                 node = if bit == 0 {
                     node.left.as_deref().ok_or("Invalid Huffman sequence")?
                 } else {
@@ -717,12 +738,425 @@ impl HpackCodec {
                 }
             }
         }
-        
-        String::from_utf8(output)
-            .map_err(|_| "Invalid UTF-8 in Huffman decoded string".to_string())
+
+        String::from_utf8(output).map_err(|_| "Invalid UTF-8 in Huffman decoded string".to_string())
     }
 }
 
+pub fn select_secure_hpack_codec_algorithm(accept_encoding: &str) -> CompressionAlgorithm {
+    compression::parse_accept_encoding(accept_encoding).into_iter().find_map(|(algorithm, quality)| {
+        if quality > 0.0 && algorithm.is_implemented() {
+            Some(algorithm)
+        } else {
+            None
+        }
+    }).unwrap_or(CompressionAlgorithm::Identity)
+}
+
+pub fn encode_secure_hpack_codec(codec: &HpackCodec, algorithm: CompressionAlgorithm) -> io::Result<(SecureHpackCodecBlobMeta, Vec<u8>)> {
+    let mut selected_algorithm = algorithm;
+    if !selected_algorithm.is_implemented() {
+        selected_algorithm = CompressionAlgorithm::Identity;
+    }
+
+    let raw_payload = serialize_hpack_codec(codec);
+    let encoded_payload = if selected_algorithm == CompressionAlgorithm::Identity {
+        raw_payload.clone()
+    } else {
+        compression::compress(selected_algorithm, &raw_payload, CompressionLevel::Default)?
+    };
+
+    let nonce = random::generate_random(24).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::Other,
+            format!("failed to generate HPACK blob nonce: {}", e),
+        )
+    })?;
+
+    let digest = sha256(&raw_payload);
+    let tag = compute_hpack_blob_tag(&nonce, selected_algorithm, raw_payload.len(), &encoded_payload);
+
+    let nonce_b64 = pem::encode(&nonce);
+    let digest_b64 = pem::encode(&digest);
+    let tag_b64 = pem::encode(&tag);
+    let issued_at_unix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    let header = format!(
+        "{magic}\ncontent-encoding={encoding}\nnonce={nonce}\ndigest=SHA-256={digest}\ntag=HMAC-SHA-256={tag}\nraw-size={raw_size}\nencoded-size={encoded_size}\nissued-at={issued_at}\n\n",
+        magic = HPACK_CODEC_BLOB_MAGIC,
+        encoding = selected_algorithm.content_encoding(),
+        nonce = nonce_b64,
+        digest = digest_b64,
+        tag = tag_b64,
+        raw_size = raw_payload.len(),
+        encoded_size = encoded_payload.len(),
+        issued_at = issued_at_unix
+    );
+
+    let mut blob = header.into_bytes();
+    blob.extend_from_slice(&encoded_payload);
+
+    Ok((SecureHpackCodecBlobMeta {
+            algorithm: selected_algorithm,
+            nonce_b64,
+            digest_b64,
+            tag_b64,
+            raw_size: raw_payload.len(),
+            encoded_size: encoded_payload.len(),
+            issued_at_unix,
+        },
+        blob,
+    ))
+}
+
+pub fn encode_secure_hpack_codec_auto(codec: &HpackCodec, accept_encoding: &str) -> io::Result<(SecureHpackCodecBlobMeta, Vec<u8>)> {
+    let selected = select_secure_hpack_codec_algorithm(accept_encoding);
+    encode_secure_hpack_codec(codec, selected)
+}
+
+pub fn decode_secure_hpack_codec(data: &[u8]) -> io::Result<(SecureHpackCodecBlobMeta, HpackCodec)> {
+    let (header, body) = split_header_body(data)?;
+    let meta = parse_secure_hpack_meta(&header, body.len())?;
+    let nonce = pem::decode(&meta.nonce_b64).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid nonce encoding: {}", e),
+        )
+    })?;
+
+    let expected_digest = pem::decode(&meta.digest_b64).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid digest encoding: {}", e),
+        )
+    })?;
+
+    let provided_tag = pem::decode(&meta.tag_b64).map_err(|e| {
+        io::Error::new(io::ErrorKind::InvalidData, format!("invalid tag encoding: {}", e))
+    })?;
+
+    if expected_digest.len() != 32 || provided_tag.len() != 32 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "digest or tag has invalid length",
+        ));
+    }
+
+    let expected_tag = compute_hpack_blob_tag(&nonce, meta.algorithm, meta.raw_size, body);
+    if !constant_time_eq(&expected_tag, &provided_tag) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "HPACK blob HMAC mismatch",
+        ));
+    }
+
+    let raw_payload = if meta.algorithm == CompressionAlgorithm::Identity {
+        body.to_vec()
+    } else {
+        compression::decompress(meta.algorithm, body)?
+    };
+
+    if raw_payload.len() != meta.raw_size {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "raw-size mismatch: expected {}, got {}",
+                meta.raw_size,
+                raw_payload.len()
+            ),
+        ));
+    }
+
+    let actual_digest = sha256(&raw_payload);
+    if !constant_time_eq(&actual_digest, &expected_digest) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "HPACK blob digest mismatch",
+        ));
+    }
+
+    let codec = deserialize_hpack_codec(&raw_payload)?;
+    Ok((meta, codec))
+}
+
+fn serialize_hpack_codec(codec: &HpackCodec) -> Vec<u8> {
+    let mut lines = Vec::new();
+    lines.push(format!(
+        "max-dynamic-table-size={}",
+        codec.max_dynamic_table_size
+    ));
+
+    lines.push(format!("dynamic-count={}", codec.dynamic_table.len()));
+    for (idx, (name, value)) in codec.dynamic_table.iter().enumerate() {
+        lines.push(format!(
+            "dynamic-{}-name={}",
+            idx,
+            pem::encode(name.as_bytes())
+        ));
+
+        lines.push(format!(
+            "dynamic-{}-value={}",
+            idx,
+            pem::encode(value.as_bytes())
+        ));
+    }
+
+    lines.join("\n").into_bytes()
+}
+
+fn deserialize_hpack_codec(raw_payload: &[u8]) -> io::Result<HpackCodec> {
+    let text = String::from_utf8(raw_payload.to_vec()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "HPACK payload is not valid UTF-8",
+        )
+    })?;
+
+    let mut kv: HashMap<String, String> = HashMap::new();
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        let (key, value) = trimmed.split_once('=').ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid HPACK payload line '{}'", trimmed),
+            )
+        })?;
+
+        kv.insert(key.to_string(), value.to_string());
+    }
+
+    let max_dynamic_table_size = parse_usize(
+        required_field(&kv, "max-dynamic-table-size")?,
+        "max-dynamic-table-size",
+    )?;
+
+    let dynamic_count = parse_usize(required_field(&kv, "dynamic-count")?, "dynamic-count")?;
+    let mut codec = HpackCodec::new(max_dynamic_table_size);
+    codec.dynamic_table.clear();
+    for idx in 0..dynamic_count {
+        let name_bytes = decode_blob_field(
+            required_field(&kv, &format!("dynamic-{}-name", idx))?,
+            &format!("dynamic-{}-name", idx),
+        )?;
+
+        let value_bytes = decode_blob_field(
+            required_field(&kv, &format!("dynamic-{}-value", idx))?,
+            &format!("dynamic-{}-value", idx),
+        )?;
+
+        let name = String::from_utf8(name_bytes).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("dynamic-{}-name is not valid UTF-8", idx),
+            )
+        })?;
+
+        let value = String::from_utf8(value_bytes).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("dynamic-{}-value is not valid UTF-8", idx),
+            )
+        })?;
+
+        codec.dynamic_table.push((name, value));
+    }
+
+    codec.evict_to_fit();
+    Ok(codec)
+}
+
+fn decode_blob_field(value: &str, field: &str) -> io::Result<Vec<u8>> {
+    pem::decode(value).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid {} encoding: {}", field, e),
+        )
+    })
+}
+
+fn required_field<'a>(kv: &'a HashMap<String, String>, key: &str) -> io::Result<&'a str> {
+    kv.get(key).map(|v| v.as_str()).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("missing {} in HPACK payload", key),
+        )
+    })
+}
+
+fn parse_usize(v: &str, field: &str) -> io::Result<usize> {
+    v.parse::<usize>().map_err(|_| {
+        io::Error::new(io::ErrorKind::InvalidData, format!("invalid {}", field))
+    })
+}
+
+fn compute_hpack_blob_tag(nonce: &[u8], algorithm: CompressionAlgorithm, raw_size: usize, encoded_payload: &[u8]) -> [u8; 32] {
+    let mut mac_input = Vec::new();
+    mac_input.extend_from_slice(HPACK_CODEC_BLOB_CONTEXT.as_bytes());
+    mac_input.extend_from_slice(algorithm.content_encoding().as_bytes());
+    mac_input.extend_from_slice(&(raw_size as u64).to_be_bytes());
+    mac_input.extend_from_slice(nonce);
+    mac_input.extend_from_slice(encoded_payload);
+    hmac_sha256(HPACK_CODEC_BLOB_CONTEXT.as_bytes(), &mac_input)
+}
+
+fn split_header_body(data: &[u8]) -> io::Result<(String, &[u8])> {
+    if let Some(pos) = data.windows(2).position(|w| w == b"\n\n") {
+        let header = std::str::from_utf8(&data[..pos]).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidData, "header is not valid UTF-8")
+        })?;
+
+        return Ok((header.to_string(), &data[pos + 2..]));
+    }
+
+    if let Some(pos) = data.windows(4).position(|w| w == b"\r\n\r\n") {
+        let header = std::str::from_utf8(&data[..pos]).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidData, "header is not valid UTF-8")
+        })?;
+
+        return Ok((header.to_string(), &data[pos + 4..]));
+    }
+
+    Err(io::Error::new(
+        io::ErrorKind::InvalidData,
+        "missing blob header/body separator",
+    ))
+}
+
+fn parse_secure_hpack_meta(header: &str, body_len: usize) -> io::Result<SecureHpackCodecBlobMeta> {
+    let mut lines = header.lines();
+    let magic = lines.next().unwrap_or_default();
+    if magic != HPACK_CODEC_BLOB_MAGIC {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "secure HPACK blob magic mismatch",
+        ));
+    }
+
+    let mut algorithm = CompressionAlgorithm::Identity;
+    let mut nonce_b64 = None::<String>;
+    let mut digest_b64 = None::<String>;
+    let mut tag_b64 = None::<String>;
+    let mut raw_size = None::<usize>;
+    let mut encoded_size = None::<usize>;
+    let mut issued_at_unix = None::<u64>;
+    for line in lines {
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        let (key, value) = line.split_once('=').ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid secure HPACK header line '{}'", line),
+            )
+        })?;
+
+        match key.trim() {
+            "content-encoding" => {
+                algorithm =
+                    CompressionAlgorithm::from_content_encoding(value.trim()).ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("unsupported content-encoding '{}'", value.trim()),
+                        )
+                    })?;
+            }
+            "nonce" => nonce_b64 = Some(value.trim().to_string()),
+            "digest" => {
+                let parsed = value.trim().strip_prefix("SHA-256=").ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "invalid digest header")
+                })?.to_string();
+
+                digest_b64 = Some(parsed);
+            }
+            "tag" => {
+                let parsed = value.trim().strip_prefix("HMAC-SHA-256=").ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "invalid tag header")
+                })?.to_string();
+
+                tag_b64 = Some(parsed);
+            }
+            "raw-size" => {
+                raw_size = Some(value.trim().parse::<usize>().map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidData, "invalid raw-size")
+                })?,);
+            }
+            "encoded-size" => {
+                encoded_size = Some(value.trim().parse::<usize>().map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidData, "invalid encoded-size")
+                })?,);
+            }
+            "issued-at" => {
+                issued_at_unix = Some(value.trim().parse::<u64>().map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidData, "invalid issued-at")
+                })?,);
+            }
+            _ => {}
+        }
+    }
+
+    let nonce_b64 = nonce_b64.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "missing nonce in secure HPACK blob",
+        )
+    })?;
+
+    let digest_b64 = digest_b64.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "missing digest in secure HPACK blob",
+        )
+    })?;
+
+    let tag_b64 = tag_b64.ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidData, "missing tag in secure HPACK blob")
+    })?;
+
+    let raw_size = raw_size.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "missing raw-size in secure HPACK blob",
+        )
+    })?;
+
+    let encoded_size = encoded_size.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "missing encoded-size in secure HPACK blob",
+        )
+    })?;
+
+    if encoded_size != body_len {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "encoded-size mismatch: metadata {}, actual {}",
+                encoded_size, body_len
+            ),
+        ));
+    }
+
+    let issued_at_unix = issued_at_unix.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "missing issued-at in secure HPACK blob",
+        )
+    })?;
+
+    Ok(SecureHpackCodecBlobMeta {
+        algorithm,
+        nonce_b64,
+        digest_b64,
+        tag_b64,
+        raw_size,
+        encoded_size,
+        issued_at_unix,
+    })
+}
 
 #[cfg(test)]
 mod tests {
@@ -731,7 +1165,7 @@ mod tests {
     #[test]
     fn test_huffman_encode_decode() {
         let codec = HpackCodec::new(4096);
-        
+
         let test_cases = vec![
             "www.example.com",
             "GET",
@@ -740,7 +1174,7 @@ mod tests {
             "Mozilla/5.0",
             "gzip, deflate",
         ];
-        
+
         for input in test_cases {
             let encoded = codec.huffman_encode(input.as_bytes());
             let decoded_str = codec.huffman_decode(&encoded).expect("Decode failed");
@@ -751,12 +1185,11 @@ mod tests {
     #[test]
     fn test_huffman_compression() {
         let codec = HpackCodec::new(4096);
-        
+
         let input = "www.example.com";
         let plain = input.as_bytes();
         let encoded = codec.huffman_encode(plain);
-        
-        // Huffman encoding should be smaller for this text
+
         assert!(encoded.len() < plain.len());
     }
 
@@ -764,17 +1197,54 @@ mod tests {
     fn test_hpack_encode_decode() {
         let mut encoder = HpackCodec::new(4096);
         let mut decoder = HpackCodec::new(4096);
-        
+
         let headers: HashMap<String, String> = vec![
             (":method".to_string(), "GET".to_string()),
             (":path".to_string(), "/".to_string()),
             (":scheme".to_string(), "https".to_string()),
             ("user-agent".to_string(), "test".to_string()),
-        ].into_iter().collect();
-        
+        ]
+        .into_iter()
+        .collect();
+
         let encoded = encoder.encode(&headers);
         let decoded = decoder.decode(&encoded).expect("Decode failed");
-        
+
         assert_eq!(headers, decoded);
+    }
+
+    #[test]
+    fn test_secure_hpack_codec_roundtrip() {
+        let mut codec = HpackCodec::new(4096);
+        let headers: HashMap<String, String> = vec![
+            ("x-test-header".to_string(), "alpha".to_string()),
+            ("x-test-header-2".to_string(), "beta".to_string()),
+        ]
+        .into_iter()
+        .collect();
+
+        let _ = codec.encode(&headers);
+
+        let (meta, blob) =
+            encode_secure_hpack_codec(&codec, CompressionAlgorithm::Identity).expect("encode blob");
+        assert_eq!(meta.algorithm, CompressionAlgorithm::Identity);
+
+        let (decoded_meta, restored) = decode_secure_hpack_codec(&blob).expect("decode blob");
+        assert_eq!(decoded_meta.algorithm, CompressionAlgorithm::Identity);
+        assert_eq!(restored.max_dynamic_table_size, codec.max_dynamic_table_size);
+        assert_eq!(restored.dynamic_table, codec.dynamic_table);
+    }
+
+    #[test]
+    fn test_secure_hpack_codec_tamper_detection() {
+        let codec = HpackCodec::new(4096);
+        let (_, mut blob) =
+            encode_secure_hpack_codec(&codec, CompressionAlgorithm::Identity).expect("encode blob");
+
+        let idx = blob.len() - 1;
+        blob[idx] ^= 0x01;
+
+        let result = decode_secure_hpack_codec(&blob);
+        assert!(result.is_err());
     }
 }
