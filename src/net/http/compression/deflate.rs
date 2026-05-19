@@ -139,7 +139,7 @@ impl HuffmanTree {
             for huffman_code in &self.codes {
                 if huffman_code.length == bit_len as u8 && huffman_code.code == code {
                     match huffman_code.symbol {
-                        0..=255 | 256..=285 | 256 => return Some(huffman_code.symbol),
+                        0..=255 | 256..=285 => return Some(huffman_code.symbol),
                         _ => return None,
                     }
                 }

@@ -1,6 +1,6 @@
 use super::congestion::{CongestionAlgorithm, CongestionController};
-use super::error::{Error, Result};
-use super::packet::{Packet, PacketNumberSpace};
+use super::error::Result;
+use super::packet::PacketNumberSpace;
 use crate::crypto::constant_time_eq;
 use crate::crypto::encoding::pem;
 use crate::crypto::hash::hmac::hmac_sha256;

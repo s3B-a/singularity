@@ -8,7 +8,7 @@ use crate::crypto::hash::sha2::sha256;
 use crate::crypto::random;
 use crate::net::tcp::{TcpListener, TcpStream};
 use std::collections::HashMap;
-use std::io::{self, BufRead, BufReader, Read, Write};
+use std::io::{self, BufRead, BufReader, Read};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};

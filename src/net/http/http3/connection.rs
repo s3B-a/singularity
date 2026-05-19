@@ -9,11 +9,9 @@ use crate::crypto::constant_time_eq;
 use crate::crypto::encoding::pem;
 use crate::crypto::hash::hmac::hmac_sha256;
 use crate::crypto::hash::sha2::sha256;
-use crate::crypto::random;
-use crate::net::http::compression::{self, CompressionAlgorithm, CompressionLevel};
+use crate::net::http::compression::{CompressionAlgorithm};
 use crate::net::udp::UdpSocket;
 use std::collections::{HashMap, VecDeque};
-use std::io::{self, Read, Write};
 use std::net::SocketAddr;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -360,7 +358,7 @@ impl Http3Connection {
     fn process_frame(&mut self, header: &PacketHeader, frame: Frame) -> Result<()> {
         match frame {
             Frame::Crypto { offset, data } => {
-                self.handle_crypto_frame(offset, data)?;
+                self.handle_crypto_frame(data)?;
             }
             Frame::Stream {
                 stream_id,
@@ -472,8 +470,8 @@ impl Http3Connection {
         self.crypto.update_application_keys()
     }
 
-    fn handle_crypto_frame(&mut self, offset: u64, data: Vec<u8>) -> Result<()> {
-        self.crypto.handle_frame(offset, data)?;
+    fn handle_crypto_frame(&mut self, data: Vec<u8>) -> Result<()> {
+        self.crypto.handle_crypto_data(&data)?;
         if self.state == ConnectionState::Handshake && self.crypto.is_handshake_complete() {
             self.on_handshake_complete()?;
         }

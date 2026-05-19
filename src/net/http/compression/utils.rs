@@ -1,4 +1,4 @@
-use crate::net::http::compression::{self, CompressionAlgorithm, CompressionLevel};
+use crate::net::http::compression::{CompressionAlgorithm, CompressionLevel};
 use crate::crypto::constant_time_eq;
 use crate::crypto::encoding::pem;
 use crate::crypto::hash::hmac::hmac_sha256;

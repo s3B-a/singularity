@@ -19,7 +19,6 @@ use crate::net::tcp::TcpStream;
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, BufRead, BufReader, Read};
 use std::net::{IpAddr, SocketAddr};
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const HTTP_CLIENT_PROFILE_BLOB_MAGIC: &str = "SINGULARITY_HTTP_CLIENT_PROFILE_BLOB_V1";
@@ -2211,7 +2210,7 @@ impl HttpClient {
 
     pub fn close_connection(&mut self, host: &str, port: u16) -> Result<(), io::Error> {
         let key = format!("{}:{}", host, port);
-        if let Some(mut entry) = self.http1_connections.remove(&key) {
+        if let Some(entry) = self.http1_connections.remove(&key) {
             let _ = entry.stream.shutdown(std::net::Shutdown::Both);
         }
 

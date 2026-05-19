@@ -224,8 +224,6 @@ fn sys_fill_bytes(dest: &mut [u8]) -> Result<()> {
 
         return Ok(());
     }
-
-    read_urandom(dest) // fallback
 }
 
 /**
