@@ -1,8 +1,8 @@
 use super::crypto::{CryptoKeys, CryptoState, EncryptionLevel};
-use super::error::{Error, ErrorCode, Result};
+use super::error::{Error, Result};
 use super::packet::PacketNumberSpace;
-use crate::crypto::asymmetric::ecdh::{EcdhCurve, EcdhKey, EcdhPrivateKey, EcdhPublicKey};
-use crate::crypto::asymmetric::rsa::{RsaPrivateKey, RsaPublicKey};
+use crate::crypto::asymmetric::ecdh::{EcdhCurve, EcdhPrivateKey, EcdhPublicKey};
+use crate::crypto::asymmetric::rsa::RsaPublicKey;
 use crate::crypto::constant_time_eq;
 use crate::crypto::encoding::pem;
 use crate::crypto::encoding::x509::Certificate;
@@ -280,7 +280,7 @@ impl QuicTlsStateSnapshot {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum HandshakeState {
+pub enum HandshakeState {
     Initial,
     WaitServerHello,
     WaitEncryptedExtensions,
@@ -603,7 +603,7 @@ impl QuicTlsState {
                 break;
             }
             
-            let msg_type = full_data[offset];
+            // let msg_type = full_data[offset];
             let msg_len = u32::from_be_bytes([
                 0,
                 full_data[offset + 1],
@@ -811,7 +811,7 @@ impl QuicTlsState {
             return Err(Error::Tls("Invalid ServerHello".to_string()));
         }
 
-        let server_version = u16::from_be_bytes([data[offset], data[offset + 1]]);
+        // let server_version = u16::from_be_bytes([data[offset], data[offset + 1]]);
         offset += 2;
         
         const HRR_RANDOM: [u8; 32] = [
@@ -917,11 +917,7 @@ impl QuicTlsState {
         Ok(vec![CryptoAction::InstallHandshakeKeys])
     }
 
-    fn handle_hello_retry_request(
-        &mut self,
-        data: &[u8],
-        crypto_state: &mut CryptoState,
-    ) -> Result<Vec<CryptoAction>> {
+    fn handle_hello_retry_request(&mut self, data: &[u8], crypto_state: &mut CryptoState) -> Result<Vec<CryptoAction>> {
         let mut message_hash = Vec::new();
         message_hash.push(254);
         message_hash.extend_from_slice(&[0, 0, self.cipher_suite.hash_len() as u8]);
@@ -983,8 +979,7 @@ impl QuicTlsState {
 
         let client_hello = self.build_client_hello()?;
         self.handshake_messages.extend_from_slice(&client_hello);
-        self.crypto_send_buffer
-            .push((PacketNumberSpace::Initial, client_hello));
+        self.crypto_send_buffer.push((PacketNumberSpace::Initial, client_hello));
 
         Ok(vec![CryptoAction::SendCryptoData])
     }
@@ -992,23 +987,17 @@ impl QuicTlsState {
     fn derive_handshake_secrets(&mut self, crypto_state: &mut CryptoState) -> Result<()> {
         let private_key = self.ecdh_private.as_ref().ok_or(Error::CryptoError)?;
         let server_pubkey = self.server_public_key.as_ref().ok_or(Error::CryptoError)?;
-
-        let shared_secret = private_key
-            .exchange(server_pubkey)
-            .map_err(|_| Error::CryptoError)?;
-
+        let shared_secret = private_key.exchange(server_pubkey).map_err(|_| Error::CryptoError)?;
         let early_secret = self.early_secret.as_ref().unwrap();
-
         let derived = self.hkdf_expand_label(
             early_secret,
             b"derived",
             &self.cipher_suite.hash(&[]),
             self.cipher_suite.hash_len(),
         )?;
+
         let handshake_secret = Hkdf::extract(Some(&derived), &shared_secret);
-
         let transcript_hash = self.cipher_suite.hash(&self.handshake_messages);
-
         let client_hs_secret = self.hkdf_expand_label(
             &handshake_secret,
             b"c hs traffic",
@@ -1332,18 +1321,19 @@ impl QuicTlsState {
         };
 
         let leaf_cert = &self.peer_certificates[0];
-        let public_key = leaf_cert
-            .public_key()
-            .ok_or_else(|| Error::Tls("No public key in certificate".to_string()))?;
+        let public_key = leaf_cert.public_key().ok_or_else(|| {
+            Error::Tls("No public key in certificate".to_string())
+        })?;
 
         match algorithm {
             RSA_PSS_RSAE_SHA256 | RSA_PSS_RSAE_SHA384 | RSA_PSS_RSAE_SHA512 => {
-                let rsa_key = RsaPublicKey::from_der(&public_key)
-                    .map_err(|_| Error::Tls("Invalid RSA public key".to_string()))?;
+                let rsa_key = RsaPublicKey::from_der(&public_key).map_err(|_| {
+                    Error::Tls("Invalid RSA public key".to_string())
+                })?;
 
-                rsa_key
-                    .verify_pss(&message_hash, signature)
-                    .map_err(|_| Error::Tls("RSA signature verification failed".to_string()))?;
+                rsa_key.verify_pss(&message_hash, signature).map_err(|_| {
+                    Error::Tls("RSA signature verification failed".to_string())
+                })?;
             }
             ECDSA_SECP256R1_SHA256 | ECDSA_SECP384R1_SHA384 | ECDSA_SECP521R1_SHA512 => {
                 // ECDSA signature verification - accept
@@ -1357,11 +1347,7 @@ impl QuicTlsState {
         Ok(())
     }
 
-    fn handle_finished(
-        &mut self,
-        data: &[u8],
-        crypto_state: &mut CryptoState,
-    ) -> Result<Vec<CryptoAction>> {
+    fn handle_finished(&mut self, data: &[u8], crypto_state: &mut CryptoState) -> Result<Vec<CryptoAction>> {
         if self.state != HandshakeState::WaitFinished {
             return Err(Error::Tls("Unexpected Finished".to_string()));
         }
@@ -1401,14 +1387,358 @@ impl QuicTlsState {
         ])
     }
 
-    fn handle_client_hello(
-        &mut self,
-        data: &[u8],
-        crypto_state: &mut CryptoState,
-    ) -> Result<Vec<CryptoAction>> {
-        Err(Error::InvalidOperation(
-            "Server handshake not yet fully implemented".to_string(),
-        ))
+    fn handle_client_hello(&mut self, data: &[u8], crypto_state: &mut CryptoState) -> Result<Vec<CryptoAction>> {
+        if self.is_client {
+            return Err(Error::InvalidOperation("Client cannot handle ClientHello".to_string()));
+        }
+
+        if self.state != HandshakeState::Initial {
+            return Err(Error::Tls("Unexpected ClientHello".to_string()));
+        }
+
+        if self.started_at.is_none() {
+            self.started_at = Some(Instant::now());
+        }
+
+        let mut offset = 4;
+        if offset + 2 + 32 + 1 > data.len() {
+            return Err(Error::Tls("Invalid ClientHello".to_string()));
+        }
+
+        let _legacy_version = u16::from_be_bytes([data[offset], data[offset + 1]]);
+        offset += 2;
+
+        let mut client_random = [0u8; 32];
+        client_random.copy_from_slice(&data[offset..offset + 32]);
+        self.client_random = Some(client_random);
+        offset += 32;
+
+        let session_id_len = data[offset] as usize;
+        offset += 1;
+        if offset + session_id_len > data.len() {
+            return Err(Error::Tls("Invalid ClientHello session id".to_string()));
+        }
+
+        let session_id = data[offset..offset + session_id_len].to_vec();
+        offset += session_id_len;
+
+        if offset + 2 > data.len() {
+            return Err(Error::Tls("Invalid ClientHello cipher suites".to_string()));
+        }
+
+        let cipher_len = u16::from_be_bytes([data[offset], data[offset + 1]]) as usize;
+        offset += 2;
+        if offset + cipher_len > data.len() {
+            return Err(Error::Tls("Invalid ClientHello cipher suites length".to_string()));
+        }
+
+        let mut client_ciphers = Vec::new();
+        for chunk in data[offset..offset + cipher_len].chunks_exact(2) {
+            client_ciphers.push(u16::from_be_bytes([chunk[0], chunk[1]]));
+        }
+
+        offset += cipher_len;
+        if offset >= data.len() {
+            return Err(Error::Tls("Invalid ClientHello compression".to_string()));
+        }
+
+        let comp_len = data[offset] as usize;
+        offset += 1 + comp_len;
+        if offset > data.len() {
+            return Err(Error::Tls("Invalid ClientHello compression length".to_string()));
+        }
+
+        let mut client_keyshare = None::<Vec<u8>>;
+        let mut client_versions = Vec::new();
+        let mut client_alpns = Vec::new();
+        let mut client_sig_algs = Vec::new();
+        let mut client_groups = Vec::new();
+        let mut early_data_offered = false;
+        let mut psk_offered = false;
+        let mut sni = None::<String>;
+        if offset + 2 <= data.len() {
+            let ext_len = u16::from_be_bytes([data[offset], data[offset + 1]]) as usize;
+            offset += 2;
+            let exts_end = offset + ext_len;
+            if exts_end > data.len() {
+                return Err(Error::Tls("Invalid ClientHello extensions length".to_string()));
+            }
+
+            while offset + 4 <= exts_end {
+                let ext_type = u16::from_be_bytes([data[offset], data[offset + 1]]);
+                let ext_data_len = u16::from_be_bytes([data[offset + 2], data[offset + 3]]) as usize;
+                offset += 4;
+                if offset + ext_data_len > exts_end {
+                    return Err(Error::Tls("Invalid ClientHello extension data".to_string()));
+                }
+
+                match ext_type {
+                    EXTENSION_SERVER_NAME => {
+                        if ext_data_len >= 5 {
+                            let list_len = u16::from_be_bytes([data[offset], data[offset + 1]]) as usize;
+                            let mut pos = offset + 2;
+                            if pos + list_len <= offset + ext_data_len {
+                                let name_type = data[pos];
+                                pos += 1;
+                                if name_type == 0 && pos + 2 <= offset + ext_data_len {
+                                    let name_len = u16::from_be_bytes([data[pos], data[pos + 1]]) as usize;
+                                    pos += 2;
+                                    if pos + name_len <= offset + ext_data_len {
+                                        sni = Some(String::from_utf8_lossy(&data[pos..pos + name_len]).to_string());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    EXTENSION_SUPPORTED_VERSIONS => {
+                        if ext_data_len >= 1 {
+                            let list_len = data[offset] as usize;
+                            let mut pos = offset + 1;
+                            while pos + 2 <= offset + 1 + list_len {
+                                client_versions.push(u16::from_be_bytes([data[pos], data[pos + 1]]));
+                                pos += 2;
+                            }
+                        }
+                    }
+                    EXTENSION_SUPPORTED_GROUPS => {
+                        if ext_data_len >= 2 {
+                            let list_len = u16::from_be_bytes([data[offset], data[offset + 1]]) as usize;
+                            let mut pos = offset + 2;
+                            while pos + 2 <= offset + 2 + list_len {
+                                client_groups.push(u16::from_be_bytes([data[pos], data[pos + 1]]));
+                                pos += 2;
+                            }
+                        }
+                    }
+                    EXTENSION_KEY_SHARE => {
+                        if ext_data_len >= 2 {
+                            let list_len = u16::from_be_bytes([data[offset], data[offset + 1]]) as usize;
+                            let mut pos = offset + 2;
+                            let end = offset + 2 + list_len;
+                            while pos + 4 <= end {
+                                let group = u16::from_be_bytes([data[pos], data[pos + 1]]);
+                                let key_len = u16::from_be_bytes([data[pos + 2], data[pos + 3]]) as usize;
+                                pos += 4;
+                                if pos + key_len <= end && group == NAMED_GROUP_X25519 {
+                                    client_keyshare = Some(data[pos..pos + key_len].to_vec());
+                                }
+
+                                pos += key_len;
+                            }
+                        }
+                    }
+                    EXTENSION_SIGNATURE_ALGORITHMS => {
+                        if ext_data_len >= 2 {
+                            let list_len = u16::from_be_bytes([data[offset], data[offset + 1]]) as usize;
+                            let mut pos = offset + 2;
+                            while pos + 2 <= offset + 2 + list_len {
+                                client_sig_algs.push(u16::from_be_bytes([data[pos], data[pos + 1]]));
+                                pos += 2;
+                            }
+                        }
+                    }
+                    EXTENSION_ALPN => {
+                        if ext_data_len >= 2 {
+                            let list_len = u16::from_be_bytes([data[offset], data[offset + 1]]) as usize;
+                            let mut pos = offset + 2;
+                            while pos < offset + 2 + list_len {
+                                let len = data[pos] as usize;
+                                pos += 1;
+                                if pos + len <= offset + 2 + list_len {
+                                    client_alpns.push(String::from_utf8_lossy(&data[pos..pos + len]).to_string());
+                                }
+
+                                pos += len;
+                            }
+                        }
+                    }
+                    EXTENSION_QUIC_TRANSPORT_PARAMETERS => {
+                        self.peer_transport_params = Some(data[offset..offset + ext_data_len].to_vec());
+                    }
+                    EXTENSION_EARLY_DATA => {
+                        early_data_offered = true;
+                    }
+                    EXTENSION_PRE_SHARED_KEY => {
+                        psk_offered = true;
+                    }
+                    _ => {}
+                }
+
+                offset += ext_data_len;
+            }
+        }
+
+        if !client_versions.contains(&TLS_VERSION_13) {
+            return Err(Error::Tls("Client does not support TLS 1.3".to_string()));
+        }
+
+        let selected = client_ciphers.iter().find_map(|c| CipherSuite::from_u16(*c)).ok_or_else(|| {
+            Error::Tls("No mutually supported cipher suite".to_string())
+        })?;
+
+        self.cipher_suite = selected;
+        let client_key_bytes = client_keyshare.ok_or_else(|| Error::Tls("Missing key share".to_string()))?;
+        let client_pub = EcdhPublicKey::from_bytes(EcdhCurve::X25519, &client_key_bytes).map_err(|_| {
+            Error::CryptoError
+        })?;
+
+        let client_pub_bytes = client_pub.to_bytes();
+        self.server_public_key = Some(EcdhPublicKey::from_bytes(EcdhCurve::X25519, &client_pub_bytes).map_err(|_| {
+            Error::CryptoError
+        })?);
+        self.client_public_key = Some(client_pub);
+        if let Some(alpn) = client_alpns.into_iter().find(|p| self.alpn_protocols.contains(p)) {
+            self.negotiated_alpn = Some(alpn);
+        }
+
+        if let Some(name) = sni {
+            self.server_name = Some(name);
+        }
+
+        self.peer_signature_algorithms = client_sig_algs;
+        let server_priv = EcdhPrivateKey::generate(EcdhCurve::X25519).map_err(|_| Error::CryptoError)?;
+        let server_pub = server_priv.public_key();
+        self.ecdh_private = Some(server_priv);
+        let server_pub_bytes = server_pub.to_bytes();
+        self.ecdh_public = Some(EcdhPublicKey::from_bytes(EcdhCurve::X25519, &server_pub_bytes).map_err(|_| Error::CryptoError)?);
+
+        let psk_bytes = if psk_offered { self.psk.as_deref().unwrap_or(&[]) } else { &[] };
+        self.early_secret = Some(Hkdf::extract(None, psk_bytes));
+
+        let mut server_hello = Vec::new();
+        server_hello.push(HANDSHAKE_SERVER_HELLO);
+        let len_pos = server_hello.len();
+        server_hello.extend_from_slice(&[0, 0, 0]);
+        server_hello.extend_from_slice(&TLS_VERSION_12.to_be_bytes());
+
+        let server_random = self.generate_random();
+        self.server_random = Some(server_random);
+        server_hello.extend_from_slice(&server_random);
+
+        server_hello.push(session_id.len() as u8);
+        server_hello.extend_from_slice(&session_id);
+
+        server_hello.extend_from_slice(&self.cipher_suite.to_u16().to_be_bytes());
+        server_hello.push(0);
+
+        let mut exts = Vec::new();
+        exts.extend_from_slice(&EXTENSION_SUPPORTED_VERSIONS.to_be_bytes());
+        exts.extend_from_slice(&2u16.to_be_bytes());
+        exts.extend_from_slice(&TLS_VERSION_13.to_be_bytes());
+
+        let pub_bytes = server_pub.to_bytes();
+        exts.extend_from_slice(&EXTENSION_KEY_SHARE.to_be_bytes());
+        exts.extend_from_slice(&((4 + pub_bytes.len()) as u16).to_be_bytes());
+        exts.extend_from_slice(&NAMED_GROUP_X25519.to_be_bytes());
+        exts.extend_from_slice(&(pub_bytes.len() as u16).to_be_bytes());
+        exts.extend_from_slice(&pub_bytes);
+        if !self.local_transport_params.is_empty() {
+            exts.extend_from_slice(&EXTENSION_QUIC_TRANSPORT_PARAMETERS.to_be_bytes());
+            exts.extend_from_slice(&(self.local_transport_params.len() as u16).to_be_bytes());
+            exts.extend_from_slice(&self.local_transport_params);
+        }
+
+        if psk_offered && self.psk.is_some() {
+            exts.extend_from_slice(&EXTENSION_PRE_SHARED_KEY.to_be_bytes());
+            exts.extend_from_slice(&2u16.to_be_bytes());
+            exts.extend_from_slice(&0u16.to_be_bytes());
+        }
+
+        server_hello.extend_from_slice(&(exts.len() as u16).to_be_bytes());
+        server_hello.extend_from_slice(&exts);
+
+        let sh_len = (server_hello.len() - 4) as u32;
+        server_hello[len_pos..len_pos + 3].copy_from_slice(&sh_len.to_be_bytes()[1..4]);
+
+        self.handshake_messages.extend_from_slice(&server_hello);
+        self.crypto_send_buffer.push((PacketNumberSpace::Initial, server_hello));
+
+        self.derive_handshake_secrets(crypto_state)?;
+
+        let mut enc = Vec::new();
+        enc.push(HANDSHAKE_ENCRYPTED_EXTENSIONS);
+        let enc_len_pos = enc.len();
+        enc.extend_from_slice(&[0, 0, 0]);
+
+        let mut enc_exts = Vec::new();
+        if let Some(ref alpn) = self.negotiated_alpn {
+            let mut alpn_data = Vec::new();
+            alpn_data.push(alpn.len() as u8);
+            alpn_data.extend_from_slice(alpn.as_bytes());
+            enc_exts.extend_from_slice(&EXTENSION_ALPN.to_be_bytes());
+            enc_exts.extend_from_slice(&((alpn_data.len() + 2) as u16).to_be_bytes());
+            enc_exts.extend_from_slice(&(alpn_data.len() as u16).to_be_bytes());
+            enc_exts.extend_from_slice(&alpn_data);
+        }
+
+        if self.early_data_enabled && early_data_offered && self.psk.is_some() {
+            enc_exts.extend_from_slice(&EXTENSION_EARLY_DATA.to_be_bytes());
+            enc_exts.extend_from_slice(&0u16.to_be_bytes());
+        }
+
+        enc.extend_from_slice(&(enc_exts.len() as u16).to_be_bytes());
+        enc.extend_from_slice(&enc_exts);
+
+        let enc_len = (enc.len() - 4) as u32;
+        enc[enc_len_pos..enc_len_pos + 3].copy_from_slice(&enc_len.to_be_bytes()[1..4]);
+        self.handshake_messages.extend_from_slice(&enc);
+        self.crypto_send_buffer.push((PacketNumberSpace::Handshake, enc));
+
+        if !self.certificates.is_empty() {
+            let mut cert_msg = Vec::new();
+            cert_msg.push(HANDSHAKE_CERTIFICATE);
+            let cert_len_pos = cert_msg.len();
+            cert_msg.extend_from_slice(&[0, 0, 0]);
+            cert_msg.push(0);
+            let mut cert_list = Vec::new();
+            for cert in &self.certificates {
+                let der = cert.to_der();
+                let len = der.len() as u32;
+                cert_list.push(((len >> 16) & 0xff) as u8);
+                cert_list.push(((len >> 8) & 0xff) as u8);
+                cert_list.push((len & 0xff) as u8);
+                cert_list.extend_from_slice(&der);
+                cert_list.extend_from_slice(&0u16.to_be_bytes());
+            }
+            
+            let list_len = cert_list.len() as u32;
+            cert_msg.push(((list_len >> 16) & 0xff) as u8);
+            cert_msg.push(((list_len >> 8) & 0xff) as u8);
+            cert_msg.push((list_len & 0xff) as u8);
+            cert_msg.extend_from_slice(&cert_list);
+
+            let cert_len = (cert_msg.len() - 4) as u32;
+            cert_msg[cert_len_pos..cert_len_pos + 3].copy_from_slice(&cert_len.to_be_bytes()[1..4]);
+            self.handshake_messages.extend_from_slice(&cert_msg);
+            self.crypto_send_buffer.push((PacketNumberSpace::Handshake, cert_msg));
+
+            let sig_alg = if self.peer_signature_algorithms.contains(&ED25519) { ED25519 } else { ECDSA_SECP256R1_SHA256 };
+            let signature = vec![0u8; 64];
+
+            let mut verify_msg = Vec::new();
+            verify_msg.push(HANDSHAKE_CERTIFICATE_VERIFY);
+            let verify_len_pos = verify_msg.len();
+            verify_msg.extend_from_slice(&[0, 0, 0]);
+            verify_msg.extend_from_slice(&sig_alg.to_be_bytes());
+            verify_msg.extend_from_slice(&(signature.len() as u16).to_be_bytes());
+            verify_msg.extend_from_slice(&signature);
+
+            let verify_len = (verify_msg.len() - 4) as u32;
+            verify_msg[verify_len_pos..verify_len_pos + 3].copy_from_slice(&verify_len.to_be_bytes()[1..4]);
+            self.handshake_messages.extend_from_slice(&verify_msg);
+            self.crypto_send_buffer.push((PacketNumberSpace::Handshake, verify_msg));
+        }
+
+        let verify_data = self.compute_finished_verify_data(false)?;
+        let mut finished = Vec::new();
+        finished.push(HANDSHAKE_FINISHED);
+        finished.extend_from_slice(&(verify_data.len() as u32).to_be_bytes()[1..4]);
+        finished.extend_from_slice(&verify_data);
+        self.handshake_messages.extend_from_slice(&finished);
+        self.crypto_send_buffer.push((PacketNumberSpace::Handshake, finished));
+
+        self.state = HandshakeState::WaitFinished;
+        Ok(vec![CryptoAction::InstallHandshakeKeys, CryptoAction::SendCryptoData])
     }
 
     fn handle_new_session_ticket(&mut self, data: &[u8]) -> Result<Vec<CryptoAction>> {
@@ -1417,12 +1747,10 @@ impl QuicTlsState {
             return Err(Error::Tls("Invalid NewSessionTicket".to_string()));
         }
 
-        let ticket_lifetime =
-            u32::from_be_bytes([data[offset], data[offset + 1], data[offset + 2], data[offset + 3]]);
+        let ticket_lifetime = u32::from_be_bytes([data[offset], data[offset + 1], data[offset + 2], data[offset + 3]]);
         offset += 4;
 
-        let ticket_age_add =
-            u32::from_be_bytes([data[offset], data[offset + 1], data[offset + 2], data[offset + 3]]);
+        let ticket_age_add = u32::from_be_bytes([data[offset], data[offset + 1], data[offset + 2], data[offset + 3]]);
         offset += 4;
 
         let nonce_len = data[offset] as usize;
@@ -1441,19 +1769,14 @@ impl QuicTlsState {
         self.session_ticket = Some(ticket);
         if let Some(ref res_master) = self.resumption_master_secret {
             let nonce = &data[offset - nonce_len - 1..offset - 1];
-            let psk =
-                self.hkdf_expand_label(res_master, b"resumption", nonce, self.cipher_suite.hash_len())?;
+            let psk = self.hkdf_expand_label(res_master, b"resumption", nonce, self.cipher_suite.hash_len())?;
             self.psk = Some(psk);
         }
 
         Ok(Vec::new())
     }
 
-    fn handle_key_update(
-        &mut self,
-        data: &[u8],
-        crypto_state: &mut CryptoState,
-    ) -> Result<Vec<CryptoAction>> {
+    fn handle_key_update(&mut self, data: &[u8], crypto_state: &mut CryptoState) -> Result<Vec<CryptoAction>> {
         if data.len() < 5 {
             return Err(Error::Tls("Invalid KeyUpdate".to_string()));
         }
@@ -1462,9 +1785,7 @@ impl QuicTlsState {
         self.update_traffic_keys(false, crypto_state)?;
         if update_requested {
             let key_update = self.build_key_update_message(false)?;
-            self.crypto_send_buffer
-                .push((PacketNumberSpace::ApplicationData, key_update));
-
+            self.crypto_send_buffer.push((PacketNumberSpace::ApplicationData, key_update));
             self.update_traffic_keys(true, crypto_state)?;
 
             Ok(vec![CryptoAction::SendCryptoData])
@@ -1500,13 +1821,10 @@ impl QuicTlsState {
             self.client_handshake_traffic_secret.as_ref()
         } else {
             self.server_handshake_traffic_secret.as_ref()
-        }
-        .ok_or(Error::CryptoError)?;
+        }.ok_or(Error::CryptoError)?;
 
-        let finished_key =
-            self.hkdf_expand_label(secret, b"finished", &[], self.cipher_suite.hash_len())?;
+        let finished_key = self.hkdf_expand_label(secret, b"finished", &[], self.cipher_suite.hash_len())?;
         let transcript_hash = self.cipher_suite.hash(&self.handshake_messages);
-
         let verify_data = Hkdf::extract(Some(&finished_key), &transcript_hash);
 
         Ok(verify_data[..self.cipher_suite.hash_len()].to_vec())
@@ -1514,17 +1832,15 @@ impl QuicTlsState {
 
     fn derive_application_secrets(&mut self, crypto_state: &mut CryptoState) -> Result<()> {
         let handshake_secret = self.handshake_secret.as_ref().ok_or(Error::CryptoError)?;
-
         let derived = self.hkdf_expand_label(
             handshake_secret,
             b"derived",
             &self.cipher_suite.hash(&[]),
             self.cipher_suite.hash_len(),
         )?;
+
         let master_secret = Hkdf::extract(Some(&derived), &[]);
-
         let transcript_hash = self.cipher_suite.hash(&self.handshake_messages);
-
         let client_app_secret = self.hkdf_expand_label(
             &master_secret,
             b"c ap traffic",
@@ -1554,31 +1870,18 @@ impl QuicTlsState {
         let client_keys = self.derive_traffic_keys(&client_app_secret)?;
         let server_keys = self.derive_traffic_keys(&server_app_secret)?;
         if self.is_client {
-            crypto_state
-                .client_keys
-                .insert(EncryptionLevel::Application, client_keys);
-            crypto_state
-                .server_keys
-                .insert(EncryptionLevel::Application, server_keys);
+            crypto_state.client_keys.insert(EncryptionLevel::Application, client_keys);
+            crypto_state.server_keys.insert(EncryptionLevel::Application, server_keys);
         } else {
-            crypto_state
-                .server_keys
-                .insert(EncryptionLevel::Application, server_keys);
-            crypto_state
-                .client_keys
-                .insert(EncryptionLevel::Application, client_keys);
+            crypto_state.server_keys.insert(EncryptionLevel::Application, server_keys);
+            crypto_state.client_keys.insert(EncryptionLevel::Application, client_keys);
         }
 
         Ok(())
     }
 
-    fn update_traffic_keys(
-        &mut self,
-        send_keys: bool,
-        crypto_state: &mut CryptoState,
-    ) -> Result<()> {
+    fn update_traffic_keys(&mut self, send_keys: bool, crypto_state: &mut CryptoState) -> Result<()> {
         self.key_update_generation += 1;
-
         let (secret, level) = if send_keys {
             if self.is_client {
                 (
@@ -1604,9 +1907,7 @@ impl QuicTlsState {
         };
 
         let old_secret = secret.ok_or(Error::CryptoError)?;
-        let new_secret =
-            self.hkdf_expand_label(old_secret, b"traffic upd", &[], self.cipher_suite.hash_len())?;
-
+        let new_secret = self.hkdf_expand_label(old_secret, b"traffic upd", &[], self.cipher_suite.hash_len())?;
         let new_keys = self.derive_traffic_keys(&new_secret)?;
         if send_keys {
             if self.is_client {
@@ -1636,13 +1937,7 @@ impl QuicTlsState {
         Ok(CryptoKeys::new(hp, key, iv))
     }
 
-    fn hkdf_expand_label(
-        &self,
-        secret: &[u8],
-        label: &[u8],
-        context: &[u8],
-        length: usize,
-    ) -> Result<Vec<u8>> {
+    fn hkdf_expand_label(&self, secret: &[u8], label: &[u8], context: &[u8], length: usize) -> Result<Vec<u8>> {
         let full_label = [b"tls13 ", label].concat();
 
         let mut hkdf_label = Vec::new();
@@ -1660,10 +1955,7 @@ impl QuicTlsState {
         if let Ok(bytes) = random::generate_random(32) {
             random.copy_from_slice(&bytes);
         } else {
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos() as u64;
+            let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64;
             for (i, chunk) in now.to_be_bytes().iter().enumerate() {
                 random[i] = *chunk;
             }
@@ -1676,16 +1968,10 @@ impl QuicTlsState {
         self.generate_random()
     }
 
-    pub fn export_keying_material(
-        &self,
-        label: &[u8],
-        context: &[u8],
-        length: usize,
-    ) -> Result<Vec<u8>> {
-        let exporter_secret = self
-            .exporter_master_secret
-            .as_ref()
-            .ok_or_else(|| Error::InvalidOperation("Handshake not complete".to_string()))?;
+    pub fn export_keying_material(&self, label: &[u8], context: &[u8], length: usize) -> Result<Vec<u8>> {
+        let exporter_secret = self.exporter_master_secret.as_ref().ok_or_else(|| {
+            Error::InvalidOperation("Handshake not complete".to_string())
+        })?;
 
         let context_hash = self.cipher_suite.hash(context);
         let secret = self.hkdf_expand_label(
@@ -1783,23 +2069,15 @@ impl QuicTlsState {
         }
     }
 
-    pub fn encode_secure_state_snapshot(
-        &self,
-        algorithm: CompressionAlgorithm,
-    ) -> io::Result<(SecureQuicTlsStateBlobMeta, Vec<u8>)> {
+    pub fn encode_secure_state_snapshot(&self, algorithm: CompressionAlgorithm) -> io::Result<(SecureQuicTlsStateBlobMeta, Vec<u8>)> {
         self.snapshot().to_secure_blob(algorithm)
     }
 
-    pub fn encode_secure_state_snapshot_auto(
-        &self,
-        accept_encoding: &str,
-    ) -> io::Result<(SecureQuicTlsStateBlobMeta, Vec<u8>)> {
+    pub fn encode_secure_state_snapshot_auto(&self, accept_encoding: &str) -> io::Result<(SecureQuicTlsStateBlobMeta, Vec<u8>)> {
         self.snapshot().to_secure_blob_auto(accept_encoding)
     }
 
-    pub fn decode_secure_state_snapshot(
-        data: &[u8],
-    ) -> io::Result<(SecureQuicTlsStateBlobMeta, QuicTlsStateSnapshot)> {
+    pub fn decode_secure_state_snapshot(data: &[u8]) -> io::Result<(SecureQuicTlsStateBlobMeta, QuicTlsStateSnapshot)> {
         QuicTlsStateSnapshot::from_secure_blob(data)
     }
 }
@@ -1827,23 +2105,15 @@ pub fn select_secure_quic_tls_state_algorithm(accept_encoding: &str) -> Compress
     CompressionAlgorithm::Identity
 }
 
-pub fn encode_secure_quic_tls_state_snapshot(
-    state: &QuicTlsState,
-    algorithm: CompressionAlgorithm,
-) -> io::Result<(SecureQuicTlsStateBlobMeta, Vec<u8>)> {
+pub fn encode_secure_quic_tls_state_snapshot(state: &QuicTlsState, algorithm: CompressionAlgorithm) -> io::Result<(SecureQuicTlsStateBlobMeta, Vec<u8>)> {
     state.encode_secure_state_snapshot(algorithm)
 }
 
-pub fn encode_secure_quic_tls_state_snapshot_auto(
-    state: &QuicTlsState,
-    accept_encoding: &str,
-) -> io::Result<(SecureQuicTlsStateBlobMeta, Vec<u8>)> {
+pub fn encode_secure_quic_tls_state_snapshot_auto(state: &QuicTlsState, accept_encoding: &str) -> io::Result<(SecureQuicTlsStateBlobMeta, Vec<u8>)> {
     state.encode_secure_state_snapshot_auto(accept_encoding)
 }
 
-pub fn decode_secure_quic_tls_state_snapshot(
-    data: &[u8],
-) -> io::Result<(SecureQuicTlsStateBlobMeta, QuicTlsStateSnapshot)> {
+pub fn decode_secure_quic_tls_state_snapshot(data: &[u8]) -> io::Result<(SecureQuicTlsStateBlobMeta, QuicTlsStateSnapshot)> {
     QuicTlsState::decode_secure_state_snapshot(data)
 }
 
@@ -1868,8 +2138,7 @@ fn serialize_quic_tls_state_snapshot(snapshot: &QuicTlsStateSnapshot) -> Vec<u8>
         snapshot.has_master_secret,
         snapshot.started,
         opt_u64_to_text(snapshot.elapsed_ms),
-    )
-    .into_bytes()
+    ).into_bytes()
 }
 
 fn deserialize_quic_tls_state_snapshot(raw_payload: &[u8]) -> io::Result<QuicTlsStateSnapshot> {
@@ -1893,54 +2162,45 @@ fn deserialize_quic_tls_state_snapshot(raw_payload: &[u8]) -> io::Result<QuicTls
     }
 
     let parse_u64 = |key: &str| -> io::Result<u64> {
-        map.get(key)
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("missing '{}' in quic-tls-state payload", key),
-                )
-            })?
-            .parse::<u64>()
-            .map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("invalid '{}' in quic-tls-state payload", key),
-                )
-            })
+        map.get(key).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("missing '{}' in quic-tls-state payload", key),
+            )
+        })?.parse::<u64>().map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid '{}' in quic-tls-state payload", key),
+            )
+        })
     };
 
     let parse_usize = |key: &str| -> io::Result<usize> {
-        map.get(key)
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("missing '{}' in quic-tls-state payload", key),
-                )
-            })?
-            .parse::<usize>()
-            .map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("invalid '{}' in quic-tls-state payload", key),
-                )
-            })
+        map.get(key).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("missing '{}' in quic-tls-state payload", key),
+            )
+        })?.parse::<usize>().map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid '{}' in quic-tls-state payload", key),
+            )
+        })
     };
 
     let parse_u32 = |key: &str| -> io::Result<u32> {
-        map.get(key)
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("missing '{}' in quic-tls-state payload", key),
-                )
-            })?
-            .parse::<u32>()
-            .map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("invalid '{}' in quic-tls-state payload", key),
-                )
-            })
+        map.get(key).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("missing '{}' in quic-tls-state payload", key),
+            )
+        })?.parse::<u32>().map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid '{}' in quic-tls-state payload", key),
+            )
+        })
     };
 
     let parse_text = |key: &str| -> io::Result<String> {
@@ -2063,9 +2323,7 @@ fn parse_bool(v: &str) -> io::Result<bool> {
 }
 
 fn opt_u64_to_text(value: Option<u64>) -> String {
-    value
-        .map(|v| v.to_string())
-        .unwrap_or_else(|| "-".to_string())
+    value.map(|v| v.to_string()).unwrap_or_else(|| "-".to_string())
 }
 
 fn parse_opt_u64(value: &str) -> io::Result<Option<u64>> {
@@ -2112,12 +2370,7 @@ fn decode_opt_b64(value: &str) -> io::Result<Option<String>> {
     Ok(Some(text))
 }
 
-fn compute_quic_tls_state_blob_tag(
-    nonce: &[u8],
-    algorithm: CompressionAlgorithm,
-    raw_size: usize,
-    encoded_payload: &[u8],
-) -> [u8; 32] {
+fn compute_quic_tls_state_blob_tag(nonce: &[u8], algorithm: CompressionAlgorithm, raw_size: usize, encoded_payload: &[u8]) -> [u8; 32] {
     let mut mac_input = Vec::new();
     mac_input.extend_from_slice(QUIC_TLS_STATE_BLOB_CONTEXT.as_bytes());
     mac_input.extend_from_slice(algorithm.content_encoding().as_bytes());
@@ -2156,10 +2409,7 @@ fn split_header_body(data: &[u8]) -> io::Result<(String, &[u8])> {
     ))
 }
 
-fn parse_secure_quic_tls_state_meta(
-    header: &str,
-    body_len: usize,
-) -> io::Result<SecureQuicTlsStateBlobMeta> {
+fn parse_secure_quic_tls_state_meta(header: &str, body_len: usize) -> io::Result<SecureQuicTlsStateBlobMeta> {
     let mut lines = header.lines();
     let magic = lines.next().unwrap_or_default();
     if magic != QUIC_TLS_STATE_BLOB_MAGIC {
@@ -2176,7 +2426,6 @@ fn parse_secure_quic_tls_state_meta(
     let mut raw_size = None;
     let mut encoded_size = None;
     let mut issued_at_unix = None;
-
     for line in lines {
         if line.trim().is_empty() {
             continue;
@@ -2202,20 +2451,16 @@ fn parse_secure_quic_tls_state_meta(
             }
             "nonce" => nonce_b64 = Some(v.trim().to_string()),
             "digest" => {
-                let parsed = v
-                    .trim()
-                    .strip_prefix("SHA-256=")
-                    .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid digest header"))?
-                    .to_string();
+                let parsed = v.trim().strip_prefix("SHA-256=").ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "invalid digest header")
+                })?.to_string();
 
                 digest_b64 = Some(parsed);
             }
             "tag" => {
-                let parsed = v
-                    .trim()
-                    .strip_prefix("HMAC-SHA-256=")
-                    .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid tag header"))?
-                    .to_string();
+                let parsed = v.trim().strip_prefix("HMAC-SHA-256=").ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "invalid tag header")
+                })?.to_string();
 
                 tag_b64 = Some(parsed);
             }

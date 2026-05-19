@@ -17,7 +17,7 @@ use crate::net::http::compression::{self, CompressionAlgorithm, CompressionLevel
 use crate::net::tcp::TcpStream;
 use std::collections::HashMap;
 use std::io;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const CLIENT_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 const HTTP2_CONNECTION_BLOB_MAGIC: &str = "SINGULARITY_HTTP2_CONNECTION_BLOB_V1";

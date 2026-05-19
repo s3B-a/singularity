@@ -1,5 +1,5 @@
-use super::http3::{Config, ConnectionId, Error, QuicClient, StreamId};
-use super::{HttpMethod, HttpRequest, HttpResponse, HttpVersion};
+use super::http3::{Config, Error, QuicClient};
+use super::{HttpRequest, HttpResponse, HttpVersion};
 use crate::crypto::constant_time_eq;
 use crate::crypto::encoding::pem;
 use crate::crypto::hash::hmac::hmac_sha256;

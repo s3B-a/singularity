@@ -160,7 +160,7 @@ impl DnsCache {
         cache.remove(&key);
     }
 
-    pub fn cleanup_expired(&self, cache: &mut HashMap<CacheKey, Vec<CacheEntry>>) {
+    fn cleanup_expired(&self, cache: &mut HashMap<CacheKey, Vec<CacheEntry>>) {
         cache.retain(|key, entries| {
             entries.retain(|entry| entry.verify_integrity(&key.name_hash) && !entry.is_expired());
             !entries.is_empty()

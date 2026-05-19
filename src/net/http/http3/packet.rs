@@ -1,4 +1,4 @@
-use super::error::{Error, ErrorCode, Result};
+use super::error::{Error, Result};
 use super::{decode_varint, encode_varint, ConnectionId};
 use crate::crypto::constant_time_eq;
 use crate::crypto::encoding::pem;
