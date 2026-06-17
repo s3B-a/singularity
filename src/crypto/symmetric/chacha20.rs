@@ -81,6 +81,20 @@ impl ChaCha20 {
      *    (): Nothing
      */
     fn generate_keystream(&mut self) {
+        self.generate_keystream_optimized();
+    }
+
+    /**
+     * Alternative keystream generation using unsafe code,
+     * which is used if the to_le_bytes method causes issues
+     * by using direct byte calling instead of converting to bytes first
+     * Args:
+     *    &mut self: The ChaCha20 instance
+     * 
+     * Returns:
+     *    (): Nothing
+     */
+    fn generate_keystream_alt(&mut self) {
         let mut working_state = self.state;
         for _ in 0..10 {
             quarter_round(&mut working_state, 0, 4, 8, 12);
@@ -98,15 +112,83 @@ impl ChaCha20 {
             working_state[i] = working_state[i].wrapping_add(self.state[i]);
         }
 
-        for i in 0..16 {
-            let bytes = working_state[i].to_le_bytes();
-            self.keystream[i * 4] = bytes[0];
-            self.keystream[i * 4 + 1] = bytes[1];
-            self.keystream[i * 4 + 2] = bytes[2];
-            self.keystream[i * 4 + 3] = bytes[3];
-        }
+        #[allow(unsafe_code)]
+        unsafe {
+            let state_bytes: &[u8] = std::slice::from_raw_parts(
+                working_state.as_ptr() as *const u8,
+                64,
+            );
 
+            self.keystream.copy_from_slice(state_bytes);
+        }
+        
         self.state[12] = self.state[12].wrapping_add(1);
+    }
+
+    /**
+     * Optimized keystream generation that avoids overhead of to_le_bytes by directly writing bytes to the keystream array
+     * Args:
+     *    &mut self: The ChaCha20 instance
+     * 
+     * Returns:
+     *    (): Nothing
+     */
+    fn generate_keystream_optimized(&mut self) {
+        let mut state = self.state;
+        for _ in 0..10 {
+            Self::qround(&mut state, 0, 4, 8, 12);
+            Self::qround(&mut state, 1, 5, 9, 13);
+            Self::qround(&mut state, 2, 6, 10, 14);
+            Self::qround(&mut state, 3, 7, 11, 15);
+            
+            Self::qround(&mut state, 0, 5, 10, 15);
+            Self::qround(&mut state, 1, 6, 11, 12);
+            Self::qround(&mut state, 2, 7, 8, 13);
+            Self::qround(&mut state, 3, 4, 9, 14);
+        }
+        
+        for i in 0..16 {
+            let result = state[i].wrapping_add(self.state[i]);
+            let bytes = result.to_le_bytes();
+            let offset = i * 4;
+            self.keystream[offset] = bytes[0];
+            self.keystream[offset + 1] = bytes[1];
+            self.keystream[offset + 2] = bytes[2];
+            self.keystream[offset + 3] = bytes[3];
+        }
+        
+        self.state[12] = self.state[12].wrapping_add(1);
+    }
+
+    /**
+     * Performs the quarter round operation on the state
+     * Args:
+     *    state - &mut [u32; 16]: The state array to operate on
+     *    a - usize: Index a
+     *    b - usize: Index b
+     *    c - usize: Index c
+     *    d - usize: Index d
+     * 
+     * Returns:
+     *    (): Nothing
+     */
+    #[inline(always)]
+    fn qround(state: &mut [u32; 16], a: usize, b: usize, c: usize, d: usize) {
+        state[a] = state[a].wrapping_add(state[b]);
+        state[d] ^= state[a];
+        state[d] = state[d].rotate_left(16);
+        
+        state[c] = state[c].wrapping_add(state[d]);
+        state[b] ^= state[c];
+        state[b] = state[b].rotate_left(12);
+        
+        state[a] = state[a].wrapping_add(state[b]);
+        state[d] ^= state[a];
+        state[d] = state[d].rotate_left(8);
+        
+        state[c] = state[c].wrapping_add(state[d]);
+        state[b] ^= state[c];
+        state[b] = state[b].rotate_left(7);
     }
 
     /**
@@ -139,9 +221,18 @@ impl ChaCha20 {
      * Returns:
      *    Vec<u8>: The resulting ciphertext
      */
-    pub fn encrypt(&mut self, plaintext: &mut [u8]) -> Vec<u8> {
-        let mut ciphertext = plaintext.to_vec();
-        self.apply_keystream(&mut ciphertext);
+    pub fn encrypt(&mut self, plaintext: &[u8]) -> Vec<u8> {
+        let mut ciphertext = Vec::with_capacity(plaintext.len());
+        ciphertext.resize(plaintext.len(), 0u8);
+        for i in 0..plaintext.len() {
+            if self.ks_index >= 64 {
+                self.generate_keystream();
+                self.ks_index = 0;
+            }
+            
+            ciphertext[i] = plaintext[i] ^ self.keystream[self.ks_index];
+            self.ks_index += 1;
+        }
         
         ciphertext
     }

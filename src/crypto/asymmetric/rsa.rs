@@ -3,7 +3,7 @@
 
 use crate::crypto::{Error, Result};
 use crate::crypto::encoding::pem;
-use crate::crypto::bignum::BigNum;
+use crate::crypto::bignum::{BigNum, MontgomeryContext};
 use crate::crypto::hash::sha2::Sha256;
 use crate::crypto::random;
 use std::cmp::Ordering;
@@ -118,9 +118,9 @@ impl RsaPrivateKey {
         
         let p_minus_1 = p.clone().sub(BigNum::from_u64(1));
         let q_minus_1 = q.clone().sub(BigNum::from_u64(1));
-        let lambda_n = lcm(&p_minus_1, &q_minus_1);
         
-        let d = e.mod_inverse(&lambda_n)?;
+        let phi_n = p_minus_1.clone().mul(q_minus_1.clone());        
+        let d = e.mod_inverse(&phi_n)?;
         
         let dp = d.clone().modulo(&p_minus_1);
         let dq = d.clone().modulo(&q_minus_1);
@@ -170,15 +170,10 @@ impl RsaPrivateKey {
         if c.cmp(&self.n) != Ordering::Less {
             return Err(Error::CryptoError("Ciphertext too large".to_string()));
         }
-        
+
         let m = rsa_decrypt_crt(&c, &self.p, &self.q, &self.dp, &self.dq, &self.qinv, &self.n)?;
-        let mut m_bytes = m.to_bytes_be();
-        let target_len = self.size.bytes();
-        if m_bytes.len() < target_len {
-            let mut padded = vec![0u8; target_len - m_bytes.len()];
-            padded.extend_from_slice(&m_bytes);
-            m_bytes = padded;
-        }
+        let key_size = self.size.bytes();
+        let m_bytes = big_num_to_fixed_bytes(&m, key_size);
         
         match padding {
             RsaPadding::Pkcs1v15 => unpad_pkcs1v15(&m_bytes, false),
@@ -297,12 +292,8 @@ impl RsaPublicKey {
      */
     pub fn encrypt(&self, plaintext: &[u8], padding: RsaPadding) -> Result<Vec<u8>> {
         let padded = match padding {
-            RsaPadding::Pkcs1v15 => {
-                pad_pkcs1v15_encrypt(plaintext, self.size.bytes())?
-            }
-            RsaPadding::OaepSha256 => {
-                pad_oaep_sha256(plaintext, self.size.bytes())?
-            }
+            RsaPadding::Pkcs1v15 => pad_pkcs1v15_encrypt(plaintext, self.size.bytes())?,
+            RsaPadding::OaepSha256 => pad_oaep_sha256(plaintext, self.size.bytes())?,
             RsaPadding::NoPadding => {
                 if plaintext.len() > self.size.bytes() {
                     return Err(Error::CryptoError("Plaintext too long".to_string()));
@@ -317,16 +308,8 @@ impl RsaPublicKey {
             return Err(Error::CryptoError("Message too large".to_string()));
         }
         
-        let c = m.mod_exp(&self.e, &self.n)?;
-        
-        let mut c_bytes = c.to_bytes_be();
-        let target_len = self.size.bytes();
-        if c_bytes.len() < target_len {
-            let mut padded = vec![0u8; target_len - c_bytes.len()];
-            padded.extend_from_slice(&c_bytes);
-            c_bytes = padded;
-        }
-        Ok(c_bytes)
+        let c = m.mod_exp_montgomery(&self.e, &self.n)?;
+        Ok(big_num_to_fixed_bytes(&c, self.size.bytes()))
     }
     
     /**
@@ -360,7 +343,7 @@ impl RsaPublicKey {
             return Ok(false);
         }
         
-        let m = s.mod_exp(&self.e, &self.n)?;
+        let m = s.mod_exp_montgomery(&self.e, &self.n)?;
         let mut m_bytes = m.to_bytes_be();
         let target_len = self.size.bytes();
         if m_bytes.len() < target_len {
@@ -511,7 +494,7 @@ impl RsaPublicKey {
             return Ok(false);
         }
         
-        let m = s.mod_exp(&self.e, &self.n)?;
+        let m = s.mod_exp_montgomery(&self.e, &self.n)?;
         let mut m_bytes = m.to_bytes_be();
         let target_len = self.size.bytes();
         if m_bytes.len() < target_len {
@@ -533,7 +516,7 @@ impl RsaPublicKey {
  * Returns:
  *    BigNum: The GCD of a and b
  */
-fn generate_rsa_primes(bits: usize, e: &BigNum) -> Result<(BigNum, BigNum)> {
+pub fn generate_rsa_primes(bits: usize, e: &BigNum) -> Result<(BigNum, BigNum)> {
     let p = generate_prime(bits, e)?;
     let q = loop {
         let candidate = generate_prime(bits, e)?;
@@ -555,49 +538,199 @@ fn generate_rsa_primes(bits: usize, e: &BigNum) -> Result<(BigNum, BigNum)> {
  *    Result<BigNum>: The generated prime number or an error if generation fails
  */
 fn generate_prime(bits: usize, e: &BigNum) -> Result<BigNum> {
+    const SMALL_PRIMES: [u64; 49] = [
+        3, 5, 7, 11, 13, 17, 19, 23, 29, 31,
+        37, 41, 43, 47, 53, 59, 61, 67, 71, 73,
+        79, 83, 89, 97, 101, 103, 107, 109, 113, 127,
+        131, 137, 139, 149, 151, 157, 163, 167, 173, 179,
+        181, 191, 193, 197, 199, 211, 223, 227, 229,
+    ];
+
     let bytes = (bits + 7) / 8;
+    let prime_rounds = if bits < 512 { 6 } else if bits < 1024 { 8 } else { 8 };
+    let two = BigNum::from_u64(2);
+
+    let mut candidate_bytes = vec![0u8; bytes];
+    random::fill_random(&mut candidate_bytes)?;
+    candidate_bytes[0] |= 0x80;
+    candidate_bytes[bytes - 1] |= 0x01;
+    let mut candidate = BigNum::from_bytes_be(&candidate_bytes);
+    if candidate.is_even() {
+        candidate = candidate + &two;
+    }
+
     loop {
-        let mut candidate_bytes = vec![0u8; bytes];
-        random::fill_random(&mut candidate_bytes)?;
-        
-        candidate_bytes[0] |= 0x80;
-        candidate_bytes[bytes - 1] |= 0x01;
-        
-        let candidate = BigNum::from_bytes_be(&candidate_bytes);
-        let candidate_minus_1 = candidate.clone().sub(BigNum::from_u64(1));
-        if gcd(&candidate_minus_1, e).cmp(&BigNum::from_u64(1)) != Ordering::Equal {
-            continue;
+        let mut composite = false;
+        for &p in &SMALL_PRIMES {
+            if mod_u64(&candidate, p) == 0 {
+                composite = true;
+                break;
+            }
         }
-        
-        if is_probably_prime(&candidate, 64) {
-            return Ok(candidate);
+
+        if !composite {
+            let candidate_minus_1 = candidate.clone() - BigNum::one();
+            if gcd(&candidate_minus_1, e) == BigNum::one() {
+                if is_probably_prime(&candidate, prime_rounds)? {
+                    return Ok(candidate);
+                }
+            }
+        }
+
+        candidate = candidate + &two;
+        if candidate.bit_length() > bits {
+            random::fill_random(&mut candidate_bytes)?;
+            candidate_bytes[0] |= 0x80;
+            candidate_bytes[bytes - 1] |= 0x01;
+            candidate = BigNum::from_bytes_be(&candidate_bytes);
+            if candidate.is_even() {
+                candidate = candidate + &two;
+            }
         }
     }
+
+    Err(Error::CryptoError("Prime generation failed".to_string()))
 }
 
 /**
- * Computes the greatest common divisor (GCD) of two BigNums
+ * Performs a test to determine if a BigNum is probably prime 
+ * using a combination of trial division and Miller-Rabin tests
  * Args:
- *    a - &BigNum: The first BigNum
- *    b - &BigNum: The second BigNum
+ *    n - &BigNum: The number to test for primality
+ *    rounds - usize: The number of Miller-Rabin rounds to perform for larger numbers
  * 
  * Returns:
- *    BigNum: The GCD of a and b
+ *    Result<bool>: True if n is probably prime, false if composite or an error if the test fails
  */
-fn is_probably_prime(n: &BigNum, rounds: usize) -> bool {
-    let small_primes = [2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47];
-    for &p in &small_primes {
-        let prime = BigNum::from_u64(p);
-        if n.cmp(&prime) == Ordering::Equal {
-            return true;
+fn is_probably_prime(n: &BigNum, rounds: usize) -> Result<bool> {
+    if n <= &BigNum::one() {
+        return Ok(false);
+    }
+
+    if n == &BigNum::from_u64(2) || n == &BigNum::from_u64(3) {
+        return Ok(true);
+    }
+
+    if n.is_even() {
+        return Ok(false);
+    }
+
+    const SMALL_PRIMES: [u64; 49] = [
+        3, 5, 7, 11, 13, 17, 19, 23, 29, 31,
+        37, 41, 43, 47, 53, 59, 61, 67, 71, 73,
+        79, 83, 89, 97, 101, 103, 107, 109, 113, 127,
+        131, 137, 139, 149, 151, 157, 163, 167, 173, 179,
+        181, 191, 193, 197, 199, 211, 223, 227, 229,
+    ];
+
+    for &p in &SMALL_PRIMES {
+        if n == &BigNum::from_u64(p) {
+            return Ok(true);
+        }
+    }
+
+    if n.limbs.len() == 1 {
+        return Ok(is_probably_prime_deterministic_64bit(n.limbs[0]));
+    }
+
+    if n.limbs.len() <= 2 {
+        return Ok(miller_rabin_deterministic(n));
+    }
+
+    let bit_length = n.bit_length();
+    let adaptive_rounds = if bit_length < 512 { 
+        6
+    } else if bit_length < 1024 { 
+        8
+    } else {
+        8
+    };
+
+    let effective_rounds = if rounds == 0 { adaptive_rounds } else { rounds };
+
+    Ok(miller_rabin_probabilistic(n, effective_rounds))
+}
+
+fn mod_u64(n: &BigNum, m: u64) -> u64 {
+    if m == 0 {
+        return 0;
+    }
+
+    let mut rem: u128 = 0;
+    for &limb in n.limbs.iter().rev() {
+        rem = ((rem << 64) + limb as u128) % (m as u128);
+    }
+
+    rem as u64
+}
+
+fn gcd_u64(mut a: u64, mut b: u64) -> u64 {
+    while b != 0 {
+        let r = a % b;
+        a = b;
+        b = r;
+    }
+
+    a
+}
+
+/**
+ * Performs a deterministic Miller-Rabin primality test for 64-bit integers
+ * Args:
+ *    n - u64: The number to test for primality
+ * 
+ * Returns:
+ *    bool: True if n is probably prime, false if composite
+ */
+fn is_probably_prime_deterministic_64bit(n: u64) -> bool {
+    if n < 2 {
+        return false;
+    }
+    if n == 2 || n == 3 {
+        return true;
+    }
+    if n % 2 == 0 {
+        return false;
+    }
+
+    let witnesses: &[u64] = &[2, 3, 5, 7, 11, 13, 17];
+    let n_minus_1 = n - 1;
+    let mut r = 0;
+    let mut d = n_minus_1;
+    while d % 2 == 0 {
+        d /= 2;
+        r += 1;
+    }
+
+    'witness_loop: for &witness in witnesses {
+        if witness >= n {
+            continue;
         }
 
-        if n.clone().modulo(&prime).is_zero() {
+        let witness_bn = BigNum::from_u64(witness);
+        let n_bn = BigNum::from_u64(n);
+        let d_bn = BigNum::from_u64(d);
+
+        let mut x = witness_bn.mod_exp(&d_bn, &n_bn).unwrap_or(BigNum::one());
+        if x.is_one() || x == (n_bn.clone() - BigNum::one()) {
+            continue 'witness_loop;
+        }
+
+        let mut composite = true;
+        for _ in 0..(r - 1) {
+            x = (&x * &x).modulo(&n_bn);
+            if x == (n_bn.clone() - BigNum::one()) {
+                composite = false;
+                break;
+            }
+        }
+
+        if composite {
             return false;
         }
     }
-    
-    miller_rabin(n, rounds)
+
+    true
 }
 
 /**
@@ -618,20 +751,22 @@ fn miller_rabin(n: &BigNum, rounds: usize) -> bool {
         return true;
     }
     
-    let n_minus_1 = n.clone().sub(BigNum::from_u64(1));
+    let one = BigNum::from_u64(1);
+    let n_minus_1 = n.sub(&one);
     let (r, d) = factor_power_of_two(&n_minus_1);
     'witness: for _ in 0..rounds {
         let a = random_range(&BigNum::from_u64(2), &n_minus_1).unwrap_or(BigNum::from_u64(2));
-        let mut x = match a.mod_exp(&d, n) {
+        let mut x = match a.mod_exp_montgomery(&d, n) {
             Ok(val) => val,
             Err(_) => return false,
         };
-        if x.cmp(&BigNum::from_u64(1)) == Ordering::Equal || x.cmp(&n_minus_1) == Ordering::Equal {
+        
+        if x.cmp(&one) == Ordering::Equal || x.cmp(&n_minus_1) == Ordering::Equal {
             continue 'witness;
         }
         
         for _ in 0..r {
-            x = x.clone().mul(x.clone()).modulo(n);
+            x = (&x * &x).modulo(n);
             if x.cmp(&n_minus_1) == Ordering::Equal {
                 continue 'witness;
             }
@@ -643,6 +778,158 @@ fn miller_rabin(n: &BigNum, rounds: usize) -> bool {
     true
 }
 
+fn mod_exp_montgomery_ctx(base: &BigNum, exp: &BigNum, ctx: &MontgomeryContext) -> BigNum {
+    let bit_length = exp.bit_length();
+    if bit_length == 0 {
+        return BigNum::one();
+    }
+    
+    let base_mont = ctx.to_montgomery(base);
+    let mut result = ctx.to_montgomery(&BigNum::one());
+    for i in (0..bit_length).rev() {
+        result = ctx.multiply(&result, &result);
+        if exp.get_bit(i) {
+            result = ctx.multiply(&result, &base_mont);
+        }
+    }
+    
+    ctx.from_montgomery(&result)
+}
+
+/**
+ * Performs a deterministic Miller-Rabin primality test for BigNums up to 64 bits
+ * Args:
+ *    n - &BigNum: The number to test for primality
+ * 
+ * Returns:
+ *    bool: True if n is probably prime, false if composite
+ */
+fn miller_rabin_deterministic(n: &BigNum) -> bool {
+    if n <= &BigNum::one() { return false; }
+
+    let witnesses = [2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37];
+    let n_minus_1 = n - &BigNum::one();
+    let (r, d) = factor_power_of_two(&n_minus_1);
+    if r == 0 { return false; }
+
+    let ctx = match MontgomeryContext::new(n) {
+        Ok(ctx) => ctx,
+        Err(_) => return false,
+    };
+    let one_mont = ctx.to_montgomery(&BigNum::one());
+    let n_minus_1_mont = ctx.to_montgomery(&n_minus_1);
+
+    'witness_loop: for &witness in &witnesses {
+        if BigNum::from_u64(witness) >= *n { continue; }
+
+        let a = BigNum::from_u64(witness);
+        let mut x = mod_exp_montgomery_ctx_mont(&a, &d, &ctx);
+
+        if x == one_mont || x == n_minus_1_mont {
+            continue 'witness_loop;
+        }
+
+        let mut found = false;
+        for _ in 0..(r - 1) {
+            x = ctx.multiply(&x, &x);
+            if x == n_minus_1_mont {
+                found = true;
+                break;
+            }
+        }
+
+        if !found { return false; }
+    }
+
+    true
+}
+
+/**
+ * Performs a probabilistic Miller-Rabin primality test for BigNums larger than 64 bits
+ * Args:
+ *    n - &BigNum: The number to test for primality
+ *    rounds - usize: The number of rounds to perform
+ * 
+ * Returns:
+ *    bool: True if n is probably prime, false if composite
+ */
+fn miller_rabin_probabilistic(n: &BigNum, rounds: usize) -> bool {
+    println!("miller_rabin_probabilistic: starting with {} rounds", rounds);
+    
+    let one = BigNum::one();
+    let n_minus_1 = n - &one;
+    let (r, d) = factor_power_of_two(&n_minus_1);
+    if r == 0 {
+        println!("miller_rabin_probabilistic: r=0, returning false");
+        return false;
+    }
+
+    let ctx = match MontgomeryContext::new(n) {
+        Ok(ctx) => ctx,
+        Err(_) => {
+            println!("miller_rabin_probabilistic: MontgomeryContext::new failed");
+            return false;
+        }
+    };
+
+    let one_mont = ctx.to_montgomery(&one);
+    let n_minus_1_mont = ctx.to_montgomery(&n_minus_1);
+    for round in 0..rounds {
+        println!("  Round {}/{}", round + 1, rounds);
+        
+        let a = match random_range(&BigNum::from_u64(2), &n_minus_1) {
+            Ok(val) => { println!("    Generated random witness"); val },
+            Err(e) => { println!("    random_range failed: {:?}", e); return false; }
+        };
+
+        let mut x = mod_exp_montgomery_ctx_mont(&a, &d, &ctx);
+        if x == one_mont || x == n_minus_1_mont {
+            println!("    Witness passed (x == 1 or n-1)");
+            continue;
+        }
+
+        let mut found_n_minus_1 = false;
+        for i in 0..(r - 1) {
+            if i % 10 == 0 && i > 0 {
+                println!("      Squaring iteration {}/{}", i, r - 1);
+            }
+
+            x = ctx.multiply(&x, &x);
+            if x == n_minus_1_mont {
+                found_n_minus_1 = true;
+                println!("    Found n-1 after {} squares", i + 1);
+                break;
+            }
+        }
+
+        if !found_n_minus_1 {
+            println!("    Witness proves composite");
+            return false;
+        }
+    }
+
+    println!("miller_rabin_probabilistic: all witnesses passed - probably prime");
+    true
+}
+
+fn mod_exp_montgomery_ctx_mont(base: &BigNum, exp: &BigNum, ctx: &MontgomeryContext) -> BigNum {
+    let bit_length = exp.bit_length();
+    if bit_length == 0 {
+        return ctx.to_montgomery(&BigNum::one());
+    }
+    
+    let base_mont = ctx.to_montgomery(base);
+    let mut result = ctx.to_montgomery(&BigNum::one());
+    for i in (0..bit_length).rev() {
+        result = ctx.multiply(&result, &result);
+        if exp.get_bit(i) {
+            result = ctx.multiply(&result, &base_mont);
+        }
+    }
+    
+    result
+}
+
 /**
  * Factors out powers of two from a BigNum
  * Args:
@@ -652,13 +939,12 @@ fn miller_rabin(n: &BigNum, rounds: usize) -> bool {
  *    (usize, BigNum): A tuple containing the exponent of the power of two and the odd component
  */
 fn factor_power_of_two(n: &BigNum) -> (usize, BigNum) {
-    let mut d = n.clone();
-    let mut r = 0;
-    while d.clone().modulo(&BigNum::from_u64(2)).is_zero() {
-        d = d.div(BigNum::from_u64(2));
-        r += 1;
+    let r = n.trailing_zeros();
+    if r == 0 {
+        return (0, n.clone());
     }
-    
+
+    let d = n >> r;
     (r, d)
 }
 
@@ -672,15 +958,14 @@ fn factor_power_of_two(n: &BigNum) -> (usize, BigNum) {
  *    Result<BigNum>: A random BigNum in the specified range or an error if generation fails
  */
 fn random_range(min: &BigNum, max: &BigNum) -> Result<BigNum> {
-    let range = max.clone().sub(min.clone());
-    let range_bytes = range.to_bytes_be();
+    let range = max - min;
+    let num_bytes = range.to_bytes_be().len();
     loop {
-        let mut random_bytes = vec![0u8; range_bytes.len()];
+        let mut random_bytes = vec![0u8; num_bytes];
         random::fill_random(&mut random_bytes)?;
-        
         let r = BigNum::from_bytes_be(&random_bytes);
-        if r.cmp(&range) == Ordering::Less {
-            return Ok(r.add(min.clone()));
+        if r < range {
+            return Ok(r + min);
         }
     }
 }
@@ -700,16 +985,20 @@ fn random_range(min: &BigNum, max: &BigNum) -> Result<BigNum> {
  *    Result<BigNum>: The decrypted plaintext or an error if decryption fails
  */
 fn rsa_decrypt_crt(c: &BigNum, p: &BigNum, q: &BigNum, dp: &BigNum, dq: &BigNum, qinv: &BigNum, n: &BigNum) -> Result<BigNum> {
-    let m1 = c.mod_exp(dp, p)?;
-    let m2 = c.mod_exp(dq, q)?;
-    let h = if m1.cmp(&m2) != Ordering::Less {
-        qinv.clone().mul(m1.sub(m2.clone())).modulo(p)
-    } else {
-        let diff = p.clone().add(m1).sub(m2.clone());
-        qinv.clone().mul(diff).modulo(p)
-    };
+    let m1 = c.mod_exp_montgomery(dp, p)?;
+    let m2 = c.mod_exp_montgomery(dq, q)?;
     
-    let m = m2.add(h.mul(q.clone())).modulo(n);
+    let diff = if m1 >= m2 {
+        &m1 - &m2
+    } else {
+        p + &m1 - &m2
+    };
+    let h = (&diff * qinv).modulo(p);
+    let mut m = &m2 + &(&h * q);
+    
+    if m >= *n {
+        m = &m - n;
+    }
     
     Ok(m)
 }
@@ -731,20 +1020,21 @@ fn pad_pkcs1v15_encrypt(data: &[u8], key_size: usize) -> Result<Vec<u8>> {
     let mut padded = vec![0u8; key_size];
     padded[0] = 0x00;
     padded[1] = 0x02;
-    
     let ps_len = key_size - data.len() - 3;
-    let mut ps = vec![0u8; ps_len];
-    random::fill_random(&mut ps)?;
-    for byte in ps.iter_mut() {
-        if *byte == 0 {
-            *byte = 1;
+    let ps = &mut padded[2..2 + ps_len];
+    for _ in 0..100 {
+        random::fill_random(ps)?;
+        if !ps.iter().any(|&b| b == 0) {
+            break;
         }
     }
-    
-    padded[2..2 + ps_len].copy_from_slice(&ps);
+
+    for b in ps.iter_mut() {
+        if *b == 0 { *b = 0x01; }
+    }
+
     padded[2 + ps_len] = 0x00;
-    padded[3 + ps_len..].copy_from_slice(data);
-    
+    padded[2 + ps_len + 1..].copy_from_slice(data);
     Ok(padded)
 }
 
@@ -888,25 +1178,25 @@ fn verify_pkcs1v15_sign(padded: &[u8], hash: &[u8]) -> Result<bool> {
  */
 fn pad_oaep_sha256(data: &[u8], key_size: usize) -> Result<Vec<u8>> {
     let hash_len = 32;
-    if data.len() > key_size - 2 * hash_len - 2 {
+    let max_data_len = key_size - 2 * hash_len - 2;
+    if data.len() > max_data_len {
         return Err(Error::CryptoError("Data too long for OAEP".to_string()));
     }
-    
-    let hasher = Sha256::new();
-    let l_hash = hasher.finalize();
-    
+
+    let l_hash = Sha256::new().finalize();
     let ps_len = key_size - data.len() - 2 * hash_len - 2;
-    let mut db = Vec::with_capacity(key_size - hash_len - 1);
+    let mut db = Vec::with_capacity(hash_len + ps_len + 1 + data.len());
     db.extend_from_slice(&l_hash);
     db.extend(vec![0u8; ps_len]);
     db.push(0x01);
     db.extend_from_slice(data);
-    
+
     let mut seed = vec![0u8; hash_len];
     random::fill_random(&mut seed)?;
-    
+
     let db_mask = mgf1_sha256(&seed, db.len());
     let masked_db: Vec<u8> = db.iter().zip(db_mask.iter()).map(|(a, b)| a ^ b).collect();
+
     let seed_mask = mgf1_sha256(&masked_db, hash_len);
     let masked_seed: Vec<u8> = seed.iter().zip(seed_mask.iter()).map(|(a, b)| a ^ b).collect();
 
@@ -914,7 +1204,6 @@ fn pad_oaep_sha256(data: &[u8], key_size: usize) -> Result<Vec<u8>> {
     em[0] = 0x00;
     em[1..1 + hash_len].copy_from_slice(&masked_seed);
     em[1 + hash_len..].copy_from_slice(&masked_db);
-    
     Ok(em)
 }
 
@@ -932,34 +1221,32 @@ fn unpad_oaep_sha256(data: &[u8]) -> Result<Vec<u8>> {
     if data.len() < 2 * hash_len + 2 || data[0] != 0x00 {
         return Err(Error::CryptoError("Invalid OAEP padding".to_string()));
     }
-    
+
     let masked_seed = &data[1..1 + hash_len];
     let masked_db = &data[1 + hash_len..];
     let seed_mask = mgf1_sha256(masked_db, hash_len);
     let seed: Vec<u8> = masked_seed.iter().zip(seed_mask.iter()).map(|(a, b)| a ^ b).collect();
-    
+
     let db_mask = mgf1_sha256(&seed, masked_db.len());
     let db: Vec<u8> = masked_db.iter().zip(db_mask.iter()).map(|(a, b)| a ^ b).collect();
-    
-    let hasher = Sha256::new();
-    let l_hash = hasher.finalize();
+
+    let l_hash = Sha256::new().finalize();
     if &db[..hash_len] != &l_hash[..] {
         return Err(Error::CryptoError("Invalid OAEP padding".to_string()));
     }
-    
-    let mut separator_idx = None;
+
+    let mut sep = None;
     for i in hash_len..db.len() {
         if db[i] == 0x01 {
-            separator_idx = Some(i);
+            sep = Some(i);
             break;
         } else if db[i] != 0x00 {
             return Err(Error::CryptoError("Invalid OAEP padding".to_string()));
         }
     }
-    
-    let separator_idx = separator_idx.ok_or_else(|| Error::CryptoError("Invalid OAEP padding".to_string()))?;
-    
-    Ok(db[separator_idx + 1..].to_vec())
+
+    let sep = sep.ok_or_else(|| Error::CryptoError("Invalid OAEP padding".to_string()))?;
+    Ok(db[sep + 1..].to_vec())
 }
 
 /**
@@ -1083,9 +1370,8 @@ fn mgf1_sha256(seed: &[u8], length: usize) -> Vec<u8> {
         hasher.update(&(counter as u32).to_be_bytes());
         output.extend_from_slice(&hasher.finalize());
     }
-    
-    output.truncate(length);
 
+    output.truncate(length);
     output
 }
 
@@ -1101,12 +1387,18 @@ fn mgf1_sha256(seed: &[u8], length: usize) -> Vec<u8> {
 fn gcd(a: &BigNum, b: &BigNum) -> BigNum {
     let mut a = a.clone();
     let mut b = b.clone();
+    let mut iterations = 0;
     while !b.is_zero() {
+        iterations += 1;
+        if iterations % 1000 == 0 {
+            println!("    gcd: iteration {}", iterations);
+        }
+
         let temp = b.clone();
         b = a.modulo(&b);
         a = temp;
     }
-    
+    println!("    gcd completed in {} iterations", iterations);
     a
 }
 
@@ -1122,6 +1414,20 @@ fn gcd(a: &BigNum, b: &BigNum) -> BigNum {
 fn lcm(a: &BigNum, b: &BigNum) -> BigNum {
     let g = gcd(a, b);
     a.clone().mul(b.clone()).div(g)
+}
+
+fn big_num_to_fixed_bytes(num: &BigNum, length: usize) -> Vec<u8> {
+    let mut bytes = num.to_bytes_be();
+    if bytes.len() > length {
+        bytes = bytes[bytes.len() - length..].to_vec();
+    }
+    if bytes.len() < length {
+        let mut padded = vec![0u8; length - bytes.len()];
+        padded.extend_from_slice(&bytes);
+        padded
+    } else {
+        bytes
+    }
 }
 
 #[cfg(test)]
@@ -1197,5 +1503,48 @@ mod tests {
         let signature2 = restored.sign(message, RsaPadding::Pkcs1v15).unwrap();
         
         assert_eq!(signature1.len(), signature2.len());
+    }
+
+
+        #[test]
+    fn test_is_probably_prime_small_primes() {
+        let small_primes = [
+            BigNum::from_u64(2),
+            BigNum::from_u64(3),
+            BigNum::from_u64(5),
+            BigNum::from_u64(7),
+            BigNum::from_u64(11),
+            BigNum::from_u64(101),
+            BigNum::from_u64(1009),
+            BigNum::from_u64(10007),
+        ];
+        
+        println!("\n=== Testing is_probably_prime on small primes ===");
+        for prime in small_primes.iter() {
+            match is_probably_prime(prime, 16) {
+                Ok(result) => println!("is_probably_prime({}) = {}", prime, result),
+                Err(e) => println!("is_probably_prime({}) ERROR: {:?}", prime, e),
+            }
+        }
+    }
+
+    #[test]
+    fn test_oaep_padding_only() {
+        let msg = b"Hello OAEP";
+        let key_size = 256;
+        let padded = pad_oaep_sha256(msg, key_size).unwrap();
+        let unpadded = unpad_oaep_sha256(&padded).unwrap();
+        assert_eq!(unpadded, msg);
+    }
+
+    #[test]
+    fn test_rsa_core_raw() {
+        let key = RsaPrivateKey::generate(RsaKeySize::Rsa2048).unwrap();
+        let public = key.public_key();
+        let mut msg = vec![0u8; key.size.bytes()];
+        msg[key.size.bytes() - 1] = 0x42; // just some data
+        let cipher = public.encrypt(&msg, RsaPadding::NoPadding).unwrap();
+        let plain = key.decrypt(&cipher, RsaPadding::NoPadding).unwrap();
+        assert_eq!(plain, msg);
     }
 }
