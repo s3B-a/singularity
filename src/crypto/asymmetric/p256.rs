@@ -353,11 +353,11 @@ fn fe_is_zero(a: &FieldElement) -> bool {
 fn fe_cmp(a: &FieldElement, b: &FieldElement) -> i32 {
     for i in (0..4).rev() {
         if a[i] < b[i] {
-            return 1;
+            return -1;
         }
 
         if a[i] > b[i] {
-            return -1;
+            return 1;
         }
     }
 
@@ -425,24 +425,126 @@ fn fe_sub(a: &FieldElement, b: &FieldElement) -> FieldElement {
  *    FieldElement: The result of a * b mod P (where P is the field prime)
  */
 fn fe_mul(a: &FieldElement, b: &FieldElement) -> FieldElement {
+    let a_lo = [a[0], a[1]];
+    let a_hi = [a[2], a[3]];
+    let b_lo = [b[0], b[1]];
+    let b_hi = [b[2], b[3]];
+    
+    let z0 = mul_2limb(a_lo, b_lo);
+    let z2 = mul_2limb(a_hi, b_hi);
+    let a_sum = add_4limb(
+        [a_hi[0], a_hi[1], 0, 0],
+        [a_lo[0], a_lo[1], 0, 0]
+    );
+
+    let b_sum = add_4limb(
+        [b_hi[0], b_hi[1], 0, 0],
+        [b_lo[0], b_lo[1], 0, 0]
+    );
+
+    let z1_temp = mul_2limb([a_sum[0], a_sum[1]], [b_sum[0], b_sum[1]]);
+    let z1 = sub_4limb(sub_4limb(z1_temp, z0), z2);
     let mut result = [0u128; 8];
     for i in 0..4 {
-        for j in 0..4 {
-            result[i + j] += (a[i] as u128) * (b[j] as u128);
-        }
+        result[i] += z0[i] as u128;
     }
-
+    
+    for i in 0..4 {
+        result[i + 2] += z1[i] as u128;
+    }
+    
+    for i in 0..4 {
+        result[i + 4] += z2[i] as u128;
+    }
+    
     for i in 0..7 {
         result[i + 1] += result[i] >> 64;
         result[i] &= 0xFFFFFFFFFFFFFFFF;
     }
-
+    
     let mut r = [0u64; 4];
     for i in 0..4 {
         r[i] = result[i] as u64;
     }
-
+    
     fe_reduce(&r)
+}
+
+/**
+ * Multiplies two 2-limb numbers (128-bit) to produce a 4-limb number (256-bit)
+ * Args:
+ *    a - [u64; 2]: The first 2-limb number
+ *    b - [u64; 2]: The second 2 limb number
+ * 
+ * Returns:
+ *    [u64; 4]: The resulting 4-limb number
+ */
+fn mul_2limb(a: [u64; 2], b: [u64; 2]) -> [u64; 4] {
+    let mut result = [0u128; 4];
+    for i in 0..2 {
+        for j in 0..2 {
+            result[i + j] += (a[i] as u128) * (b[j] as u128);
+        }
+    }
+    
+    for i in 0..3 {
+        result[i + 1] += result[i] >> 64;
+        result[i] &= 0xFFFFFFFFFFFFFFFF;
+    }
+    
+    let mut r = [0u64; 4];
+    for i in 0..4 {
+        r[i] = result[i] as u64;
+    }
+    
+    r
+}
+
+/**
+ * Adds two 4-limb numbers (256-bit) to produce a 4-limb number (256-bit)
+ * Args:
+ *    a - [u64; 4]: The first 4-limb number
+ *    b - [u64; 4]: The second 4-limb number
+ * 
+ * Returns:
+ *    [u64; 4]: The resulting 4-limb number
+ */
+fn add_4limb(a: [u64; 4], b: [u64; 4]) -> [u64; 4] {
+    let mut result = [0u64; 4];
+    let mut carry = 0u128;
+    for i in 0..4 {
+        let sum = a[i] as u128 + b[i] as u128 + carry;
+        result[i] = sum as u64;
+        carry = sum >> 64;
+    }
+
+    result
+}
+
+/**
+ * Subtracts two 4-limb numbers (256-bit) to produce a 4-limb number (256-bit)
+ * Args:
+ *    a - [u64; 4]: The first 4-limb number
+ *    b - [u64; 4]: The second 4-limb number
+ * 
+ * Returns:
+ *    [u64; 4]: The resulting 4-limb number
+ */
+fn sub_4limb(a: [u64; 4], b: [u64; 4]) -> [u64; 4] {
+    let mut result = [0u64; 4];
+    let mut borrow = 0i128;
+    for i in 0..4 {
+        let diff = a[i] as i128 - b[i] as i128 - borrow;
+        if diff < 0 {
+            result[i] = (diff + (1i128 << 64)) as u64;
+            borrow = 1;
+        } else {
+            result[i] = diff as u64;
+            borrow = 0;
+        }
+    }
+
+    result
 }
 
 /**
@@ -454,7 +556,29 @@ fn fe_mul(a: &FieldElement, b: &FieldElement) -> FieldElement {
  *    FieldElement: The result of a^2 mod P (where P is the field prime)
  */
 fn fe_square(a: &FieldElement) -> FieldElement {
-    fe_mul(a, a)
+    let mut result = [0u128; 8];
+    for i in 0..4 {
+        result[2 * i] += (a[i] as u128) * (a[i] as u128);
+    }
+    
+    for i in 0..4 {
+        for j in (i + 1)..4 {
+            let cross = (a[i] as u128) * (a[j] as u128);
+            result[i + j] += 2 * cross;
+        }
+    }
+    
+    for i in 0..7 {
+        result[i + 1] += result[i] >> 64;
+        result[i] &= 0xFFFFFFFFFFFFFFFF;
+    }
+    
+    let mut r = [0u64; 4];
+    for i in 0..4 {
+        r[i] = result[i] as u64;
+    }
+    
+    fe_reduce(&r)
 }
 
 /**
@@ -493,20 +617,23 @@ fn fe_reduce(a: &FieldElement) -> FieldElement {
  *    FieldElement: The multiplicative inverse of a mod P (where P is the field prime)
  */
 fn fe_invert(a: &FieldElement) -> FieldElement {
-    let mut result = [1, 0, 0, 0];
-    let mut base = *a;
     let exp = [
         0xFFFFFFFFFFFFFFFFu64,
         0xFFFFFFFFFFFFFFFFu64,
         0xFFFFFFFFFFFFFFFFu64,
         0xFFFFFFFF00000000u64,
     ];
-
-    for i in (0..256).rev() {
+    
+    let mut result = [1, 0, 0, 0];
+    let mut base = *a;
+    for i in 0..256 {
         if (exp[i / 64] >> (i % 64)) & 1 == 1 {
             result = fe_mul(&result, &base);
         }
-        base = fe_square(&base);
+
+        if i < 255 {
+            base = fe_square(&base);
+        }
     }
 
     result
@@ -592,6 +719,39 @@ fn point_on_curve(p: &AffinePoint) -> bool {
 }
 
 /**
+ * Performs batch inversion of field elements
+ * Args:
+ *    elements - &[FieldElement]: The field elements to invert
+ * 
+ * Returns:
+ *    Vec<FieldElement>: The inverted field elements
+ *        where the i-th element is the inverse of the i-th input
+ */
+fn batch_invert(elements: &[FieldElement]) -> Vec<FieldElement> {
+    if elements.is_empty() {
+        return Vec::new();
+    }
+    
+    let mut result = vec![[0u64; 4]; elements.len()];
+    let mut prefix = vec![[1u64; 4]; elements.len()];
+
+    prefix[0] = elements[0];
+    for i in 1..elements.len() {
+        prefix[i] = fe_mul(&prefix[i - 1], &elements[i]);
+    }
+    
+    let mut inv = fe_invert(&prefix[elements.len() - 1]);
+    for i in (0..elements.len()).rev() {
+        result[i] = fe_mul(&inv, &prefix[i - 1]);
+        inv = fe_mul(&inv, &elements[i]);
+    }
+
+    result[0] = inv;
+    
+    result
+}
+
+/**
  * Converts an affine point to a Jacobian point
  * This is done by setting the z-coordinate to 1 for non-infinite points and 0 for infinite points
  * 
@@ -638,8 +798,10 @@ fn jacobian_to_affine(p: &JacobianPoint) -> AffinePoint {
         };
     }
 
+    let z2 = fe_square(&p.z);
+    let z3 = fe_mul(&z2, &p.z);
     let z_inv = fe_invert(&p.z);
-    let z_inv2 = fe_square(&z_inv);
+    let z_inv2 = fe_mul(&z_inv, &z_inv);
     let z_inv3 = fe_mul(&z_inv2, &z_inv);
 
     AffinePoint {
@@ -737,6 +899,82 @@ fn jacobian_add(p: &JacobianPoint, q: &JacobianPoint) -> JacobianPoint {
 }
 
 /**
+ * Adds a Jacobian point and an affine point
+ * Args:
+ *    p - &JacobianPoint: The Jacobian point
+ *    q - &AffinePoint: The affine point
+ * 
+ * Returns:
+ *    JacobianPoint: The resulting Jacobian point after addition
+ */
+fn jacobian_add_mixed(p: &JacobianPoint, q: &AffinePoint) -> JacobianPoint {
+    if p.inf {
+        return affine_to_jacobian(q);
+    }
+    
+    if q.inf {
+        return p.clone();
+    }
+    
+    let z1z1 = fe_square(&p.z);
+    let u1 = p.x.clone();
+    let u2 = fe_mul(&q.x, &z1z1);
+    
+    let s1 = p.y.clone();
+    let s2 = fe_mul(&q.y, &fe_mul(&p.z, &z1z1));
+    if fe_cmp(&u1, &u2) == 0 {
+        if fe_cmp(&s1, &s2) == 0 {
+            return jacobian_double(p);
+        } else {
+            return JacobianPoint {
+                x: [0; 4],
+                y: [1; 4],
+                z: [0; 4],
+                inf: true,
+            };
+        }
+    }
+    
+    let h = fe_sub(&u2, &u1);
+    let r = fe_sub(&s2, &s1);
+    let hh = fe_square(&h);
+    let hhh = fe_mul(&h, &hh);
+    let v = fe_mul(&u1, &hh);
+    
+    let x3 = fe_sub(&fe_sub(&fe_square(&r), &hhh), &fe_mul(&[2, 0, 0, 0], &v));
+    let y3 = fe_sub(&fe_mul(&r, &fe_sub(&v, &x3)), &fe_mul(&s1, &hhh));
+    let z3 = fe_mul(&p.z, &h);
+    
+    JacobianPoint {
+        x: x3,
+        y: y3,
+        z: z3,
+        inf: false,
+    }
+}
+
+/**
+ * Negates a Jacobian point by negating the y-coordinate (reflecting accross the x-axis)
+ * Args:
+ *    p - &JacobianPoint: The Jacobian point to negate
+ * 
+ * Returns:
+ *    JacobianPoint: The negated Jacobian point
+ */
+fn jacobian_negate(p: &JacobianPoint) -> JacobianPoint {
+    if p.inf {
+        return p.clone();
+    }
+    
+    JacobianPoint {
+        x: p.x,
+        y: fe_sub(&P, &p.y),
+        z: p.z,
+        inf: false,
+    }
+}
+
+/**
  * Performs scalar multiplication of the base point G by a scalar
  * Args:
  *    scalar - &FieldElement: The scalar to multiply by
@@ -764,6 +1002,92 @@ fn scalar_mult_base(scalar: &FieldElement) -> JacobianPoint {
  *    JacobianPoint: The resulting Jacobian point after multiplication
  */
 fn scalar_mult(scalar: &FieldElement, point: &JacobianPoint) -> JacobianPoint {
+    scalar_mult_wnaf_impl(scalar, point)
+}
+
+/**
+ * Converts a scalar to its wNAF representation
+ * Args:
+ *    scalar - &FieldElement: The scalar to convert
+ * 
+ * Returns:
+ *    Vec<i8>: The wNAF representation of the scalar where each 
+ *        element is either 0 or an odd integer in the range [-7, 7]
+ */
+fn scalar_to_wnaf(scalar: &FieldElement) -> Vec<i8> {
+    const WINDOW_WIDTH: usize = 3;
+    let window = 1i32 << WINDOW_WIDTH;
+    let mask = (window - 1) as u8;
+    
+    let mut wnaf = Vec::with_capacity(256);
+    let mut k = [scalar[0], scalar[1], scalar[2], scalar[3]];
+    let mut pos = 0;
+    while pos < 256 {
+        let limb_idx = pos / 64;
+        let bit_idx = pos % 64;
+        if limb_idx >= 4 {
+            break;
+        }
+        
+        let bit = ((k[limb_idx] >> bit_idx) & 1) as u8;
+        if bit == 1 {
+            let mut w = (k[limb_idx] >> bit_idx) & (mask as u64);
+            if w >= ((window >> 1) as u64) {
+                w = (w as i32 - window) as u64;
+                if bit_idx + WINDOW_WIDTH < 64 {
+                    k[limb_idx] += 1 << (bit_idx + WINDOW_WIDTH);
+                } else if limb_idx + 1 < 4 {
+                    k[limb_idx + 1] += 1;
+                }
+            }
+            
+            wnaf.push(w as i8);
+            pos += WINDOW_WIDTH;
+        } else {
+            wnaf.push(0);
+            pos += 1;
+        }
+    }
+    
+    wnaf
+}
+
+/**
+ * Precomputes the odd multiples of a point for wNAF scalar multiplication
+ * which creates a lookup table of points [P, 3P, 5P, 7P]
+ * Args:
+ *    point - &JacobianPoint: The point to precompute multiples of
+ * 
+ * Returns:
+ *    Vec<JacobianPoint>: A vector containing the precomputed multiples of the point
+ */
+fn precompute_wnaf_multiples(point: &JacobianPoint) -> Vec<JacobianPoint> {
+    let mut table = Vec::with_capacity(8);
+    table.push(point.clone());
+    
+    let p2 = jacobian_double(point);
+    table.push(jacobian_add(point, &p2));
+    
+    let p4 = jacobian_double(&p2);
+    table.push(jacobian_add(point, &p4));
+    table.push(jacobian_add(&p2, &p4));
+    
+    table
+}
+
+/**
+ * Performs scalar multiplication using wNAF with opportunistic lazy reduction
+ * Args:
+ *    scalar - &FieldElement: The scalar to multiply by
+ *    point - &JacobianPoint: The point to multiply
+ * 
+ * Returns:
+ *    JacobianPoint: The resulting Jacobian point after multiplication
+ */
+fn scalar_mult_wnaf_impl(scalar: &FieldElement, point: &JacobianPoint) -> JacobianPoint {
+    let wnaf = scalar_to_wnaf(scalar);
+    let table = precompute_wnaf_multiples(point);
+    
     let mut result = JacobianPoint {
         x: [0; 4],
         y: [1; 4],
@@ -771,15 +1095,30 @@ fn scalar_mult(scalar: &FieldElement, point: &JacobianPoint) -> JacobianPoint {
         inf: true,
     };
     
-    let mut temp = point.clone();
-    for i in 0..4 {
-        let mut k = scalar[i];
-        for _ in 0..64 {
-            if k & 1 == 1 {
-                result = jacobian_add(&result, &temp);
+    const REDUCTION_INTERVAL: usize = 16;
+    let mut reduction_counter = 0;
+    
+    for i in (0..wnaf.len()).rev() {
+        result = jacobian_double(&result);
+        if wnaf[i] > 0 {
+            let idx = ((wnaf[i] >> 1) as usize);
+            if idx < table.len() {
+                result = jacobian_add(&result, &table[idx]);
             }
-            temp = jacobian_double(&temp);
-            k >>= 1;
+        } else if wnaf[i] < 0 {
+            let idx = (((-wnaf[i]) >> 1) as usize);
+            if idx < table.len() {
+                let neg_point = jacobian_negate(&table[idx]);
+                result = jacobian_add(&result, &neg_point);
+            }
+        }
+        
+        reduction_counter += 1;
+        if reduction_counter >= REDUCTION_INTERVAL && !result.inf {
+            result.x = fe_reduce(&result.x);
+            result.y = fe_reduce(&result.y);
+            result.z = fe_reduce(&result.z);
+            reduction_counter = 0;
         }
     }
     
@@ -794,6 +1133,7 @@ fn scalar_mult(scalar: &FieldElement, point: &JacobianPoint) -> JacobianPoint {
  * Returns:
  *    FieldElement: The resulting field element
  */
+#[inline]
 fn bytes_to_field(bytes: &[u8; 32]) -> FieldElement {
     let mut result = [0u64; 4];
     for i in 0..4 {
@@ -820,6 +1160,7 @@ fn bytes_to_field(bytes: &[u8; 32]) -> FieldElement {
  * Returns:
  *    [u8; 32]: The resulting byte array
  */
+#[inline]
 fn field_to_bytes(fe: &FieldElement) -> [u8; 32] {
     let mut bytes = [0u8; 32];
     for i in 0..4 {

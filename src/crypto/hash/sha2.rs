@@ -89,7 +89,7 @@ impl Sha1 {
             self.buffer_len += to_copy;
             pos += to_copy;
             if self.buffer_len == 64 {
-                self.process_block(&self.buffer.clone());
+                self.process_block();
                 self.buffer_len = 0;
             }
         }
@@ -111,22 +111,14 @@ impl Sha1 {
         self.buffer[self.buffer_len] = 0x80;
         self.buffer_len += 1;
         if self.buffer_len > 56 {
-            while self.buffer_len < 64 {
-                self.buffer[self.buffer_len] = 0;
-                self.buffer_len += 1;
-            }
-            self.process_block(&self.buffer.clone());
+            self.buffer[self.buffer_len..64].fill(0);
+            self.process_block();
             self.buffer_len = 0;
         }
 
-        while self.buffer_len < 56 {
-            self.buffer[self.buffer_len] = 0;
-            self.buffer_len += 1;
-        }
-
+        self.buffer[self.buffer_len..56].fill(0);
         self.buffer[56..64].copy_from_slice(&bit_len.to_be_bytes());
-        let buffer_copy = self.buffer;
-        self.process_block(&buffer_copy);
+        self.process_block();
 
         let mut output = [0u8; 20];
         for (i, &word) in self.state.iter().enumerate() {
@@ -140,12 +132,12 @@ impl Sha1 {
      * Process a single 512-bit block
      * Args:
      *    &mut self: Mutable reference to SHA-1 instance
-     *    block - &[u8; 64]: 512-bit block to process
-     * 
+     *
      * Returns:
      *    (): Nothing
      */
-    fn process_block(&mut self, block: &[u8; 64]) {
+    fn process_block(&mut self) {
+        let block = &self.buffer;
         let mut w = [0u32; 80];
         for i in 0..16 {
             w[i] = u32::from_be_bytes([
@@ -266,7 +258,7 @@ impl Sha256 {
             self.buffer_len += to_copy;
             pos += to_copy;
             if self.buffer_len == 64 {
-                self.process_block(&self.buffer.clone());
+                process_sha256_block(&mut self.state, &self.buffer);
                 self.buffer_len = 0;
             }
         }
@@ -288,23 +280,14 @@ impl Sha256 {
         self.buffer[self.buffer_len] = 0x80;
         self.buffer_len += 1;
         if self.buffer_len > 56 {
-            while self.buffer_len < 64 {
-                self.buffer[self.buffer_len] = 0;
-                self.buffer_len += 1;
-            }
-
-            self.process_block(&self.buffer.clone());
+            self.buffer[self.buffer_len..64].fill(0);
+            process_sha256_block(&mut self.state, &self.buffer);
             self.buffer_len = 0;
         }
 
-        while self.buffer_len < 56 {
-            self.buffer[self.buffer_len] = 0;
-            self.buffer_len += 1;
-        }
-
+        self.buffer[self.buffer_len..56].fill(0);
         self.buffer[56..64].copy_from_slice(&bit_len.to_be_bytes());
-        let buffer_copy = self.buffer;
-        self.process_block(&buffer_copy);
+        process_sha256_block(&mut self.state, &self.buffer);
 
         let mut output = [0u8; 32];
         for (i, &word) in self.state.iter().enumerate() {
@@ -324,58 +307,7 @@ impl Sha256 {
      *    (): Nothing
      */
     fn process_block(&mut self, block: &[u8; 64]) {
-        let mut w = [0u32; 64];
-        for i in 0..16 {
-            w[i] = u32::from_be_bytes([
-                block[i * 4],
-                block[i * 4 + 1],
-                block[i * 4 + 2],
-                block[i * 4 + 3],
-            ]);
-        }
-
-        for i in 16..64 {
-            let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
-            let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
-            w[i] = w[i - 16].wrapping_add(s0).wrapping_add(w[i - 7]).wrapping_add(s1);
-        }
-
-        let mut a = self.state[0];
-        let mut b = self.state[1];
-        let mut c = self.state[2];
-        let mut d = self.state[3];
-        let mut e = self.state[4];
-        let mut f = self.state[5];
-        let mut g = self.state[6];
-        let mut h = self.state[7];
-
-        // Main loop
-        for i in 0..64 {
-            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
-            let ch = (e & f) ^ ((!e) & g);
-            let temp1 = h.wrapping_add(s1).wrapping_add(ch).wrapping_add(K256[i]).wrapping_add(w[i]);
-            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
-            let maj = (a & b) ^ (a & c) ^ (b & c);
-            let temp2 = s0.wrapping_add(maj);
-
-            h = g;
-            g = f;
-            f = e;
-            e = d.wrapping_add(temp1);
-            d = c;
-            c = b;
-            b = a;
-            a = temp1.wrapping_add(temp2);
-        }
-
-        self.state[0] = self.state[0].wrapping_add(a);
-        self.state[1] = self.state[1].wrapping_add(b);
-        self.state[2] = self.state[2].wrapping_add(c);
-        self.state[3] = self.state[3].wrapping_add(d);
-        self.state[4] = self.state[4].wrapping_add(e);
-        self.state[5] = self.state[5].wrapping_add(f);
-        self.state[6] = self.state[6].wrapping_add(g);
-        self.state[7] = self.state[7].wrapping_add(h);
+        process_sha256_block(&mut self.state, block);
     }
 }
 
@@ -565,7 +497,7 @@ impl Sha512 {
             self.buffer_len += to_copy;
             pos += to_copy;
             if self.buffer_len == 128 {
-                self.process_block(&self.buffer.clone());
+                self.process_block();
                 self.buffer_len = 0;
             }
         }
@@ -587,22 +519,14 @@ impl Sha512 {
         self.buffer[self.buffer_len] = 0x80;
         self.buffer_len += 1;
         if self.buffer_len > 112 {
-            while self.buffer_len < 128 {
-                self.buffer[self.buffer_len] = 0;
-                self.buffer_len += 1;
-            }
-            self.process_block(&self.buffer.clone());
+            self.buffer[self.buffer_len..128].fill(0);
+            self.process_block();
             self.buffer_len = 0;
         }
 
-        while self.buffer_len < 112 {
-            self.buffer[self.buffer_len] = 0;
-            self.buffer_len += 1;
-        }
-
+        self.buffer[self.buffer_len..112].fill(0);
         self.buffer[112..128].copy_from_slice(&bit_len.to_be_bytes());
-        let buffer_copy = self.buffer;
-        self.process_block(&buffer_copy);
+        self.process_block();
 
         let mut output = [0u8; 64];
         for (i, &word) in self.state.iter().enumerate() {
@@ -616,12 +540,12 @@ impl Sha512 {
      * Process a single 1024-bit block
      * Args:
      *    &mut self: Mutable reference to SHA-512 instance
-     *    block - &[u8; 128]: 1024-bit block to process
      * 
      * Returns:
      *    (): Nothing
      */
-    fn process_block(&mut self, block: &[u8; 128]) {
+    fn process_block(&mut self) {
+        let block = &self.buffer;
         let mut w = [0u64; 80];
         for i in 0..16 {
             w[i] = u64::from_be_bytes([
@@ -650,24 +574,42 @@ impl Sha512 {
         let mut f = self.state[5];
         let mut g = self.state[6];
         let mut h = self.state[7];
-
-        // Main loop
-        for i in 0..80 {
+        for i in (0..80).step_by(4) {
             let s1 = e.rotate_right(14) ^ e.rotate_right(18) ^ e.rotate_right(41);
             let ch = (e & f) ^ ((!e) & g);
             let temp1 = h.wrapping_add(s1).wrapping_add(ch).wrapping_add(K512[i]).wrapping_add(w[i]);
             let s0 = a.rotate_right(28) ^ a.rotate_right(34) ^ a.rotate_right(39);
             let maj = (a & b) ^ (a & c) ^ (b & c);
             let temp2 = s0.wrapping_add(maj);
+            h = g; g = f; f = e; e = d.wrapping_add(temp1);
+            d = c; c = b; b = a; a = temp1.wrapping_add(temp2);
 
-            h = g;
-            g = f;
-            f = e;
-            e = d.wrapping_add(temp1);
-            d = c;
-            c = b;
-            b = a;
-            a = temp1.wrapping_add(temp2);
+            let s1 = e.rotate_right(14) ^ e.rotate_right(18) ^ e.rotate_right(41);
+            let ch = (e & f) ^ ((!e) & g);
+            let temp1 = h.wrapping_add(s1).wrapping_add(ch).wrapping_add(K512[i + 1]).wrapping_add(w[i + 1]);
+            let s0 = a.rotate_right(28) ^ a.rotate_right(34) ^ a.rotate_right(39);
+            let maj = (a & b) ^ (a & c) ^ (b & c);
+            let temp2 = s0.wrapping_add(maj);
+            h = g; g = f; f = e; e = d.wrapping_add(temp1);
+            d = c; c = b; b = a; a = temp1.wrapping_add(temp2);
+
+            let s1 = e.rotate_right(14) ^ e.rotate_right(18) ^ e.rotate_right(41);
+            let ch = (e & f) ^ ((!e) & g);
+            let temp1 = h.wrapping_add(s1).wrapping_add(ch).wrapping_add(K512[i + 2]).wrapping_add(w[i + 2]);
+            let s0 = a.rotate_right(28) ^ a.rotate_right(34) ^ a.rotate_right(39);
+            let maj = (a & b) ^ (a & c) ^ (b & c);
+            let temp2 = s0.wrapping_add(maj);
+            h = g; g = f; f = e; e = d.wrapping_add(temp1);
+            d = c; c = b; b = a; a = temp1.wrapping_add(temp2);
+
+            let s1 = e.rotate_right(14) ^ e.rotate_right(18) ^ e.rotate_right(41);
+            let ch = (e & f) ^ ((!e) & g);
+            let temp1 = h.wrapping_add(s1).wrapping_add(ch).wrapping_add(K512[i + 3]).wrapping_add(w[i + 3]);
+            let s0 = a.rotate_right(28) ^ a.rotate_right(34) ^ a.rotate_right(39);
+            let maj = (a & b) ^ (a & c) ^ (b & c);
+            let temp2 = s0.wrapping_add(maj);
+            h = g; g = f; f = e; e = d.wrapping_add(temp1);
+            d = c; c = b; b = a; a = temp1.wrapping_add(temp2);
         }
 
         self.state[0] = self.state[0].wrapping_add(a);
@@ -818,23 +760,93 @@ fn process_sha256_block(state: &mut [u32; 8], block: &[u8; 64]) {
     let mut f = state[5];
     let mut g = state[6];
     let mut h = state[7];
+    for chunk in 0..16 {
+        let base = chunk * 4;
+        let t1_0 = h.wrapping_add(
+            (e.rotate_right(6) ^
+             e.rotate_right(11) ^
+             e.rotate_right(25)) ^
+             ((e & f) ^ ((!e) & g)) ^
+             K256[base]).wrapping_add(w[base]);
 
-    for i in 0..64 {
-        let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
-        let ch = (e & f) ^ ((!e) & g);
-        let temp1 = h.wrapping_add(s1).wrapping_add(ch).wrapping_add(K256[i]).wrapping_add(w[i]);
-        let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
-        let maj = (a & b) ^ (a & c) ^ (b & c);
-        let temp2 = s0.wrapping_add(maj);
+        let t2_0 = (a.rotate_right(2) ^
+                         a.rotate_right(13) ^
+                         a.rotate_right(22)) ^
+                         ((a & b) ^ (a & c) ^
+                         (b & c));
+        h = g;
+        g = f;
+        f = e;
+        e = d.wrapping_add(t1_0);
+        d = c;
+        c = b;
+        b = a;
+        a = t1_0.wrapping_add(t2_0);
+
+        let t1_1 = h.wrapping_add(
+            (e.rotate_right(6) ^
+             e.rotate_right(11) ^
+             e.rotate_right(25)) ^
+             ((e & f) ^ ((!e) & g)) ^
+            K256[base + 1]).wrapping_add(w[base + 1]);
+
+        let t2_1 = (a.rotate_right(2) ^ 
+                         a.rotate_right(13) ^
+                         a.rotate_right(22)) ^
+                         ((a & b) ^ (a & c) ^
+                         (b & c));
+        h = g;
+        g = f;
+        f = e;
+        e = d.wrapping_add(t1_1);
+        d = c;
+        c = b;
+        b = a;
+        a = t1_1.wrapping_add(t2_1);
+
+        let t1_2 = h.wrapping_add(
+            (e.rotate_right(6) ^
+             e.rotate_right(11) ^
+             e.rotate_right(25)) ^
+             ((e & f) ^ ((!e) & g))^
+             K256[base + 2]).wrapping_add(w[base + 2]);
+
+        let t2_2 = (a.rotate_right(2) ^
+                         a.rotate_right(13) ^
+                         a.rotate_right(22)) ^
+                         ((a & b) ^ (a & c) ^
+                         (b & c));
 
         h = g;
         g = f;
         f = e;
-        e = d.wrapping_add(temp1);
+        e = d.wrapping_add(t1_2);
         d = c;
         c = b;
         b = a;
-        a = temp1.wrapping_add(temp2);
+        a = t1_2.wrapping_add(t2_2);
+
+        let t1_3 = h.wrapping_add(
+            (e.rotate_right(6) ^
+             e.rotate_right(11) ^
+             e.rotate_right(25)) ^
+             ((e & f) ^ ((!e) & g))^
+             K256[base + 3]).wrapping_add(w[base + 3]);
+
+        let t2_3 = (a.rotate_right(2) ^
+                         a.rotate_right(13) ^
+                         a.rotate_right(22)) ^
+                         ((a & b) ^ (a & c) ^
+                         (b & c));
+
+        h = g;
+        g = f;
+        f = e;
+        e = d.wrapping_add(t1_3);
+        d = c;
+        c = b;
+        b = a;
+        a = t1_3.wrapping_add(t2_3);
     }
 
     state[0] = state[0].wrapping_add(a);
@@ -865,19 +877,12 @@ fn finalize_sha256_state(state: &mut [u32; 8], buffer: &mut [u8; 64], buffer_len
     buffer[temp_buffer_len] = 0x80;
     temp_buffer_len += 1;
     if temp_buffer_len > 56 {
-        while temp_buffer_len < 64 {
-            buffer[temp_buffer_len] = 0;
-            temp_buffer_len += 1;
-        }
+        buffer[temp_buffer_len..64].fill(0);
         process_sha256_block(state, buffer);
         temp_buffer_len = 0;
     }
 
-    while temp_buffer_len < 56 {
-        buffer[temp_buffer_len] = 0;
-        temp_buffer_len += 1;
-    }
-
+    buffer[temp_buffer_len..56].fill(0);
     buffer[56..64].copy_from_slice(&bit_len.to_be_bytes());
     process_sha256_block(state, buffer);
 }
