@@ -762,18 +762,15 @@ fn process_sha256_block(state: &mut [u32; 8], block: &[u8; 64]) {
     let mut h = state[7];
     for chunk in 0..16 {
         let base = chunk * 4;
-        let t1_0 = h.wrapping_add(
-            (e.rotate_right(6) ^
-             e.rotate_right(11) ^
-             e.rotate_right(25)) ^
-             ((e & f) ^ ((!e) & g)) ^
-             K256[base]).wrapping_add(w[base]);
+        let t1_0 = h
+            .wrapping_add(e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25))
+            .wrapping_add((e & f) ^ ((!e) & g))
+            .wrapping_add(K256[base])
+            .wrapping_add(w[base]);
 
-        let t2_0 = (a.rotate_right(2) ^
-                         a.rotate_right(13) ^
-                         a.rotate_right(22)) ^
-                         ((a & b) ^ (a & c) ^
-                         (b & c));
+        let t2_0 = (a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22))
+            .wrapping_add((a & b) ^ (a & c) ^ (b & c));
+
         h = g;
         g = f;
         f = e;
@@ -783,18 +780,15 @@ fn process_sha256_block(state: &mut [u32; 8], block: &[u8; 64]) {
         b = a;
         a = t1_0.wrapping_add(t2_0);
 
-        let t1_1 = h.wrapping_add(
-            (e.rotate_right(6) ^
-             e.rotate_right(11) ^
-             e.rotate_right(25)) ^
-             ((e & f) ^ ((!e) & g)) ^
-            K256[base + 1]).wrapping_add(w[base + 1]);
+        let t1_1 = h
+            .wrapping_add(e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25))
+            .wrapping_add((e & f) ^ ((!e) & g))
+            .wrapping_add(K256[base + 1])
+            .wrapping_add(w[base + 1]);
 
-        let t2_1 = (a.rotate_right(2) ^ 
-                         a.rotate_right(13) ^
-                         a.rotate_right(22)) ^
-                         ((a & b) ^ (a & c) ^
-                         (b & c));
+        let t2_1 = (a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22))
+            .wrapping_add((a & b) ^ (a & c) ^ (b & c));
+        
         h = g;
         g = f;
         f = e;
@@ -804,18 +798,14 @@ fn process_sha256_block(state: &mut [u32; 8], block: &[u8; 64]) {
         b = a;
         a = t1_1.wrapping_add(t2_1);
 
-        let t1_2 = h.wrapping_add(
-            (e.rotate_right(6) ^
-             e.rotate_right(11) ^
-             e.rotate_right(25)) ^
-             ((e & f) ^ ((!e) & g))^
-             K256[base + 2]).wrapping_add(w[base + 2]);
+        let t1_2 = h
+            .wrapping_add(e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25))
+            .wrapping_add((e & f) ^ ((!e) & g))
+            .wrapping_add(K256[base + 2])
+            .wrapping_add(w[base + 2]);
 
-        let t2_2 = (a.rotate_right(2) ^
-                         a.rotate_right(13) ^
-                         a.rotate_right(22)) ^
-                         ((a & b) ^ (a & c) ^
-                         (b & c));
+        let t2_2 = (a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22))
+            .wrapping_add((a & b) ^ (a & c) ^ (b & c));
 
         h = g;
         g = f;
@@ -826,18 +816,14 @@ fn process_sha256_block(state: &mut [u32; 8], block: &[u8; 64]) {
         b = a;
         a = t1_2.wrapping_add(t2_2);
 
-        let t1_3 = h.wrapping_add(
-            (e.rotate_right(6) ^
-             e.rotate_right(11) ^
-             e.rotate_right(25)) ^
-             ((e & f) ^ ((!e) & g))^
-             K256[base + 3]).wrapping_add(w[base + 3]);
+        let t1_3 = h
+            .wrapping_add(e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25))
+            .wrapping_add((e & f) ^ ((!e) & g))
+            .wrapping_add(K256[base + 3])
+            .wrapping_add(w[base + 3]);
 
-        let t2_3 = (a.rotate_right(2) ^
-                         a.rotate_right(13) ^
-                         a.rotate_right(22)) ^
-                         ((a & b) ^ (a & c) ^
-                         (b & c));
+        let t2_3 = (a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22))
+            .wrapping_add((a & b) ^ (a & c) ^ (b & c));
 
         h = g;
         g = f;

@@ -274,8 +274,8 @@ impl Aes {
 
         add_round_key(&mut state, &self.round_keys[0]);
         for round in 1..self.num_rounds {
-            shift_rows(&mut state);
             sub_bytes(&mut state);
+            shift_rows(&mut state);
             mix_columns(&mut state);
             add_round_key(&mut state, &self.round_keys[round]);
         }
@@ -769,9 +769,9 @@ fn shift_rows(state: &mut [u8; 16]) {
     state[14] = temp;
 
     let temp = state[3];
-    state[3] = state[11];
-    state[11] = state[15];
-    state[15] = state[7];
+    state[3] = state[15];
+    state[15] = state[11];
+    state[11] = state[7];
     state[7] = temp;
 }
 

@@ -63,7 +63,7 @@ impl Certificate {
                 })?;
 
                 let end = cert.pos;
-                der[start..end].to_vec()
+                cert.data[start..end].to_vec()
             };
 
             let signature_algorithm = cert.sequence(|alg| alg.object_identifier())?;
@@ -178,9 +178,10 @@ impl Certificate {
      *    Result<Self>: The parsed Certificate or an error if parsing fails
      */
     pub fn from_pem(pem_str: &str) -> Result<Self> {
-        let pem = pem::decode(pem_str)?;
-
-        Self::from_der(&pem)
+        let body: String = pem_str.lines().filter(|line| !line.starts_with("-----")).collect::<Vec<_>>().join("");
+        let der = pem::decode(&body)?;
+        
+        Self::from_der(&der)
     }
 
     /**
@@ -192,7 +193,9 @@ impl Certificate {
      *    String: The PEM-encoded certificate string
      */
     pub fn to_pem(&self) -> String {
-        pem::encode(&self.tbs)
+        let der = self.to_der();
+        
+        format!("-----BEGIN CERTIFICATE-----\n{}\n-----END CERTIFICATE-----", pem::encode(&der))
     }
 
     /**
@@ -630,17 +633,25 @@ impl Certificate {
  */
 fn parse_name(decoder: &mut DerDecoder) -> Result<Name> {
     let mut common_name = None;
-    decoder.set(|set| {
-        set.sequence(|attr| {
-            let oid = attr.object_identifier()?;
-            let value = attr.read_element()?;
-            if oid == [2, 5, 4, 3] {
-                let mut val_decoder = DerDecoder::new(&value.data);
-                common_name = Some(val_decoder.utf8_string().unwrap_or_default());
+    while decoder.has_more() {
+        decoder.set(|set| {
+            while set.has_more() {
+                set.sequence(|attr| {
+                    let oid = attr.object_identifier()?;
+                    let value = attr.read_element()?;
+                    if oid == [2, 5, 4, 3] {
+                        let mut val_decoder = DerDecoder::new(&value.data);
+                        common_name = Some(val_decoder.utf8_string().unwrap_or_default());
+                    }
+
+                    Ok(())
+                })?;
             }
+
             Ok(())
-        })
-    })?;
+        })?;
+    }
+    
     Ok(Name { common_name })
 }
 
@@ -740,7 +751,7 @@ fn parse_utc_time(data: &[u8]) -> Result<i64> {
 
     let timestamp = calculate_unix_timestamp(year, month, day, hour, minute, second)?;
     if time_str.len() > 13 && !time_str.ends_with('Z') {
-        let tz_offset = parse_timezone_offset(&time_str[13..])?;
+        let tz_offset = parse_timezone_offset(&time_str[12..])?;
         Ok(timestamp - tz_offset)
     } else {
         Ok(timestamp)
@@ -930,32 +941,37 @@ mod tests {
 
     // Minimal DER-encoded self-signed certificate (not valid, just for testing structure)
     // This is a dummy, minimal ASN.1 DER-encoded X.509 certificate for test purposes.
-    // In a real test, use a real certificate or a properly generated one.
     const MINIMAL_DER: &[u8] = &[
-        0x30, 0x82, 0x00, 0x22, // SEQUENCE, length 34
-        0x30, 0x1F, // SEQUENCE, length 31 (tbsCertificate)
-        0xA0, 0x03, 0x02, 0x01, 0x02, // [0] Version: v3
-        0x02, 0x01, 0x01, // Serial Number: 1
-        0x30, 0x0D, // SEQUENCE (signature algorithm)
-        0x06, 0x09, 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x05, // OID 1.2.840.113549.1.1.5 (sha1WithRSAEncryption)
-        0x05, 0x00, // NULL
-        0x30, 0x03, // SEQUENCE (issuer)
-        0x31, 0x01, // SET
-        0x30, 0x00, // SEQUENCE (empty)
-        0x30, 0x03, // SEQUENCE (validity)
-        0x17, 0x01, 0x30, // UTCTime
-        0x17, 0x01, 0x30, // UTCTime
-        0x30, 0x03, // SEQUENCE (subject)
-        0x31, 0x01, // SET
-        0x30, 0x00, // SEQUENCE (empty)
-        0x30, 0x0A, // SEQUENCE (subjectPublicKeyInfo)
-        0x30, 0x08, // SEQUENCE (algorithm)
-        0x06, 0x06, 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, // OID 1.2.840.113549.1.1.1 (rsaEncryption)
-        0x03, 0x00, // BIT STRING (empty)
-        0x30, 0x0D, // SEQUENCE (signatureAlgorithm)
-        0x06, 0x09, 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x05, // OID 1.2.840.113549.1.1.5
-        0x05, 0x00, // NULL
-        0x03, 0x01, 0x00, // BIT STRING (signature)
+        // Certificate SEQUENCE, length 74 = 0x4A
+        0x30, 0x4A,
+        // TBSCertificate SEQUENCE, length 54 = 0x36
+        0x30, 0x36,
+        // [0] Version: v3
+        0xA0, 0x03, 0x02, 0x01, 0x02,
+        // Serial Number: 1
+        0x02, 0x01, 0x01,
+        // Signature algorithm SEQUENCE (sha1WithRSAEncryption), length 13
+        0x30, 0x0D,
+        0x06, 0x09, 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x05,
+        0x05, 0x00,
+        // Issuer SEQUENCE, length 2: empty SET
+        0x30, 0x02, 0x31, 0x00,
+        // Validity SEQUENCE, length 6: two UTCTime values
+        0x30, 0x06, 0x17, 0x01, 0x30, 0x17, 0x01, 0x30,
+        // Subject SEQUENCE, length 2: empty SET
+        0x30, 0x02, 0x31, 0x00,
+        // SubjectPublicKeyInfo SEQUENCE, length 13
+        0x30, 0x0D,
+        // Algorithm SEQUENCE, length 8
+        0x30, 0x08, 0x06, 0x06, 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D,
+        // Public key BIT STRING: 1 byte content (0 unused bits, empty key)
+        0x03, 0x01, 0x00,
+        // Signature algorithm SEQUENCE (sha1WithRSAEncryption), length 13
+        0x30, 0x0D,
+        0x06, 0x09, 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x05,
+        0x05, 0x00,
+        // Signature BIT STRING: 1 byte content (0 unused bits, empty signature)
+        0x03, 0x01, 0x00,
     ];
 
     #[test]
@@ -999,14 +1015,14 @@ mod tests {
     fn test_parse_utc_time() {
         // "240101120000Z" = Jan 1, 2024, 12:00:00 UTC
         let timestamp = parse_utc_time(b"240101120000Z").unwrap();
-        assert!(timestamp > 1704110400); // Unix timestamp for 2024-01-01 12:00:00
+        assert!(timestamp >= 1704110400); // Unix timestamp for 2024-01-01 12:00:00
     }
 
     #[test]
     fn test_parse_generalized_time() {
         // "20240101120000Z" = Jan 1, 2024, 12:00:00 UTC
         let timestamp = parse_generalized_time(b"20240101120000Z").unwrap();
-        assert!(timestamp > 1704110400);
+        assert!(timestamp >= 1704110400);
     }
 
     #[test]

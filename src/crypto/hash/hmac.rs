@@ -432,8 +432,8 @@ mod tests {
         let key = b"secret_key";
         let data = b"message";
         
-        let hmac1 = HmacSha256::new(key);
-        hmac1.clone().update(data);
+        let mut hmac1 = HmacSha256::new(key);
+        hmac1.update(data);
         let mac = hmac1.clone().finalize();
         
         let mut hmac2 = HmacSha256::new(key);

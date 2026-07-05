@@ -323,24 +323,21 @@ mod tests {
     
     #[test]
     fn test_md5_message_digest() {
-        let hash = md5(b"message digest");
-        assert_eq!(md5_hex(&hash), "f96b697d7cb7938d525a2f31aaf161d0");
+        assert_eq!(md5_hex(b"message digest"), "f96b697d7cb7938d525a2f31aaf161d0");
     }
     
     #[test]
     fn test_md5_alphabet() {
-        let hash = md5(b"abcdefghijklmnopqrstuvwxyz");
         assert_eq!(
-            md5_hex(&hash),
+            md5_hex(b"abcdefghijklmnopqrstuvwxyz"),
             "c3fcd3d76192e4007dfb496cca67e13b"
         );
     }
     
     #[test]
     fn test_md5_alphanumeric() {
-        let hash = md5(b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789");
         assert_eq!(
-            md5_hex(&hash),
+            md5_hex(b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"),
             "d174ab98d277d9f5a5611c2c9f419d9f"
         );
     }

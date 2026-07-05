@@ -59,6 +59,7 @@ pub fn decode(input: &str) -> Result<Vec<u8>> {
     let mut output = Vec::new();
     let mut buf = [0u8; 4];
     let mut buf_len = 0;
+    let mut pad_count = 0;
 
     fn decode_char(c: u8) -> Option<u8> {
         match c {
@@ -67,7 +68,6 @@ pub fn decode(input: &str) -> Result<Vec<u8>> {
             b'0'..=b'9' => Some(c - b'0' + 52),
             b'+' => Some(62),
             b'/' => Some(63),
-            b'=' => Some(0),
             _ => None,
         }
     }
@@ -76,6 +76,7 @@ pub fn decode(input: &str) -> Result<Vec<u8>> {
         if b == b'=' {
             buf[buf_len] = 0;
             buf_len += 1;
+            pad_count += 1;
         } else if let Some(val) = decode_char(b) {
             buf[buf_len] = val;
             buf_len += 1;
@@ -85,18 +86,19 @@ pub fn decode(input: &str) -> Result<Vec<u8>> {
 
         if buf_len == 4 {
             output.push((buf[0] << 2) | (buf[1] >> 4));
-            if input.as_bytes()[output.len() * 4 / 3 + 2 - 1] != b'=' {
+            if pad_count <= 1 {
                 output.push((buf[1] << 4) | (buf[2] >> 2));
             }
 
-            if input.as_bytes()[output.len() * 4 / 3 + 3 - 1] != b'=' {
+            if pad_count == 0 {
                 output.push((buf[2] << 6) | buf[3]);
             }
-
+            
             buf_len = 0;
+            pad_count = 0;
         }
     }
-    
+
     Ok(output)
 }
 

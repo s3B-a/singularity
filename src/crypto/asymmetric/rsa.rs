@@ -444,6 +444,14 @@ impl RsaPublicKey {
         Ok(Self { n, e, size })
     }
 
+    /**
+     * Converts the RSA public key to DER-encoded bytes
+     * Args:
+     *    &self: The RsaPublicKey instance
+     * 
+     * Returns:
+     *    Vec<u8>: The DER-encoded public key bytes
+     */
     pub fn to_der(&self) -> Vec<u8> {
         let n_bytes = self.n.to_bytes_be();
         let e_bytes = self.e.to_bytes_be();
@@ -461,10 +469,26 @@ impl RsaPublicKey {
         der
     }
 
+    /**
+     * Constructs an RSA public key from DER-encoded bytes
+     * Args:
+     *    der - &[u8]: The DER-encoded public key bytes
+     * 
+     * Returns:
+     *    Result<Self>: The constructed RsaPublicKey or an error if construction fails
+     */
     pub fn from_der(der: &[u8]) -> Result<Self> {
         Self::from_bytes(der)
     }
 
+    /**
+     * Converts the RSA public key to a PEM-encoded string
+     * Args:
+     *    &self: The RsaPublicKey instance
+     * 
+     * Returns:
+     *    String: The PEM-encoded public key string
+     */
     pub fn to_pem(&self) -> String {
         let der = self.to_der();
         let b64 = pem::encode(&der);
@@ -474,11 +498,20 @@ impl RsaPublicKey {
             pem.push_str(std::str::from_utf8(chunk).unwrap());
             pem.push('\n');
         }
+
         pem.push_str("-----END PUBLIC KEY-----\n");
         
         pem
     }
 
+    /**
+     * Constructs an RSA public key from a PEM-encoded string
+     * Args:
+     *    pem_str - &str: The PEM-encoded public key string
+     * 
+     * Returns:
+     *    Result<Self>: The constructed RsaPublicKey or an error if construction fails
+     */
     pub fn from_pem(pem_str: &str) -> Result<Self> {
         let b64 = pem_str
             .lines()
@@ -488,6 +521,16 @@ impl RsaPublicKey {
         Self::from_bytes(&der)
     }
 
+    /**
+     * Verifies a PSS signature using the RSA public key and SHA-256 hash
+     * Args:
+     *    &self: The RsaPublicKey instance
+     *    message_hash - &[u8]: The SHA-256 hash of the original message
+     *    signature - &[u8]: The PSS signature to verify
+     * 
+     * Returns:
+     *    Result<bool>: True if the signature is valid, false otherwise
+     */
     pub fn verify_pss(&self, message_hash: &[u8], signature: &[u8]) -> Result<bool> {
         let s = BigNum::from_bytes_be(signature);
         if s.cmp(&self.n) != Ordering::Less {
@@ -538,17 +581,35 @@ pub fn generate_rsa_primes(bits: usize, e: &BigNum) -> Result<(BigNum, BigNum)> 
  *    Result<BigNum>: The generated prime number or an error if generation fails
  */
 fn generate_prime(bits: usize, e: &BigNum) -> Result<BigNum> {
-    const SMALL_PRIMES: [u64; 49] = [
+    let bytes = (bits + 7) / 8;
+    let prime_rounds = if bits < 512 { 6 } else if bits < 1024 { 8 } else { 8 };
+    let two = BigNum::from_u64(2);
+    const SMALL_PRIMES: [u64; 232] = [
         3, 5, 7, 11, 13, 17, 19, 23, 29, 31,
         37, 41, 43, 47, 53, 59, 61, 67, 71, 73,
         79, 83, 89, 97, 101, 103, 107, 109, 113, 127,
         131, 137, 139, 149, 151, 157, 163, 167, 173, 179,
-        181, 191, 193, 197, 199, 211, 223, 227, 229,
+        181, 191, 193, 197, 199, 211, 223, 227, 229, 233,
+        239, 241, 251, 257, 263, 269, 271, 277, 281, 283,
+        293, 307, 311, 313, 317, 331, 337, 347, 349, 353,
+        359, 367, 373, 379, 383, 389, 397, 401, 409, 419,
+        421, 431, 433, 439, 443, 449, 457, 461, 463, 467,
+        479, 487, 491, 499, 503, 509, 521, 523, 541, 547,
+        557, 563, 569, 571, 577, 587, 593, 599, 601, 607,
+        613, 617, 619, 631, 641, 643, 647, 653, 659, 661,
+        673, 677, 683, 691, 701, 709, 719, 727, 733, 739,
+        743, 751, 757, 761, 769, 773, 787, 797, 809, 811,
+        821, 823, 827, 829, 839, 853, 857, 859, 863, 877,
+        881, 883, 887, 907, 911, 919, 929, 937, 941, 947,
+        953, 967, 971, 977, 983, 991, 997, 1009, 1013, 1019,
+        1021, 1031, 1033, 1039, 1049, 1051, 1061, 1063, 1069, 1087,
+        1091, 1093, 1097, 1103, 1109, 1117, 1123, 1129, 1151, 1153,
+        1163, 1171, 1181, 1187, 1193, 1201, 1213, 1217, 1223, 1229,
+        1231, 1237, 1249, 1259, 1277, 1279, 1283, 1289, 1291, 1297,
+        1301, 1303, 1307, 1319, 1321, 1327, 1361, 1367, 1373, 1381,
+        1399, 1409, 1423, 1427, 1429, 1433, 1439, 1447, 1451, 1453,
+        1459, 1471,
     ];
-
-    let bytes = (bits + 7) / 8;
-    let prime_rounds = if bits < 512 { 6 } else if bits < 1024 { 8 } else { 8 };
-    let two = BigNum::from_u64(2);
 
     let mut candidate_bytes = vec![0u8; bytes];
     random::fill_random(&mut candidate_bytes)?;
@@ -651,6 +712,15 @@ fn is_probably_prime(n: &BigNum, rounds: usize) -> Result<bool> {
     Ok(miller_rabin_probabilistic(n, effective_rounds))
 }
 
+/**
+ * Computes the modulus of a BigNum with a u64 integer
+ * Args:
+ *    n - &BigNum: The BigNum to compute the modulus of
+ *    m - u64: The modulus
+ * 
+ * Returns:
+ *    u64: The result of n mod m
+ */
 fn mod_u64(n: &BigNum, m: u64) -> u64 {
     if m == 0 {
         return 0;
@@ -664,6 +734,15 @@ fn mod_u64(n: &BigNum, m: u64) -> u64 {
     rem as u64
 }
 
+/**
+ * Computes the greatest common divisor (GCD) of two u64 integers
+ * Args:
+ *    a - u64: The first integer
+ *    b - u64: The second integer
+ * 
+ * Returns:
+ *    u64: The GCD of a and b
+ */
 fn gcd_u64(mut a: u64, mut b: u64) -> u64 {
     while b != 0 {
         let r = a % b;
@@ -778,6 +857,16 @@ fn miller_rabin(n: &BigNum, rounds: usize) -> bool {
     true
 }
 
+/**
+ * Performs modular exponentiation using Montgomery multiplication with a given context
+ * Args:
+ *    base - &BigNum: The base for exponentiation
+ *    exp - &BigNum: The exponent for exponentiation
+ *    ctx - &MontgomeryContext: The Montgomery context for modular arithmetic
+ * 
+ * Returns:
+ *    BigNum: The result of (base^exp) mod n, where n is the modulus in the Montgomery context
+ */
 fn mod_exp_montgomery_ctx(base: &BigNum, exp: &BigNum, ctx: &MontgomeryContext) -> BigNum {
     let bit_length = exp.bit_length();
     if bit_length == 0 {
@@ -838,7 +927,9 @@ fn miller_rabin_deterministic(n: &BigNum) -> bool {
             }
         }
 
-        if !found { return false; }
+        if !found {
+            return false;
+        }
     }
 
     true
@@ -854,61 +945,46 @@ fn miller_rabin_deterministic(n: &BigNum) -> bool {
  *    bool: True if n is probably prime, false if composite
  */
 fn miller_rabin_probabilistic(n: &BigNum, rounds: usize) -> bool {
-    println!("miller_rabin_probabilistic: starting with {} rounds", rounds);
-    
     let one = BigNum::one();
     let n_minus_1 = n - &one;
     let (r, d) = factor_power_of_two(&n_minus_1);
     if r == 0 {
-        println!("miller_rabin_probabilistic: r=0, returning false");
         return false;
     }
 
     let ctx = match MontgomeryContext::new(n) {
         Ok(ctx) => ctx,
-        Err(_) => {
-            println!("miller_rabin_probabilistic: MontgomeryContext::new failed");
-            return false;
-        }
+        Err(_) => return false,
     };
 
     let one_mont = ctx.to_montgomery(&one);
     let n_minus_1_mont = ctx.to_montgomery(&n_minus_1);
-    for round in 0..rounds {
-        println!("  Round {}/{}", round + 1, rounds);
-        
-        let a = match random_range(&BigNum::from_u64(2), &n_minus_1) {
-            Ok(val) => { println!("    Generated random witness"); val },
-            Err(e) => { println!("    random_range failed: {:?}", e); return false; }
+    let two = BigNum::from_u64(2);
+    for _ in 0..rounds {
+        let a = match random_range(&two, &n_minus_1) {
+            Ok(val) => val,
+            Err(_) => return false,
         };
 
         let mut x = mod_exp_montgomery_ctx_mont(&a, &d, &ctx);
         if x == one_mont || x == n_minus_1_mont {
-            println!("    Witness passed (x == 1 or n-1)");
             continue;
         }
 
         let mut found_n_minus_1 = false;
-        for i in 0..(r - 1) {
-            if i % 10 == 0 && i > 0 {
-                println!("      Squaring iteration {}/{}", i, r - 1);
-            }
-
+        for _ in 0..(r - 1) {
             x = ctx.multiply(&x, &x);
             if x == n_minus_1_mont {
                 found_n_minus_1 = true;
-                println!("    Found n-1 after {} squares", i + 1);
                 break;
             }
         }
 
         if !found_n_minus_1 {
-            println!("    Witness proves composite");
             return false;
         }
     }
 
-    println!("miller_rabin_probabilistic: all witnesses passed - probably prime");
     true
 }
 
@@ -1204,6 +1280,7 @@ fn pad_oaep_sha256(data: &[u8], key_size: usize) -> Result<Vec<u8>> {
     em[0] = 0x00;
     em[1..1 + hash_len].copy_from_slice(&masked_seed);
     em[1 + hash_len..].copy_from_slice(&masked_db);
+
     Ok(em)
 }
 
@@ -1246,6 +1323,7 @@ fn unpad_oaep_sha256(data: &[u8]) -> Result<Vec<u8>> {
     }
 
     let sep = sep.ok_or_else(|| Error::CryptoError("Invalid OAEP padding".to_string()))?;
+
     Ok(db[sep + 1..].to_vec())
 }
 
@@ -1372,6 +1450,7 @@ fn mgf1_sha256(seed: &[u8], length: usize) -> Vec<u8> {
     }
 
     output.truncate(length);
+
     output
 }
 
@@ -1387,18 +1466,12 @@ fn mgf1_sha256(seed: &[u8], length: usize) -> Vec<u8> {
 fn gcd(a: &BigNum, b: &BigNum) -> BigNum {
     let mut a = a.clone();
     let mut b = b.clone();
-    let mut iterations = 0;
     while !b.is_zero() {
-        iterations += 1;
-        if iterations % 1000 == 0 {
-            println!("    gcd: iteration {}", iterations);
-        }
-
         let temp = b.clone();
         b = a.modulo(&b);
         a = temp;
     }
-    println!("    gcd completed in {} iterations", iterations);
+    
     a
 }
 
@@ -1421,9 +1494,11 @@ fn big_num_to_fixed_bytes(num: &BigNum, length: usize) -> Vec<u8> {
     if bytes.len() > length {
         bytes = bytes[bytes.len() - length..].to_vec();
     }
+
     if bytes.len() < length {
         let mut padded = vec![0u8; length - bytes.len()];
         padded.extend_from_slice(&bytes);
+
         padded
     } else {
         bytes

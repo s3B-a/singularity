@@ -470,12 +470,10 @@ impl BigNum {
      *    Result<BigNum>: The modular inverse of self mod modulus or an error if no inverse exists
      */
     pub fn mod_inverse(&self, modulus: &BigNum) -> Result<BigNum> {
-        println!("mod_inverse called: self_bits={}, mod_bits={}", 
-             self.bit_length(), modulus.bit_length());
-
         if self.is_zero() {
             return Err(Error::CryptoError("Cannot invert zero".to_string()));
         }
+
         if modulus.is_zero() {
             return Err(Error::CryptoError("Modulus cannot be zero".to_string()));
         }
@@ -487,7 +485,6 @@ impl BigNum {
         let mut s1 = BigNum::one();
         let mut s0_neg = false;
         let mut s1_neg = false;
-
         while !r1.is_zero() {
             let (q, r2) = Self::div_rem_optimized(&r0, &r1);
 
@@ -710,12 +707,21 @@ impl BigNum {
      */
     fn compute_r_squared(modulus: &BigNum) -> BigNum {
         let k = modulus.limbs.len();
-        let mut r_squared = BigNum::one();
-        for _ in 0..(128 * k) {
-            r_squared = (r_squared.clone() << 1) % modulus.clone();
+        let mut exp = 128 * k;
+        let mut result = BigNum::one();
+        let mut base = BigNum::from_u64(2);
+        while exp > 0 {
+            if exp & 1 == 1 {
+                result = (&result * &base) % modulus.clone();
+            }
+
+            exp >>= 1;
+            if exp > 0 {
+                base = (&base * &base) % modulus.clone();
+            }
         }
 
-        r_squared
+        result
     }
 
     /**
@@ -1284,11 +1290,8 @@ impl MontgomeryContext {
         }
 
         let bit_length = modulus.bit_length();
-        let modulus_inv = Self::compute_modulus_inv(&modulus.limbs[0]);        
-        let k = modulus.limbs.len();
-        let r = BigNum::from_limbs(vec![0u64; k + 1]);
-        let r_squared = BigNum::compute_r_squared(modulus);
-        let r2_mod_m = &r_squared % modulus;
+        let modulus_inv = Self::compute_modulus_inv(&modulus.limbs[0]);
+        let r2_mod_m = BigNum::compute_r_squared(modulus);
 
         Ok(MontgomeryContext {
             modulus: modulus.clone(),
@@ -1307,11 +1310,11 @@ impl MontgomeryContext {
      *    u64: The modular inverse of m modulo 2^64
      */
     fn compute_modulus_inv(m: &u64) -> u64 {
-        let mut x = m.wrapping_mul(m.wrapping_sub(2));
-        x = x.wrapping_mul(2u64.wrapping_sub(m.wrapping_mul(x)));
-        x = x.wrapping_mul(2u64.wrapping_sub(m.wrapping_mul(x)));
-        x = x.wrapping_mul(2u64.wrapping_sub(m.wrapping_mul(x)));
-        x = x.wrapping_mul(2u64.wrapping_sub(m.wrapping_mul(x)));
+        let mut x = *m;
+        for _ in 0..5 {
+            x = x.wrapping_mul(2u64.wrapping_sub(m.wrapping_mul(x)));
+        }
+
         x.wrapping_neg()
     }
 
@@ -1378,46 +1381,8 @@ impl MontgomeryContext {
      * Returns:
      *    BigNum: The result of the Montgomery multiplication
      */
-    pub fn multiply(&self, a: &BigNum, b:&BigNum) -> BigNum {
-        let n = self.modulus.limbs.len();
-        let mut a_limbs = a.limbs.clone();
-        let mut b_limbs = b.limbs.clone();
-        a_limbs.resize(n, 0);
-        b_limbs.resize(n, 0);
-        let mut t = vec![0u64; 2 * n + 1];
-
-        for i in 0..n {
-            let mut carry: u128 = 0;
-            for j in 0..n {
-                let prod = (a_limbs[i] as u128) * (b_limbs[j] as u128)
-                    + (t[i + j] as u128)
-                    + carry;
-                t[i + j] = prod as u64;
-                carry = prod >> 64;
-            }
-
-            t[i + n] = (t[i + n] as u128 + carry) as u64;
-
-            let q = t[i].wrapping_mul(self.modulus_inv);
-            carry = 0;
-            for j in 0..n {
-                let prod = (q as u128) * (self.modulus.limbs[j] as u128)
-                    + (t[i + j] as u128)
-                    + carry;
-                t[i + j] = prod as u64;
-                carry = prod >> 64;
-            }
-
-            t[i + n] = (t[i + n] as u128 + carry) as u64;
-        }
-
-        let mut result = BigNum::from_limbs(t[n..2 * n].to_vec());
-        result.normalize();
-        if result >= self.modulus {
-            result = &result - &self.modulus;
-        }
-
-        result
+    pub fn multiply(&self, a: &BigNum, b: &BigNum) -> BigNum {
+        self.reduce(&(a * b))
     }
 
     /**
@@ -1430,7 +1395,13 @@ impl MontgomeryContext {
      *    BigNum: The Montgomery form of the input BigNum
      */
     pub fn to_montgomery(&self, a: &BigNum) -> BigNum {
-        self.multiply(a, &self.r2_mod_m)
+        let a_mod = if a >= &self.modulus {
+            a % &self.modulus
+        } else {
+            a.clone()
+        };
+        
+        self.multiply(&a_mod, &self.r2_mod_m)
     }
 
     /**
