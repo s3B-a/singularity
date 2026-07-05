@@ -269,9 +269,31 @@ pub fn fe_from_bytes(bytes: &[u8; 32]) -> Fe {
 pub fn fe_to_bytes(h: &Fe) -> [u8; 32] {
     let mut s = [0u8; 32];
     let mut h = *h;
-    
-    fe_reduce(&mut h);
-    
+
+    let mut q = (19i64 * h[9] + (1i64 << 24)) >> 25;
+    q = (h[0] + q) >> 26;
+    q = (h[1] + q) >> 25;
+    q = (h[2] + q) >> 26;
+    q = (h[3] + q) >> 25;
+    q = (h[4] + q) >> 26;
+    q = (h[5] + q) >> 25;
+    q = (h[6] + q) >> 26;
+    q = (h[7] + q) >> 25;
+    q = (h[8] + q) >> 26;
+    q = (h[9] + q) >> 25;
+    h[0] += 19 * q;
+
+    let c = h[0] >> 26; h[1] += c; h[0] -= c << 26;
+    let c = h[1] >> 25; h[2] += c; h[1] -= c << 25;
+    let c = h[2] >> 26; h[3] += c; h[2] -= c << 26;
+    let c = h[3] >> 25; h[4] += c; h[3] -= c << 25;
+    let c = h[4] >> 26; h[5] += c; h[4] -= c << 26;
+    let c = h[5] >> 25; h[6] += c; h[5] -= c << 25;
+    let c = h[6] >> 26; h[7] += c; h[6] -= c << 26;
+    let c = h[7] >> 25; h[8] += c; h[7] -= c << 25;
+    let c = h[8] >> 26; h[9] += c; h[8] -= c << 26;
+    let c = h[9] >> 25; h[9] -= c << 25;
+
     s[0] = h[0] as u8;
     s[1] = (h[0] >> 8) as u8;
     s[2] = (h[0] >> 16) as u8;
@@ -377,15 +399,16 @@ pub fn fe_mul(a: &Fe, b: &Fe) -> Fe {
     let b9 = b[9];
     
     let mut h = [0i64; 10];
-    h[0] = a0*b0 + 38*(a1*b9 + a2*b8 + a3*b7 + a4*b6 + a5*b5 + a6*b4 + a7*b3 + a8*b2 + a9*b1);
-    h[1] = a0*b1 + a1*b0 + 38*(a2*b9 + a3*b8 + a4*b7 + a5*b6 + a6*b5 + a7*b4 + a8*b3 + a9*b2);
-    h[2] = a0*b2 + a1*b1 + a2*b0 + 38*(a3*b9 + a4*b8 + a5*b7 + a6*b6 + a7*b5 + a8*b4 + a9*b3);
-    h[3] = a0*b3 + a1*b2 + a2*b1 + a3*b0 + 38*(a4*b9 + a5*b8 + a6*b7 + a7*b6 + a8*b5 + a9*b4);
-    h[4] = a0*b4 + a1*b3 + a2*b2 + a3*b1 + a4*b0 + 38*(a5*b9 + a6*b8 + a7*b7 + a8*b6 + a9*b5);
-    h[5] = a0*b5 + a1*b4 + a2*b3 + a3*b2 + a4*b1 + a5*b0 + 38*(a6*b9 + a7*b8 + a8*b7 + a9*b6);
-    h[6] = a0*b6 + a1*b5 + a2*b4 + a3*b3 + a4*b2 + a5*b1 + a6*b0 + 38*(a7*b9 + a8*b8 + a9*b7);
-    h[7] = a0*b7 + a1*b6 + a2*b5 + a3*b4 + a4*b3 + a5*b2 + a6*b1 + a7*b0 + 38*(a8*b9 + a9*b8);
-    h[8] = a0*b8 + a1*b7 + a2*b6 + a3*b5 + a4*b4 + a5*b3 + a6*b2 + a7*b1 + a8*b0 + 38*(a9*b9);
+    
+    h[0] = a0*b0 + 38*(a1*b9 + a3*b7 + a5*b5 + a7*b3 + a9*b1) + 19*(a2*b8 + a4*b6 + a6*b4 + a8*b2);
+    h[1] = a0*b1 + a1*b0 + 19*(a2*b9 + a3*b8 + a4*b7 + a5*b6 + a6*b5 + a7*b4 + a8*b3 + a9*b2);
+    h[2] = a0*b2 + 2*a1*b1 + a2*b0 + 38*(a3*b9 + a5*b7 + a7*b5 + a9*b3) + 19*(a4*b8 + a6*b6 + a8*b4);
+    h[3] = a0*b3 + a1*b2 + a2*b1 + a3*b0 + 19*(a4*b9 + a5*b8 + a6*b7 + a7*b6 + a8*b5 + a9*b4);
+    h[4] = a0*b4 + 2*a1*b3 + a2*b2 + 2*a3*b1 + a4*b0 + 38*(a5*b9 + a7*b7 + a9*b5) + 19*(a6*b8 + a8*b6);
+    h[5] = a0*b5 + a1*b4 + a2*b3 + a3*b2 + a4*b1 + a5*b0 + 19*(a6*b9 + a7*b8 + a8*b7 + a9*b6);
+    h[6] = a0*b6 + 2*a1*b5 + a2*b4 + 2*a3*b3 + a4*b2 + 2*a5*b1 + a6*b0 + 38*(a7*b9 + a9*b7) + 19*a8*b8;
+    h[7] = a0*b7 + a1*b6 + a2*b5 + a3*b4 + a4*b3 + a5*b2 + a6*b1 + a7*b0 + 19*(a8*b9 + a9*b8);
+    h[8] = a0*b8 + 2*a1*b7 + a2*b6 + 2*a3*b5 + a4*b4 + 2*a5*b3 + a6*b2 + 2*a7*b1 + a8*b0 + 38*a9*b9;
     h[9] = a0*b9 + a1*b8 + a2*b7 + a3*b6 + a4*b5 + a5*b4 + a6*b3 + a7*b2 + a8*b1 + a9*b0;
     
     fe_reduce(&mut h);
@@ -501,18 +524,19 @@ pub fn fe_invert(z: &Fe) -> Fe {
  */
 pub fn fe_reduce(h: &mut Fe) {
     let mut carry: i64;
-    
-    carry = (h[9] + (1 << 24)) >> 25; h[0] += carry * 19; h[9] -= carry << 25;
-    carry = (h[1] + (1 << 24)) >> 25; h[2] += carry; h[1] -= carry << 25;
-    carry = (h[3] + (1 << 24)) >> 25; h[4] += carry; h[3] -= carry << 25;
-    carry = (h[5] + (1 << 24)) >> 25; h[6] += carry; h[5] -= carry << 25;
-    carry = (h[7] + (1 << 24)) >> 25; h[8] += carry; h[7] -= carry << 25;
-    
-    carry = (h[0] + (1 << 25)) >> 26; h[1] += carry; h[0] -= carry << 26;
-    carry = (h[2] + (1 << 25)) >> 26; h[3] += carry; h[2] -= carry << 26;
-    carry = (h[4] + (1 << 25)) >> 26; h[5] += carry; h[4] -= carry << 26;
-    carry = (h[6] + (1 << 25)) >> 26; h[7] += carry; h[6] -= carry << 26;
-    carry = (h[8] + (1 << 25)) >> 26; h[9] += carry; h[8] -= carry << 26;
+
+    carry = (h[0] + (1i64 << 25)) >> 26; h[1] += carry; h[0] -= carry << 26;
+    carry = (h[4] + (1i64 << 25)) >> 26; h[5] += carry; h[4] -= carry << 26;
+    carry = (h[1] + (1i64 << 24)) >> 25; h[2] += carry; h[1] -= carry << 25;
+    carry = (h[5] + (1i64 << 24)) >> 25; h[6] += carry; h[5] -= carry << 25;
+    carry = (h[2] + (1i64 << 25)) >> 26; h[3] += carry; h[2] -= carry << 26;
+    carry = (h[6] + (1i64 << 25)) >> 26; h[7] += carry; h[6] -= carry << 26;
+    carry = (h[3] + (1i64 << 24)) >> 25; h[4] += carry; h[3] -= carry << 25;
+    carry = (h[7] + (1i64 << 24)) >> 25; h[8] += carry; h[7] -= carry << 25;
+    carry = (h[4] + (1i64 << 25)) >> 26; h[5] += carry; h[4] -= carry << 26;
+    carry = (h[8] + (1i64 << 25)) >> 26; h[9] += carry; h[8] -= carry << 26;
+    carry = (h[9] + (1i64 << 24)) >> 25; h[0] += carry * 19; h[9] -= carry << 25;
+    carry = (h[0] + (1i64 << 25)) >> 26; h[1] += carry; h[0] -= carry << 26;
 }
 
 /**

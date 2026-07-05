@@ -5,11 +5,26 @@ use crate::crypto::{Error, Result};
 use super::aes::Aes;
 
 // GCM structure
+#[deprecated(note = "Gcm is now optimized and should use GcmOptimized for better performance, Gcm will still exist but may be removed in the future")]
 #[derive(Clone)]
 pub struct Gcm {
     cipher: Aes,
     h: [u64; 2],
 }
+
+pub struct GcmOptimized {
+    cipher: Aes,
+    h: [u64; 2],
+    h_powers: Vec<[u64; 2]>,
+    h_karatsuba: KaratsubaTable,
+}
+
+struct KaratsubaTable {
+    h_high: u64,
+    h_low: u64,
+    h_mid: u64,
+}
+
 
 impl Gcm {
 
@@ -290,6 +305,164 @@ impl Gcm {
         }
 
         z
+    }
+}
+
+impl GcmOptimized {
+
+    /**
+     * Creates a new GcmOptimized instance with the given AES key 
+     * and precomputes the necessary tables for faster GHASH multiplication
+     * Args:
+     *    key - &[u8]: The AES encryption key (16, 24, or 32 bytes)
+     * 
+     * Returns:
+     *    Result<Self>: The GcmOptimized instance or an error if the key size is invalid
+     */
+    pub fn new(key: &[u8]) -> Result<Self> {
+        let cipher = Aes::new(key)?;
+        let h_block = [0u8; 16];
+        let h_encrypted = cipher.encrypt_block(&h_block);
+        
+        let h = [
+            u64::from_be_bytes([
+                h_encrypted[0], h_encrypted[1], h_encrypted[2], h_encrypted[3],
+                h_encrypted[4], h_encrypted[5], h_encrypted[6], h_encrypted[7],
+            ]),
+            u64::from_be_bytes([
+                h_encrypted[8], h_encrypted[9], h_encrypted[10], h_encrypted[11],
+                h_encrypted[12], h_encrypted[13], h_encrypted[14], h_encrypted[15],
+            ]),
+        ];
+
+        let h_karatsuba = KaratsubaTable {
+            h_high: h[0],
+            h_low: h[1],
+            h_mid: ((h[0] ^ h[1]).wrapping_mul(h[0] ^ h[1])),
+        };
+
+        let mut h_powers = vec![];
+        let mut h_power = h;
+        for _ in 0..8 {
+            h_powers.push(h_power);
+            h_power = Self::ghash_mul_karatsuba(&h_power, &h);
+        }
+
+        Ok(GcmOptimized {
+            cipher,
+            h,
+            h_powers,
+            h_karatsuba,
+        })
+    }
+
+    /**
+     * Performs GHASH multiplication using Karatsuba's method for faster computation
+     * Karatsuba: (a*2^64 + b)(c*2^64 + d) = ac*2^128 + ((a+b)(c+d) - ac - bd)*2^64 + bd
+     * Args:
+     *    x: &[u64; 2]: The first operand
+     *    y: &[u64; 2]: The second operand
+     * 
+     * Returns:
+     *    [u64; 2]: The result of the multiplication
+     */
+    fn ghash_mul_karatsuba(x: &[u64; 2], y: &[u64; 2]) -> [u64; 2] {
+        let x_high = x[0];
+        let x_low = x[1];
+        let y_high = y[0];
+        let y_low = y[1];
+
+        let z0 = Self::gf128_mul_64(x_low, y_low);
+        let z2 = Self::gf128_mul_64(x_high, y_high);
+        let z1 = Self::gf128_mul_64(x_low ^ x_high, y_low ^ y_high);
+
+        let mut result = z2;
+        
+        result[0] ^= z1[0] ^ z0[0];
+        result[1] ^= z1[1] ^ z0[1];
+
+        Self::gf128_reduce(&[z2[0], z2[1] ^ z1[0] ^ z0[0], z1[1] ^ z0[1], z0[0], z0[1]])
+    }
+
+    /**
+     * Performs multiplication of two 64-bit values in GF(2^128)
+     * using the method of shifting and conditional XORs
+     * Args:
+     *    a: u64 - The first operand
+     *    b: u64 - The second operand
+     * 
+     * Returns:
+     *    [u64; 2]: The result of the multiplication, represented 
+     *        as a 128 bit value split into two 64-bit parts
+     */
+    fn gf128_mul_64(a: u64, b: u64) -> [u64; 2] {
+        let mut z0 = 0u64;
+        let mut z1 = 0u64;
+        let mut v = b;
+        for i in 0..64 {
+            if (a >> i) & 1 == 1 {
+                z0 ^= v;
+                if i > 0 {
+                    z1 ^= (v >> (64 - i));
+                }
+            }
+
+            let lsb = v & 1;
+            v >>= 1;
+            if lsb == 1 {
+                v ^= 0xe100000000000000;
+            }
+        }
+
+        [z0, z1]
+    }
+
+    /**
+     * Reduces a 256-bit product down to 128 bits using the GCM polynomial
+     * x^128 + x^7 + x^2 + x + 1
+     * Args:
+     *    p: &[u64; 5] - The 256-bit product represented as 5 64-bit parts
+     * 
+     * Retruns:
+     *    [u64; 2]: The reduced 128-bit result represented as two 64-bit parts
+     */
+    fn gf128_reduce(p: &[u64; 5]) -> [u64; 2] {
+        let mut result = [p[3], p[4]];
+        for i in 0..3 {
+            result[0] ^= p[i] >> (64 - (i + 1) * 8);
+            result[1] ^= (p[i] << ((i + 1) * 8)) & 0xffffffffffffffff;
+        }
+
+        result
+    }
+
+    /**
+     * Updates the GHASH state with the given data using the optimized Karatsuba multiplication
+     * This method processes data in 16-byte blocks and uses precomputed tables for faster multiplication
+     * Args:
+     *    &self: The GcmOptimized instance
+     *    state - &mut [u64; 2]: The current GHASH state
+     *    data - &[u8]: The data to process
+     * 
+     * Returns:
+     *    (): Nothing
+     */
+    pub fn ghash_update_fast(&self, state: &mut [u64; 2], data: &[u8]) {
+        for block in data.chunks(16) {
+            let mut x = [0u64; 2];
+            if block.len() == 16 {
+                x[0] = u64::from_be_bytes([
+                    block[0], block[1], block[2], block[3],
+                    block[4], block[5], block[6], block[7],
+                ]);
+                x[1] = u64::from_be_bytes([
+                    block[8], block[9], block[10], block[11],
+                    block[12], block[13], block[14], block[15],
+                ]);
+            }
+
+            *state = Self::ghash_mul_karatsuba(&[state[0] ^ x[0], state[1] ^ x[1]], &self.h);
+        }
     }
 }
 

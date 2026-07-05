@@ -5,8 +5,10 @@
 use std::sync::Mutex;
 use crate::crypto::{Error, Result};
 
-// Global RNG instance protected by mutex
-static GLOBAL_RNG: Mutex<Option<SystemRng>> = Mutex::new(None);
+// Thread-local RNG instance
+thread_local! {
+    static THREAD_RNG: std::cell::RefCell<Option<SystemRng>> = std::cell::RefCell::new(None);
+}
 
 // Trait for cryptographic RNGs
 pub trait CryptoRng {
@@ -69,6 +71,8 @@ pub trait CryptoRng {
 // System RNG implementation
 // Uses platform-specific APIs to gather entropy
 pub struct SystemRng {
+    buffer: [u8; 2048],
+    buffer_pos: usize,
     #[cfg(target_os = "windows")]
     _phantom: std::marker::PhantomData<()>,
 }
@@ -86,9 +90,25 @@ impl SystemRng {
      */
     pub fn new() -> Result<Self> {
         Ok(SystemRng {
+            buffer: [0u8; 2048],
+            buffer_pos: 2048,
             #[cfg(target_os = "windows")]
             _phantom: std::marker::PhantomData,
         })
+    }
+
+    /**
+     * Refill the internal buffer with random bytes from the system RNG
+     * Args:
+     *    &mut self: The RNG instance to refill
+     * 
+     * Returns:
+     *    Result<()>: Ok(()) on success, Err(Error) on failure
+     */
+    fn refill_buffer(&mut self) -> Result<()> {
+        sys_fill_bytes(&mut self.buffer)?;
+        self.buffer_pos = 0;
+        Ok(())
     }
 }
 
@@ -122,7 +142,25 @@ impl CryptoRng for SystemRng {
      *    Result<()>: Ok(()) on success, Err(Error) on failure
      */
     fn fill_bytes(&mut self, dest: &mut [u8]) -> Result<()> {
-        sys_fill_bytes(dest)
+        for chunk in dest.chunks_mut(2048) {
+            if self.buffer_pos >= self.buffer.len() {
+                self.refill_buffer()?;
+            }
+            
+            let available = self.buffer.len() - self.buffer_pos;
+            let to_copy = chunk.len().min(available);
+            
+            chunk[..to_copy].copy_from_slice(&self.buffer[self.buffer_pos..self.buffer_pos + to_copy]);
+            self.buffer_pos += to_copy;
+            if to_copy < chunk.len() {
+                self.refill_buffer()?;
+                let remaining = chunk.len() - to_copy;
+                chunk[to_copy..].copy_from_slice(&self.buffer[..remaining]);
+                self.buffer_pos = remaining;
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -298,12 +336,13 @@ fn sys_fill_bytes(dest: &[u8]) -> Result<()> {
  *    Result<()>: Ok(()) on success, Err(Error) on failure
  */
 pub fn fill_random(dest: &mut [u8]) -> Result<()> {
-    let mut rng_guard = GLOBAL_RNG.lock().unwrap();
-    if rng_guard.is_none() {
-        *rng_guard = Some(SystemRng::new()?);
-    }
-
-    rng_guard.as_mut().unwrap().fill_bytes(dest)
+    THREAD_RNG.with(|rng| {
+        let mut rng_ref = rng.borrow_mut();
+        if rng_ref.is_none() {
+            *rng_ref = Some(SystemRng::new()?);
+        }
+        rng_ref.as_mut().unwrap().fill_bytes(dest)
+    })
 }
 
 /**

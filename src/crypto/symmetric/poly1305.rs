@@ -115,25 +115,31 @@ impl Poly1305 {
         if self.buffer_len > 0 {
             let mut final_block = [0u8; 16];
             final_block[..self.buffer_len].copy_from_slice(&self.buffer[..self.buffer_len]);
+            final_block[self.buffer_len] = 0x01;
             self.process_block(&final_block, true);
         }
 
         self.reduce_h();
-        let mut c = 0u64;
-        for i in 0..4 {
-            c += self.h[i] as u64 + self.s[i] as u64;
-            self.h[i] = c as u32;
-            c >>= 32;
-        }
 
-        c += self.h[4] as u64;
-        self.h[4] = c as u32;
+        let h0 = self.h[0] | (self.h[1] << 26);
+        let h1 = (self.h[1] >> 6) | (self.h[2] << 20);
+        let h2 = (self.h[2] >> 12) | (self.h[3] << 14);
+        let h3 = (self.h[3] >> 18) | (self.h[4] << 8);
+
+        let mut c = h0 as u64 + self.s[0] as u64;
+        let t0 = c as u32; c >>= 32;
+        c += h1 as u64 + self.s[1] as u64;
+        let t1 = c as u32; c >>= 32;
+        c += h2 as u64 + self.s[2] as u64;
+        let t2 = c as u32; c >>= 32;
+        c += h3 as u64 + self.s[3] as u64;
+        let t3 = c as u32;
 
         let mut tag = [0u8; 16];
-        for i in 0..4 {
-            let bytes = self.h[i].to_le_bytes();
-            tag[i * 4..i * 4 + 4].copy_from_slice(&bytes);
-        }
+        tag[0..4].copy_from_slice(&t0.to_le_bytes());
+        tag[4..8].copy_from_slice(&t1.to_le_bytes());
+        tag[8..12].copy_from_slice(&t2.to_le_bytes());
+        tag[12..16].copy_from_slice(&t3.to_le_bytes());
 
         Ok(tag)
     }
@@ -264,41 +270,45 @@ impl Poly1305 {
      *    (): Nothing
      */
     fn reduce_h(&mut self) {
-        let mut c = (self.h[1] >> 26) as u64;
-        self.h[1] &= 0x3ffffff;
-        self.h[2] += c as u32;
-
-        c = (self.h[2] >> 26) as u64;
-        self.h[2] &= 0x3ffffff;
-        self.h[3] += c as u32;
-
-        c = (self.h[3] >> 26) as u64;
-        self.h[3] &= 0x3ffffff;
-        self.h[4] += c as u32;
-
-        c = (self.h[4] >> 26) as u64;
-        self.h[4] &= 0x3ffffff;
-        self.h[0] += (c * 5) as u32;
-
-        c = (self.h[0] >> 26) as u64;
-        self.h[0] &= 0x3ffffff;
-        self.h[1] += c as u32;
-
-        let mut g = [0u32; 5];
-        g[0] = self.h[0].wrapping_add(5);
-        c = (g[0] >> 26) as u64;
-        g[0] &= 0x3ffffff;
-        for i in 1..5 {
-            g[i] = self.h[i].wrapping_add(c as u32);
-            c = (g[i] >> 26) as u64;
-            g[i] &= 0x3ffffff;
+        const MASK26: u32 = 0x3ffffff;
+        let mut limbs = [
+            self.h[0] as u64,
+            self.h[1] as u64,
+            self.h[2] as u64,
+            self.h[3] as u64,
+            self.h[4] as u64,
+        ];
+        
+        for i in 0..4 {
+            limbs[i + 1] += limbs[i] >> 26;
+            limbs[i] &= MASK26 as u64;
         }
-
-        let mask = ((c as i32) - 1) as u32;
+        
+        let mut carry = limbs[4] >> 26;
+        limbs[4] &= MASK26 as u64;
+        limbs[0] += (carry * 5);
+        
+        carry = limbs[0] >> 26;
+        limbs[0] &= MASK26 as u64;
+        limbs[1] += carry;
+        
+        let mut g = [0u64; 5];
+        g[0] = limbs[0] + 5;
+        let mut overflow = g[0] >> 26;
+        g[0] &= MASK26 as u64;
+        for i in 1..5 {
+            g[i] = limbs[i] + overflow;
+            overflow = g[i] >> 26;
+            g[i] &= MASK26 as u64;
+        }
+        
+        let mask = 0u64.wrapping_sub(overflow as u64);
         for i in 0..5 {
-            g[i] ^= self.h[i];
-            g[i] &= mask;
-            self.h[i] ^= g[i];
+            limbs[i] = (limbs[i] & !mask) | (g[i] & mask);
+        }
+        
+        for i in 0..5 {
+            self.h[i] = limbs[i] as u32;
         }
     }
 }

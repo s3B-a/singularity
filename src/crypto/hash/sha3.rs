@@ -80,10 +80,11 @@ impl KeccakState {
             let mut x = 1;
             let mut y = 0;
             for i in 0..24 {
+                let src = self.state[x + 5 * y].rotate_left(ROTATIONS[i]);
                 let tmp = y;
                 y = (2 * x + 3 * y) % 5;
                 x = tmp;
-                b[y + 5 * x] = self.state[x + 5 * y].rotate_left(ROTATIONS[i]);
+                b[x + 5 * y] = src;
             }
 
             // Chi step

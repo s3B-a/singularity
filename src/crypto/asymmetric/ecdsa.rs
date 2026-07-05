@@ -380,16 +380,21 @@ impl P256EcdsaPrivateKey {
         let mut hasher = Sha256::new();
         hasher.update(message);
         let hash = hasher.finalize();
-        
+
         let d_bytes = self.inner.to_bytes();
         let d = BigNum::from_bytes_be(&d_bytes);
         let n = BigNum::from_bytes_be(&P256_ORDER_BYTES);
-        
+
         let k = generate_k_rfc6979(&d_bytes, &hash, &P256_ORDER_BYTES)?;
-        
-        let r_point = scalar_mult_base(&k)?;
-        let r_x = r_point.x_coordinate();
-        let r = r_x.modulo(&n);
+
+        let k_raw = k.to_bytes_be();
+        let mut k_bytes = [0u8; 32];
+        let k_start = 32usize.saturating_sub(k_raw.len());
+        k_bytes[k_start..].copy_from_slice(&k_raw[k_raw.len().saturating_sub(32)..]);
+
+        let r_point_bytes = p256::ecdsa_scalar_mult_base(&k_bytes)
+            .ok_or_else(|| Error::CryptoError("k*G is infinity".to_string()))?;
+        let r = BigNum::from_bytes_be(&r_point_bytes[1..33]).modulo(&n);
         if r.is_zero() {
             return Err(Error::CryptoError("Invalid r value".to_string()));
         }
@@ -400,7 +405,6 @@ impl P256EcdsaPrivateKey {
         let r_d = r.clone().mul(d).modulo(&n);
         let e_plus_rd = e.add(r_d).modulo(&n);
         let s = k_inv.mul(e_plus_rd).modulo(&n);
-        
         if s.is_zero() {
             return Err(Error::CryptoError("Invalid s value".to_string()));
         }
@@ -614,7 +618,6 @@ fn generate_k_rfc6979(private_key: &[u8; 32], hash: &[u8; 32], order: &[u8; 32])
     
     let n = BigNum::from_bytes_be(order);
     let one = BigNum::from_u64(1);
-    
     loop {
         let mut t = Vec::new();
         let mut hmac = Hmac::<Sha256>::new(&k_hmac);
@@ -697,7 +700,156 @@ fn scalar_mult_base(k: &BigNum) -> Result<P256Point> {
 }
 
 /**
+ * Converts a scalar k to its Windowed Non-Adjacent Form (wNAF)
+ * Args:
+ *    k - &BigNum: The scalar to convert
+ *    window_width - u32: The width of the window for wNAF
+ * 
+ * Returns:
+ *    Vec<i32>: The wNAF representation of the scalar k
+ */
+fn to_wnaf(k: &BigNum, window_width: u32) -> Vec<i32> {
+    let window = 1i32 << window_width;
+    let mask = (window - 1) as i32;
+    let one = BigNum::from_u64(1);
+    
+    let mut wnaf = Vec::new();
+    let mut k = k.clone();
+    while !k.is_zero() {
+        let k_u64 = if k.limbs.len() > 0 { k.limbs[0] as i32 } else { 0 };
+        if (k_u64 & 1) == 1 {
+            let width_pow = 1u64 << window_width;
+            let rem = (k_u64 & mask) as i32;
+            let w = if rem >= (window / 2) {
+                rem - window
+            } else {
+                rem
+            };
+            
+            wnaf.push(w);
+            if w >= 0 {
+                k = k.sub(BigNum::from_u64(w as u64));
+            } else {
+                k = k.add(BigNum::from_u64((-w) as u64));
+            }
+        } else {
+            wnaf.push(0);
+        }
+        
+        k = k.div(BigNum::from_u64(2));
+    }
+    
+    wnaf
+}
+
+/**
+ * Negates a P256Point (computes -P)
+ * Args:
+ *    p - &P256Point: The point to negate
+ * 
+ * Returns:
+ *    P256Point: The negated point -P
+ */
+fn point_negate(p: &P256Point) -> P256Point {
+    if p.infinity {
+        return P256Point {
+            x: BigNum::from_u64(0),
+            y: BigNum::from_u64(0),
+            infinity: true,
+        };
+    }
+    
+    let prime_bytes = [
+        0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x01,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF,
+        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+    ];
+
+    let prime = BigNum::from_bytes_be(&prime_bytes);
+    
+    P256Point {
+        x: p.x.clone(),
+        y: prime.sub(p.y.clone()),
+        infinity: false,
+    }
+}
+
+/**
+ * Precomputes the odd multiples of a point for wNAF scalar multiplication
+ * Args:
+ *    point - &P256Point: The point for which to precompute multiples
+ *    window_width - u32: The width of the window for wNAF
+ * 
+ * Returns:
+ *    Result<Vec<P256Point>>: A vector of precomputed odd multiples of the point
+ *        or an error if the operation fails
+ */
+fn precompute_wnaf_multiples(point: &P256Point, window_width: u32) -> Result<Vec<P256Point>> {
+    let table_size = 1usize << (window_width - 1);
+    let mut table = Vec::with_capacity(table_size);
+    
+    table.push(point.clone());
+    let double_p = point_double(point)?;
+    let mut current = point.clone();
+    for _ in 1..table_size {
+        current = point_add(&current, &double_p)?;
+        table.push(current.clone());
+    }
+    
+    Ok(table)
+}
+
+/**
+ * Performs scalar multiplication of a point by a scalar k using wNAF optimization
+ * Args:
+ *    k - &BigNum: The scalar multiplier
+ *    point - &P256Point: The point to be multiplied
+ * 
+ * Returns:
+ *    Result<P256Point>: The resulting P256Point after multiplication
+ *        or an error if the operation fails
+ */
+fn scalar_mult_wnaf(k: &BigNum, point: &P256Point) -> Result<P256Point> {
+    if k.is_zero() || point.infinity {
+        return Ok(P256Point {
+            x: BigNum::from_u64(0),
+            y: BigNum::from_u64(0),
+            infinity: true,
+        });
+    }
+    
+    const WINDOW_WIDTH: u32 = 4;
+    let wnaf = to_wnaf(k, WINDOW_WIDTH);
+    let table = precompute_wnaf_multiples(point, WINDOW_WIDTH)?;
+    let mut result = P256Point {
+        x: BigNum::from_u64(0),
+        y: BigNum::from_u64(0),
+        infinity: true,
+    };
+    
+    for i in (0..wnaf.len()).rev() {
+        result = point_double(&result)?;
+        if wnaf[i] > 0 {
+            let idx = ((wnaf[i] >> 1) as usize);
+            if idx < table.len() {
+                result = point_add(&result, &table[idx])?;
+            }
+        } else if wnaf[i] < 0 {
+            let idx = (((-wnaf[i]) >> 1) as usize);
+            if idx < table.len() {
+                let neg_point = point_negate(&table[idx]);
+                result = point_add(&result, &neg_point)?;
+            }
+        }
+    }
+    
+    Ok(result)
+}
+
+/**
  * Performs scalar multiplication of a point by a scalar k
+ * Uses wNAF optimization for improved performance
  * Args:
  *    k - &BigNum: The scalar multiplier
  *    point - &P256Point: The point to be multiplied
@@ -706,32 +858,7 @@ fn scalar_mult_base(k: &BigNum) -> Result<P256Point> {
  *    Result<P256Point>: The resulting P256Point after multiplication, or an error if the operation fails
  */
 fn scalar_mult(k: &BigNum, point: &P256Point) -> Result<P256Point> {
-    if k.is_zero() || point.is_infinity() {
-        return Ok(P256Point {
-            x: BigNum::from_u64(0),
-            y: BigNum::from_u64(0),
-            infinity: true,
-        });
-    }
-    
-    let mut result = P256Point {
-        x: BigNum::from_u64(0),
-        y: BigNum::from_u64(0),
-        infinity: true,
-    };
-    
-    let mut temp = point.clone();
-    let k_bits = k.to_bytes_be();
-    for byte in k_bits.iter().rev() {
-        for bit in 0..8 {
-            if (byte >> bit) & 1 == 1 {
-                result = point_add(&result, &temp)?;
-            }
-            temp = point_double(&temp)?;
-        }
-    }
-    
-    Ok(result)
+    scalar_mult_wnaf(k, point)
 }
 
 /**
@@ -758,9 +885,12 @@ fn point_add(p: &P256Point, q: &P256Point) -> Result<P256Point> {
         0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF,
         0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
     ];
+
     let prime = BigNum::from_bytes_be(&prime_bytes);
-    if p.x.cmp(&q.x) == Ordering::Equal {
-        if p.y.cmp(&q.y) == Ordering::Equal {
+    let dy = q.y.clone().add(prime.clone()).sub(p.y.clone()).modulo(&prime);
+    let dx = q.x.clone().add(prime.clone()).sub(p.x.clone()).modulo(&prime);
+    if dx.is_zero() {
+        if dy.is_zero() {
             return point_double(p);
         } else {
             return Ok(P256Point {
@@ -770,16 +900,16 @@ fn point_add(p: &P256Point, q: &P256Point) -> Result<P256Point> {
             });
         }
     }
-    
-    let dy = q.y.clone().sub(p.y.clone()).modulo(&prime);
-    let dx = q.x.clone().sub(p.x.clone()).modulo(&prime);
+
     let dx_inv = dx.mod_inverse(&prime)?;
     let s = dy.mul(dx_inv).modulo(&prime);
-    
+
     let s2 = s.clone().mul(s.clone()).modulo(&prime);
-    let x3 = s2.sub(p.x.clone()).sub(q.x.clone()).modulo(&prime);
-    
-    let y3 = s.mul(p.x.clone().sub(x3.clone())).sub(p.y.clone()).modulo(&prime);
+    let x3 = s2.add(prime.clone()).add(prime.clone()).sub(p.x.clone()).sub(q.x.clone()).modulo(&prime);
+
+    let inner = p.x.clone().add(prime.clone()).sub(x3.clone());
+    let product = s.mul(inner).modulo(&prime);
+    let y3 = product.add(prime.clone()).sub(p.y.clone()).modulo(&prime);
     
     Ok(P256Point {
         x: x3,
@@ -816,20 +946,42 @@ fn point_double(p: &P256Point) -> Result<P256Point> {
     let numerator = three_x2.add(a).modulo(&prime);
     
     let two_y = p.y.clone().mul(BigNum::from_u64(2)).modulo(&prime);
+    if two_y.is_zero() {
+        return Ok(P256Point { x: BigNum::from_u64(0), y: BigNum::from_u64(0), infinity: true });
+    }
+
     let two_y_inv = two_y.mod_inverse(&prime)?;
     let s = numerator.mul(two_y_inv).modulo(&prime);
     
     let s2 = s.clone().mul(s.clone()).modulo(&prime);
     let two_x = p.x.clone().mul(BigNum::from_u64(2)).modulo(&prime);
-    let x3 = s2.sub(two_x).modulo(&prime);
-    
-    let y3 = s.mul(p.x.clone().sub(x3.clone())).sub(p.y.clone()).modulo(&prime);
+    let x3 = s2.add(prime.clone()).sub(two_x).modulo(&prime);
+
+    let inner = p.x.clone().add(prime.clone()).sub(x3.clone());
+    let product = s.mul(inner).modulo(&prime);
+    let y3 = product.add(prime.clone()).sub(p.y.clone()).modulo(&prime);
     
     Ok(P256Point {
         x: x3,
         y: y3,
         infinity: false,
     })
+}
+
+/**
+ * Converts a BigNum to a 32-byte array in big-endian format
+ * Args:
+ *    n - &BigNum: The BigNum to convert
+ * 
+ * Returns:
+ *    [u8; 32]: The 32-byte array representation of the BigNum
+ */
+fn bignum_to_32bytes(n: &BigNum) -> [u8; 32] {
+    let raw = n.to_bytes_be();
+    let mut out = [0u8; 32];
+    let start = 32usize.saturating_sub(raw.len());
+    out[start..].copy_from_slice(&raw[raw.len().saturating_sub(32)..]);
+    out
 }
 
 /**
@@ -843,20 +995,29 @@ fn point_double(p: &P256Point) -> Result<P256Point> {
  *    Result<P256Point>: The resulting verification point, or an error if the operation fails
  */
 fn compute_verification_point(u1: &BigNum, u2: &BigNum, public_key: &p256::P256PublicKey) -> Result<P256Point> {
-    let p1 = scalar_mult_base(u1)?;
-    
+    let u1_bytes = bignum_to_32bytes(u1);
+    let u2_bytes = bignum_to_32bytes(u2);
     let pub_bytes = public_key.to_uncompressed();
-    let x = BigNum::from_bytes_be(&pub_bytes[1..33]);
-    let y = BigNum::from_bytes_be(&pub_bytes[33..65]);
-    let q = P256Point {
-        x,
-        y,
-        infinity: false,
+
+    let p1_bytes = p256::ecdsa_scalar_mult_base(&u1_bytes);
+    let p2_bytes = p256::ecdsa_scalar_mult(&u2_bytes, &pub_bytes);
+
+    let result_bytes = match (p1_bytes, p2_bytes) {
+        (None, None) => return Ok(P256Point { x: BigNum::from_u64(0), y: BigNum::from_u64(0), infinity: true }),
+        (None, Some(b)) | (Some(b), None) => b,
+        (Some(b1), Some(b2)) => {
+            match p256::ecdsa_point_add(&b1, &b2) {
+                None => return Ok(P256Point { x: BigNum::from_u64(0), y: BigNum::from_u64(0), infinity: true }),
+                Some(b) => b,
+            }
+        }
     };
-    
-    let p2 = scalar_mult(u2, &q)?;
-    
-    point_add(&p1, &p2)
+
+    Ok(P256Point {
+        x: BigNum::from_bytes_be(&result_bytes[1..33]),
+        y: BigNum::from_bytes_be(&result_bytes[33..65]),
+        infinity: false,
+    })
 }
 
 #[cfg(test)]
