@@ -621,7 +621,8 @@ mod tests {
             .to_secure_blob(CompressionAlgorithm::Identity)
             .unwrap();
         assert_eq!(meta.algorithm, CompressionAlgorithm::Identity);
-        assert_eq!(meta.encoded_size + 1, blob.len() - blob.iter().position(|&b| b == b'\n').unwrap_or(0));
+        let separator_pos = blob.windows(2).position(|w| w == b"\n\n").expect("header/body separator");
+        assert_eq!(meta.encoded_size, blob.len() - (separator_pos + 2));
 
         let (decoded_meta, restored) = Headers::from_secure_blob(&blob).unwrap();
         assert_eq!(decoded_meta.algorithm, CompressionAlgorithm::Identity);

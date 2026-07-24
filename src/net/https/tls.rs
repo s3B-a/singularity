@@ -4,7 +4,8 @@ use crate::crypto::encoding::{pem, x509};
 use crate::crypto::hash::sha2::{self, sha256};
 use crate::crypto::kdf::hkdf;
 use crate::crypto::random;
-use crate::crypto::symmetric::aes;
+use crate::crypto::symmetric::chacha20::ChaCha20Poly1305;
+use crate::crypto::symmetric::gcm::GcmOptimized;
 use crate::net::http::compression::{self, CompressionAlgorithm, CompressionLevel};
 use crate::net::http::http2::alpn::{AlpnNegotiator, AlpnProtocol};
 use crate::net::tcp::TcpStream;
@@ -140,8 +141,6 @@ pub struct TlsStream {
     version: TlsVersion,
     cipher_suite: u16,
     keys: Option<TlsKeys>,
-    client_cipher: Option<aes::Aes>,
-    server_cipher: Option<aes::Aes>,
     handshake_msg: Vec<u8>,
     client_seq: u64,
     server_seq: u64,
@@ -226,8 +225,6 @@ impl TlsStream {
             version: TlsVersion::Tls1_3,
             cipher_suite: 0,
             keys: None,
-            client_cipher: None,
-            server_cipher: None,
             handshake_msg: Vec::new(),
             client_seq: 0,
             server_seq: 0,
@@ -253,8 +250,6 @@ impl TlsStream {
             version: TlsVersion::Tls1_3,
             cipher_suite: 0,
             keys: None,
-            client_cipher: None,
-            server_cipher: None,
             handshake_msg: Vec::new(),
             client_seq: 0,
             server_seq: 0,
@@ -1138,28 +1133,17 @@ impl TlsStream {
         let server_hs_secret =
             self.hkdf_expand_label(&handshake_secret, b"s hs traffic", &transcript_hash, 32)?;
 
-        let client_write_key = self.hkdf_expand_label(&client_hs_secret, b"key", b"", 16)?;
+        let key_len = Self::aead_key_len(self.cipher_suite);
+        let client_write_key = self.hkdf_expand_label(&client_hs_secret, b"key", b"", key_len)?;
         let client_write_iv = self.hkdf_expand_label(&client_hs_secret, b"iv", b"", 12)?;
-        let server_write_key = self.hkdf_expand_label(&server_hs_secret, b"key", b"", 16)?;
+        let server_write_key = self.hkdf_expand_label(&server_hs_secret, b"key", b"", key_len)?;
         let server_write_iv = self.hkdf_expand_label(&server_hs_secret, b"iv", b"", 12)?;
         self.keys = Some(TlsKeys {
-            client_write_key: client_write_key.clone(),
-            server_write_key: server_write_key.clone(),
-            client_write_iv: client_write_iv.clone(),
-            server_write_iv: server_write_iv.clone(),
+            client_write_key,
+            server_write_key,
+            client_write_iv,
+            server_write_iv,
         });
-
-        self.client_cipher = Some(
-            aes::Aes::new(&client_write_key).map_err(|e| {
-                TlsError::CipherError(format!("Failed to create client cipher: {:?}", e))
-            })?,
-        );
-
-        self.server_cipher = Some(
-            aes::Aes::new(&server_write_key).map_err(|e| {
-                TlsError::CipherError(format!("Failed to create server cipher: {:?}", e))
-            })?,
-        );
 
         Ok(())
     }
@@ -1172,29 +1156,18 @@ impl TlsStream {
         let handshake_hash = self.compute_transcript_hash();
         let client_app_secret = self.hkdf_expand_label(shared_secret, b"c ap traffic", &handshake_hash, 32)?;
         let server_app_secret = self.hkdf_expand_label(shared_secret, b"s ap traffic", &handshake_hash, 32)?;
-        let client_write_key = self.hkdf_expand_label(&client_app_secret, b"key", b"", 16)?;
+        let key_len = Self::aead_key_len(self.cipher_suite);
+        let client_write_key = self.hkdf_expand_label(&client_app_secret, b"key", b"", key_len)?;
         let client_write_iv = self.hkdf_expand_label(&client_app_secret, b"iv", b"", 12)?;
-        let server_write_key = self.hkdf_expand_label(&server_app_secret, b"key", b"", 16)?;
+        let server_write_key = self.hkdf_expand_label(&server_app_secret, b"key", b"", key_len)?;
         let server_write_iv = self.hkdf_expand_label(&server_app_secret, b"iv", b"", 12)?;
 
         self.keys = Some(TlsKeys {
-            client_write_key: client_write_key.clone(),
-            server_write_key: server_write_key.clone(),
-            client_write_iv: client_write_iv.clone(),
-            server_write_iv: server_write_iv.clone(),
+            client_write_key,
+            server_write_key,
+            client_write_iv,
+            server_write_iv,
         });
-
-        self.client_cipher = Some(
-            aes::Aes::new(&client_write_key).map_err(|e| {
-                TlsError::CipherError(format!("Failed to create client cipher: {:?}", e))
-            })?,
-        );
-
-        self.server_cipher = Some(
-            aes::Aes::new(&server_write_key).map_err(|e| {
-                TlsError::CipherError(format!("Failed to create server cipher: {:?}", e))
-            })?,
-        );
 
         Ok(())
     }
@@ -1554,12 +1527,12 @@ impl TlsStream {
 
     fn send_record(&mut self, content_type: u8, data: &[u8]) -> Result<(), TlsError> {
         let mut record = Vec::new();
-        let (final_content_type, payload) = if self.should_secure_record_payload(content_type) && self.client_cipher.is_some() && self.server_cipher.is_some() {
+        let (final_content_type, payload) = if self.should_secure_record_payload(content_type) && self.keys.is_some() {
             let seq = self.next_send_sequence();
             let secure_payload = self.build_secure_record_payload(data, content_type, seq, true)?;
             let encrypted = self.encrypt_record(&secure_payload, CONTENT_TYPE_APPLICATION_DATA, seq)?;
             (CONTENT_TYPE_APPLICATION_DATA, encrypted)
-        } else if self.state == ConnectionState::Handshaking && self.client_cipher.is_some() && (content_type == CONTENT_TYPE_HANDSHAKE || content_type == CONTENT_TYPE_APPLICATION_DATA) {
+        } else if self.state == ConnectionState::Handshaking && self.keys.is_some() && (content_type == CONTENT_TYPE_HANDSHAKE || content_type == CONTENT_TYPE_APPLICATION_DATA) {
             let seq = self.next_send_sequence();
             let encrypted = self.encrypt_record(data, content_type, seq)?;
             (CONTENT_TYPE_APPLICATION_DATA, encrypted)
@@ -1593,9 +1566,9 @@ impl TlsStream {
             return Err(TlsError::AlertReceived(ALERT_LEVEL_FATAL, ALERT_HANDSHAKE_FAILURE));
         }
 
-        if content_type == CONTENT_TYPE_APPLICATION_DATA && self.server_cipher.is_some() {
+        if content_type == CONTENT_TYPE_APPLICATION_DATA && self.keys.is_some() {
             let seq = self.next_receive_sequence();
-            let (decrypted, original_type) = self.decrypt_record(&payload)?;
+            let (decrypted, original_type) = self.decrypt_record(&payload, seq)?;
             if self.state == ConnectionState::Connected && original_type == CONTENT_TYPE_APPLICATION_DATA {
                 let (decoded, _inner_type) = self.parse_secure_record_payload(&decrypted, seq, false, original_type)?;
                 return Ok(decoded);
@@ -1607,86 +1580,117 @@ impl TlsStream {
         Ok(payload)
     }
 
-    fn encrypt_record(&mut self, plaintext: &[u8], content_type: u8, seq: u64) -> Result<Vec<u8>, TlsError> {
-        let cipher = if self.is_client {
-            self.client_cipher.as_ref()
-        } else {
-            self.server_cipher.as_ref()
-        }.ok_or_else(|| TlsError::CipherError("Cipher not initialized".to_string()))?;
-
-        let keys = self.keys.as_ref().ok_or_else(|| TlsError::CipherError("Keys not initialized".to_string()))?;
-        let mut to_encrypt = plaintext.to_vec();
-        to_encrypt.push(content_type);
-        while to_encrypt.len() % 16 != 0 {
-            to_encrypt.push(0);
+    fn aead_key_len(cipher_suite: u16) -> usize {
+        match cipher_suite {
+            TLS_AES_256_GCM_SHA384 => 32,
+            TLS_CHACHA20_POLY1305_SHA256 => 32,
+            _ => 16,
         }
+    }
 
-        let iv = if self.is_client {
-            &keys.client_write_iv
-        } else {
-            &keys.server_write_iv
-        };
-
+    fn compute_record_nonce(iv: &[u8], seq: u64) -> [u8; 12] {
         let mut nonce = [0u8; 12];
         nonce.copy_from_slice(&iv[..12]);
         for i in 0..8 {
             nonce[4 + i] ^= ((seq >> (56 - i * 8)) & 0xff) as u8;
         }
 
-        let mut ciphertext = Vec::new();
-        ciphertext.extend_from_slice(&nonce);
-        for chunk in to_encrypt.chunks(16) {
-            let mut block = [0u8; 16];
-            block[..chunk.len()].copy_from_slice(chunk);
-            let encrypted_block = cipher.encrypt_block(&block);
-            ciphertext.extend_from_slice(&encrypted_block[..chunk.len()]);
-        }
-
-        let mut tag_material = Vec::new();
-        tag_material.extend_from_slice(&nonce);
-        tag_material.extend_from_slice(&ciphertext[12..]);
-        let tag = sha256(&tag_material);
-
-        ciphertext.extend_from_slice(&tag[..16]);
-        Ok(ciphertext)
+        nonce
     }
 
-    fn decrypt_record(&mut self, ciphertext: &[u8]) -> Result<(Vec<u8>, u8), TlsError> {
-        if ciphertext.len() < 12 + 16 {
+    fn record_aad(record_len: usize) -> [u8; 5] {
+        let len_bytes = (record_len as u16).to_be_bytes();
+        let version_bytes = TLS_VERSION_1_2.to_be_bytes();
+        [
+            CONTENT_TYPE_APPLICATION_DATA,
+            version_bytes[0],
+            version_bytes[1],
+            len_bytes[0],
+            len_bytes[1],
+        ]
+    }
+
+    fn aead_seal(cipher_suite: u16, key: &[u8], nonce: &[u8], plaintext: &[u8], aad: &[u8]) -> Result<Vec<u8>, TlsError> {
+        match cipher_suite {
+            TLS_CHACHA20_POLY1305_SHA256 => {
+                let cipher = ChaCha20Poly1305::new(key).map_err(|e| {
+                    TlsError::CipherError(format!("Failed to initialize ChaCha20-Poly1305: {:?}", e))
+                })?;
+
+                cipher.encrypt(nonce, plaintext, aad).map_err(|e| {
+                    TlsError::CipherError(format!("ChaCha20-Poly1305 encryption failed: {:?}", e))
+                })
+            }
+            _ => {
+                let cipher = GcmOptimized::new(key).map_err(|e| {
+                    TlsError::CipherError(format!("Failed to initialize AES-GCM: {:?}", e))
+                })?;
+
+                cipher.encrypt(nonce, plaintext, aad).map_err(|e| {
+                    TlsError::CipherError(format!("AES-GCM encryption failed: {:?}", e))
+                })
+            }
+        }
+    }
+
+    fn aead_open(cipher_suite: u16, key: &[u8], nonce: &[u8], ciphertext_and_tag: &[u8], aad: &[u8]) -> Result<Vec<u8>, TlsError> {
+        match cipher_suite {
+            TLS_CHACHA20_POLY1305_SHA256 => {
+                let cipher = ChaCha20Poly1305::new(key).map_err(|e| {
+                    TlsError::CipherError(format!("Failed to initialize ChaCha20-Poly1305: {:?}", e))
+                })?;
+
+                cipher.decrypt(nonce, ciphertext_and_tag, aad).map_err(|_| {
+                    TlsError::CipherError("Authentication tag verification failed".to_string())
+                })
+            }
+            _ => {
+                let cipher = GcmOptimized::new(key).map_err(|e| {
+                    TlsError::CipherError(format!("Failed to initialize AES-GCM: {:?}", e))
+                })?;
+
+                cipher.decrypt(nonce, ciphertext_and_tag, aad).map_err(|_| {
+                    TlsError::CipherError("Authentication tag verification failed".to_string())
+                })
+            }
+        }
+    }
+
+    fn encrypt_record(&mut self, plaintext: &[u8], content_type: u8, seq: u64) -> Result<Vec<u8>, TlsError> {
+        let keys = self.keys.as_ref().ok_or_else(|| TlsError::CipherError("Keys not initialized".to_string()))?;
+        let (write_key, iv) = if self.is_client {
+            (&keys.client_write_key, &keys.client_write_iv)
+        } else {
+            (&keys.server_write_key, &keys.server_write_iv)
+        };
+
+        let nonce = Self::compute_record_nonce(iv, seq);
+
+        let mut inner_plaintext = plaintext.to_vec();
+        inner_plaintext.push(content_type);
+
+        let record_len = inner_plaintext.len() + 16;
+        let aad = Self::record_aad(record_len);
+
+        Self::aead_seal(self.cipher_suite, write_key, &nonce, &inner_plaintext, &aad)
+    }
+
+    fn decrypt_record(&mut self, ciphertext: &[u8], seq: u64) -> Result<(Vec<u8>, u8), TlsError> {
+        if ciphertext.len() < 16 {
             return Err(TlsError::CipherError("Ciphertext too short".to_string()));
         }
 
-        let cipher = if self.is_client {
-            self.server_cipher.as_ref()
+        let keys = self.keys.as_ref().ok_or_else(|| TlsError::CipherError("Keys not initialized".to_string()))?;
+        let (read_key, iv) = if self.is_client {
+            (&keys.server_write_key, &keys.server_write_iv)
         } else {
-            self.client_cipher.as_ref()
-        }.ok_or_else(|| TlsError::CipherError("Cipher not initialized".to_string()))?;
+            (&keys.client_write_key, &keys.client_write_iv)
+        };
 
-        let nonce = &ciphertext[..12];
-        let encrypted_data = &ciphertext[12..ciphertext.len() - 16];
-        let received_tag = &ciphertext[ciphertext.len() - 16..];
-        let mut tag_material = Vec::new();
-        tag_material.extend_from_slice(nonce);
-        tag_material.extend_from_slice(encrypted_data);
-        let computed_tag = sha256(&tag_material);
-        if !constant_time_eq(received_tag, &computed_tag[..16]) {
-            return Err(TlsError::CipherError(
-                "Authentication tag verification failed".to_string(),
-            ));
-        }
+        let nonce = Self::compute_record_nonce(iv, seq);
+        let aad = Self::record_aad(ciphertext.len());
 
-        let mut plaintext = Vec::new();
-        for chunk in encrypted_data.chunks(16) {
-            let mut block = [0u8; 16];
-            block[..chunk.len()].copy_from_slice(chunk);
-            let decrypted_block = cipher.decrypt_block(&block);
-            plaintext.extend_from_slice(&decrypted_block[..chunk.len()]);
-        }
-
-        while plaintext.last() == Some(&0) {
-            plaintext.pop();
-        }
-
+        let mut plaintext = Self::aead_open(self.cipher_suite, read_key, &nonce, ciphertext, &aad)?;
         let content_type = plaintext.pop().ok_or_else(|| {
             TlsError::CipherError("Decrypted data empty".to_string())
         })?;
@@ -1940,8 +1944,6 @@ impl TlsStream {
             version: self.version,
             cipher_suite: self.cipher_suite,
             keys: self.keys.clone(),
-            client_cipher: self.client_cipher.clone(),
-            server_cipher: self.server_cipher.clone(),
             handshake_msg: self.handshake_msg.clone(),
             client_seq: self.client_seq,
             server_seq: self.server_seq,
@@ -2142,8 +2144,6 @@ mod tls_tests {
                 client_write_iv: vec![0x33; 12],
                 server_write_iv: vec![0x44; 12],
             }),
-            client_cipher: Some(aes::Aes::new(&[0x11; 16]).unwrap()),
-            server_cipher: Some(aes::Aes::new(&[0x22; 16]).unwrap()),
             handshake_msg: Vec::new(),
             client_seq: 0,
             server_seq: 0,
@@ -2181,8 +2181,6 @@ mod tls_tests {
             version: TlsVersion::Tls1_3,
             cipher_suite: 0,
             keys: None,
-            client_cipher: None,
-            server_cipher: None,
             handshake_msg: Vec::new(),
             client_seq: 0,
             server_seq: 0,
@@ -2213,8 +2211,6 @@ mod tls_tests {
             version: TlsVersion::Tls1_3,
             cipher_suite: 0,
             keys: None,
-            client_cipher: None,
-            server_cipher: None,
             handshake_msg: Vec::new(),
             client_seq: 0,
             server_seq: 0,

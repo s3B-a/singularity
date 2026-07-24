@@ -1121,7 +1121,7 @@ fn encode_header_pairs(headers: &[(String, String)]) -> String {
     let mut lines = Vec::new();
     for (name, value) in headers {
         lines.push(format!(
-            "{}={}",
+            "{}:{}",
             pem::encode(name.as_bytes()),
             pem::encode(value.as_bytes())
         ));
@@ -1151,7 +1151,7 @@ fn decode_header_pairs(encoded: &str, field: &str) -> io::Result<Vec<(String, St
 
     let mut headers = Vec::new();
     for line in text.lines() {
-        let (name_b64, value_b64) = line.split_once('=').ok_or_else(|| {
+        let (name_b64, value_b64) = line.split_once(':').ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("invalid {} line '{}'", field, line),

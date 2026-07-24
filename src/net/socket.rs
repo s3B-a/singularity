@@ -38,8 +38,14 @@ pub struct SocketCompressionCfg {
 }
 
 #[derive(Debug)]
+enum SocketInner {
+    Listener(std::net::TcpListener),
+    Stream(StdTcpStream),
+}
+
+#[derive(Debug)]
 pub struct Socket {
-    inner: StdTcpStream,
+    inner: SocketInner,
 }
 
 pub fn select_secure_socket_compression_algorithm(accept_encoding: &str) -> CompressionAlgorithm {
@@ -191,9 +197,37 @@ pub fn decode_secure_socket_frame(secure_frame: &[u8], security_cfg: &SocketSecu
     Ok((meta, decoded_payload))
 }
 
+fn not_a_stream() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        "operation requires a connected socket, not a listening socket",
+    )
+}
+
+fn not_a_listener() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        "operation requires a listening socket, not a connected socket",
+    )
+}
+
 impl Socket {
     pub fn from_stream(stream: StdTcpStream) -> Self {
-        Self { inner: stream }
+        Self { inner: SocketInner::Stream(stream) }
+    }
+
+    fn stream(&self) -> io::Result<&StdTcpStream> {
+        match &self.inner {
+            SocketInner::Stream(s) => Ok(s),
+            SocketInner::Listener(_) => Err(not_a_stream()),
+        }
+    }
+
+    fn stream_mut(&mut self) -> io::Result<&mut StdTcpStream> {
+        match &mut self.inner {
+            SocketInner::Stream(s) => Ok(s),
+            SocketInner::Listener(_) => Err(not_a_stream()),
+        }
     }
 
     pub fn connect<A: ToSocketAddrs>(addr: A, timeout: Duration) -> io::Result<Self> {
@@ -218,54 +252,66 @@ impl Socket {
 
     pub fn bind<A: ToSocketAddrs>(addr: A) -> io::Result<Self> {
         let listener = std::net::TcpListener::bind(addr)?;
-        let (stream, _) = listener.accept()?;
         Ok(Self {
-            inner: stream,
+            inner: SocketInner::Listener(listener),
         })
     }
 
     pub fn accept(&self) -> io::Result<(Self, SocketAddr)> {
-        let listener = std::net::TcpListener::bind(self.inner.local_addr()?)?;
-        let (stream, addr) = listener.accept()?;
-        Ok((Self { inner: stream }, addr))
+        match &self.inner {
+            SocketInner::Listener(listener) => {
+                let (stream, addr) = listener.accept()?;
+                Ok((Self { inner: SocketInner::Stream(stream) }, addr))
+            }
+            SocketInner::Stream(_) => Err(not_a_listener()),
+        }
     }
 
     pub fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
-        self.inner.set_read_timeout(timeout)
+        self.stream()?.set_read_timeout(timeout)
     }
 
     pub fn set_write_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
-        self.inner.set_write_timeout(timeout)
+        self.stream()?.set_write_timeout(timeout)
     }
 
     pub fn set_nodelay(&self, nodelay: bool) -> io::Result<()> {
-        self.inner.set_nodelay(nodelay)
+        self.stream()?.set_nodelay(nodelay)
     }
 
     pub fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
-        self.inner.set_nonblocking(nonblocking)
+        match &self.inner {
+            SocketInner::Listener(l) => l.set_nonblocking(nonblocking),
+            SocketInner::Stream(s) => s.set_nonblocking(nonblocking),
+        }
     }
 
     pub fn peer_addr(&self) -> io::Result<SocketAddr> {
-        self.inner.peer_addr()
+        self.stream()?.peer_addr()
     }
 
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
-        self.inner.local_addr()
+        match &self.inner {
+            SocketInner::Listener(l) => l.local_addr(),
+            SocketInner::Stream(s) => s.local_addr(),
+        }
     }
 
     pub fn shutdown(&self, how: std::net::Shutdown) -> io::Result<()> {
-        self.inner.shutdown(how)
+        self.stream()?.shutdown(how)
     }
 
     pub fn try_clone(&self) -> io::Result<Self> {
-        Ok(Self {
-            inner: self.inner.try_clone()?,
-        })
+        let inner = match &self.inner {
+            SocketInner::Listener(l) => SocketInner::Listener(l.try_clone()?),
+            SocketInner::Stream(s) => SocketInner::Stream(s.try_clone()?),
+        };
+
+        Ok(Self { inner })
     }
 
     pub fn peek(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.inner.peek(buf)
+        self.stream_mut()?.peek(buf)
     }
 
     pub fn send_secure(&mut self, payload: &[u8], security_cfg: &SocketSecurityCfg, compression_cfg: &SocketCompressionCfg) -> io::Result<SecureSocketFrameMeta> {
@@ -278,9 +324,10 @@ impl Socket {
         }
 
         let frame_len = frame.len() as u32;
-        self.inner.write_all(&frame_len.to_be_bytes())?;
-        self.inner.write_all(&frame)?;
-        self.inner.flush()?;
+        let stream = self.stream_mut()?;
+        stream.write_all(&frame_len.to_be_bytes())?;
+        stream.write_all(&frame)?;
+        stream.flush()?;
 
         Ok(meta)
     }
@@ -294,7 +341,7 @@ impl Socket {
 
     pub fn recv_secure(&mut self, security_cfg: &SocketSecurityCfg, max_frame_size: usize) -> io::Result<(SecureSocketFrameMeta, Vec<u8>)> {
         let mut len_buf = [0u8; 4];
-        self.inner.read_exact(&mut len_buf)?;
+        self.stream_mut()?.read_exact(&mut len_buf)?;
         let frame_len = u32::from_be_bytes(len_buf) as usize;
         if frame_len == 0 {
             return Err(io::Error::new(
@@ -314,7 +361,7 @@ impl Socket {
         }
 
         let mut frame = vec![0u8; frame_len];
-        self.inner.read_exact(&mut frame)?;
+        self.stream_mut()?.read_exact(&mut frame)?;
         decode_secure_socket_frame(&frame, security_cfg)
     }
 
@@ -325,17 +372,17 @@ impl Socket {
 
 impl Read for Socket {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.inner.read(buf)
+        self.stream_mut()?.read(buf)
     }
 }
 
 impl Write for Socket {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.inner.write(buf)
+        self.stream_mut()?.write(buf)
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        self.inner.flush()
+        self.stream_mut()?.flush()
     }
 }
 

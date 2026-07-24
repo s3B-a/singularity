@@ -408,29 +408,29 @@ impl QpackDecoder {
             return Err(Error::BufferTooShort);
         }
         
-        let mask = (1u8 << prefix_bits) - 1;
+        let mask = ((1u16 << prefix_bits) - 1) as u8;
         let mut value = (data[offset] & mask) as usize;
         if value < mask as usize {
             return Ok((value, 1));
         }
-        
+
         let mut consumed = 1;
         let mut shift = 0;
         loop {
             if offset + consumed >= data.len() {
                 return Err(Error::BufferTooShort);
             }
-            
+
             let byte = data[offset + consumed];
             consumed += 1;
-            
+
             value += ((byte & 0x7F) as usize) << shift;
             shift += 7;
             if byte & 0x80 == 0 {
                 break;
             }
         }
-        
+
         Ok((value, consumed))
     }
 
@@ -438,8 +438,8 @@ impl QpackDecoder {
         if offset >= data.len() {
             return Err(Error::BufferTooShort);
         }
-        
-        let mask = (1u8 << prefix_bits) - 1;
+
+        let mask = ((1u16 << prefix_bits) - 1) as u8;
         let mut value = (data[offset] & mask) as u64;
         if value < mask as u64 {
             return Ok((value, 1));

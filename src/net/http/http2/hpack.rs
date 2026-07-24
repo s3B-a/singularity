@@ -537,15 +537,13 @@ impl HpackCodec {
     }
 
     fn encode_indexed(&self, output: &mut Vec<u8>, index: usize) {
-        if output.is_empty() {
-            let mut byte = 0x80u8;
-            if index < 127 {
-                byte |= index as u8;
-                output.push(byte);
-            } else {
-                output.push(byte | 0x7F);
-                self.encode_integer(output, index - 127, 7);
-            }
+        let mut byte = 0x80u8;
+        if index < 127 {
+            byte |= index as u8;
+            output.push(byte);
+        } else {
+            output.push(byte | 0x7F);
+            self.encode_integer(output, index - 127, 7);
         }
     }
 

@@ -133,7 +133,8 @@ impl HttpVersion {
                     _ => continue,
                 };
 
-                if let Some(host_port) = rest.trim().trim_matches('"').split(';').next() {
+                if let Some(host_port_raw) = rest.split(';').next() {
+                    let host_port = host_port_raw.trim().trim_matches('"');
                     if let Some((host, port_str)) = host_port.rsplit_once(':') {
                         if let Ok(port) = port_str.parse::<u16>() {
                             versions.push((version, host.to_string(), port));
