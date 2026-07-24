@@ -200,7 +200,7 @@ impl PriorityScheduler {
 
     pub fn mark_blocked(&mut self, stream_id: u32) {
         if let Some(stream) = self.streams.get_mut(&stream_id) {
-            if stream.state == StreamScheduleState::Ready {
+            if stream.state != StreamScheduleState::Closed {
                 stream.state = StreamScheduleState::Blocked;
                 self.active_queue.retain(|&id| id != stream_id);
                 if !self.blocked_streams.contains(&stream_id) {
@@ -1106,9 +1106,9 @@ mod tests {
         let mut scheduler = PriorityScheduler::new();
         
         scheduler.add_stream(1, Priority::new(0, 16, false));
-        scheduler.add_stream(3, Priority::new(1, 16, true));
         scheduler.add_stream(5, Priority::new(1, 16, false));
-        
+        scheduler.add_stream(3, Priority::new(1, 16, true));
+
         let node3 = scheduler.dependencies.get(&3).unwrap();
         assert_eq!(node3.parent_id, 1);
         assert!(node3.children.contains(&5));

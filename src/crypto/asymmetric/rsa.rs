@@ -209,7 +209,7 @@ impl RsaPrivateKey {
                 pad_pkcs1v15_sign(&message_hash, self.size.bytes())?
             }
             RsaPadding::PssSha256 => {
-                pad_pss_sha256(&message_hash, self.size.bytes())?
+                pad_pss_sha256(&message_hash, self.size.bytes(), self.n.bit_length())?
             }
             RsaPadding::NoPadding => {
                 if message.len() > self.size.bytes() {
@@ -356,7 +356,7 @@ impl RsaPublicKey {
                 verify_pkcs1v15_sign(&m_bytes, &message_hash)
             }
             RsaPadding::PssSha256 => {
-                verify_pss_sha256(&m_bytes, &message_hash)
+                verify_pss_sha256(&m_bytes, &message_hash, self.n.bit_length())
             }
             RsaPadding::NoPadding => {
                 Ok(m_bytes == message)
@@ -364,7 +364,7 @@ impl RsaPublicKey {
             _ => Err(Error::CryptoError("Unsupported padding for verification".to_string())),
         }
     }
-    
+
     /**
      * Converts the RSA public key to its components for serialization
      * Args:
@@ -546,7 +546,7 @@ impl RsaPublicKey {
             m_bytes = padded;
         }
         
-        verify_pss_sha256(&m_bytes, message_hash)
+        verify_pss_sha256(&m_bytes, message_hash, self.n.bit_length())
     }
 }
 
@@ -1063,11 +1063,11 @@ fn random_range(min: &BigNum, max: &BigNum) -> Result<BigNum> {
 fn rsa_decrypt_crt(c: &BigNum, p: &BigNum, q: &BigNum, dp: &BigNum, dq: &BigNum, qinv: &BigNum, n: &BigNum) -> Result<BigNum> {
     let m1 = c.mod_exp_montgomery(dp, p)?;
     let m2 = c.mod_exp_montgomery(dq, q)?;
-    
-    let diff = if m1 >= m2 {
-        &m1 - &m2
+    let m2_mod_p = m2.modulo(p);
+    let diff = if m1 >= m2_mod_p {
+        &m1 - &m2_mod_p
     } else {
-        p + &m1 - &m2
+        p + &m1 - &m2_mod_p
     };
     let h = (&diff * qinv).modulo(p);
     let mut m = &m2 + &(&h * q);
@@ -1336,7 +1336,7 @@ fn unpad_oaep_sha256(data: &[u8]) -> Result<Vec<u8>> {
  * Returns:
  *    Result<Vec<u8>>: The padded hash or an error if padding fails
  */
-fn pad_pss_sha256(hash: &[u8], key_size: usize) -> Result<Vec<u8>> {
+fn pad_pss_sha256(hash: &[u8], key_size: usize, mod_bits: usize) -> Result<Vec<u8>> {
     let hash_len = 32;
     let s_len = hash_len;
     if key_size < hash_len + s_len + 2 {
@@ -1363,11 +1363,12 @@ fn pad_pss_sha256(hash: &[u8], key_size: usize) -> Result<Vec<u8>> {
     let masked_db: Vec<u8> = db.iter().zip(db_mask.iter()).map(|(a, b)| a ^ b).collect();
     
     let mut masked_db = masked_db;
-    let bits_to_clear = 8 * key_size - (key_size * 8 - 1);
+    let em_bits = mod_bits - 1;
+    let bits_to_clear = key_size * 8 - em_bits;
     if bits_to_clear > 0 {
         masked_db[0] &= 0xff >> bits_to_clear;
     }
-    
+
     let mut em = Vec::with_capacity(key_size);
     em.extend_from_slice(&masked_db);
     em.extend_from_slice(&h);
@@ -1385,23 +1386,24 @@ fn pad_pss_sha256(hash: &[u8], key_size: usize) -> Result<Vec<u8>> {
  * Returns:
  *    Result<bool>: True if the signature is valid, false otherwise
  */
-fn verify_pss_sha256(em: &[u8], hash: &[u8]) -> Result<bool> {
+fn verify_pss_sha256(em: &[u8], hash: &[u8], mod_bits: usize) -> Result<bool> {
     let hash_len = 32;
     let s_len = hash_len;
     if em.len() < hash_len + s_len + 2 {
         return Ok(false);
     }
-    
+
     if em[em.len() - 1] != 0xbc {
         return Ok(false);
     }
-    
+
     let masked_db = &em[..em.len() - hash_len - 1];
     let h = &em[em.len() - hash_len - 1..em.len() - 1];
     let db_mask = mgf1_sha256(h, masked_db.len());
-    
+
     let mut db: Vec<u8> = masked_db.iter().zip(db_mask.iter()).map(|(a, b)| a ^ b).collect();
-    let bits_to_clear = 8 * em.len() - (em.len() * 8 - 1);
+    let em_bits = mod_bits - 1;
+    let bits_to_clear = em.len() * 8 - em_bits;
     if bits_to_clear > 0 {
         db[0] &= 0xff >> bits_to_clear;
     }
@@ -1508,7 +1510,38 @@ fn big_num_to_fixed_bytes(num: &BigNum, length: usize) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
+    #[test]
+    fn stress_test_rsa_pss_sign_verify() {
+        for iter in 0..80 {
+            let key = RsaPrivateKey::generate(RsaKeySize::Rsa2048).unwrap();
+            let public = key.public_key();
+            let message = b"Message to sign with PSS";
+
+            let signature = key.sign(message, RsaPadding::PssSha256).unwrap();
+            let ok = public.verify(message, &signature, RsaPadding::PssSha256).unwrap();
+            assert!(ok, "PSS verify failed at iter={} (n_bits={})", iter, key.n.bit_length());
+        }
+    }
+
+    #[test]
+    fn stress_test_rsa_crt_decrypt_roundtrip() {
+        for iter in 0..50 {
+            let key = RsaPrivateKey::generate(RsaKeySize::Rsa2048).unwrap();
+            let public = key.public_key();
+
+            for msg_iter in 0..5 {
+                let mut msg = vec![0u8; 190];
+                random::fill_random(&mut msg).unwrap();
+                let padded = pad_oaep_sha256(&msg, key.size.bytes()).unwrap();
+                let m = BigNum::from_bytes_be(&padded);
+                let c = m.mod_exp_montgomery(&public.e, &public.n).unwrap();
+                let recovered = rsa_decrypt_crt(&c, &key.p, &key.q, &key.dp, &key.dq, &key.qinv, &key.n).unwrap();
+                assert_eq!(recovered, m, "CRT decrypt mismatch at iter={} msg_iter={}", iter, msg_iter);
+            }
+        }
+    }
+
     #[test]
     fn test_rsa_2048_keygen() {
         let key = RsaPrivateKey::generate(RsaKeySize::Rsa2048).unwrap();

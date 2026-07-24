@@ -1310,8 +1310,7 @@ impl HttpClient {
             }
         }
 
-        let addr = format!("{}:{}", host, port);
-        let stream = TcpStream::connect(&addr)?;
+        let stream = self.connect_to_host(host, port)?;
         stream.set_nodelay(true)?;
 
         Ok(Http1ConnectionEntry::new(stream, host.to_string(), port))
@@ -1552,6 +1551,21 @@ impl HttpClient {
         })
     }
 
+    fn connect_to_host(&self, host: &str, port: u16) -> io::Result<TcpStream> {
+        let ip_addresses = self.resolve_host(host)?;
+        let mut last_error = None;
+        for ip in ip_addresses {
+            match TcpStream::connect(SocketAddr::new(ip, port)) {
+                Ok(stream) => return Ok(stream),
+                Err(e) => last_error = Some(e),
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| {
+            io::Error::new(io::ErrorKind::Other, format!("Failed to connect to {}:{}", host, port))
+        }))
+    }
+
     fn build_redirect_request(&self, original: &HttpRequest, location: &str) -> Result<HttpRequest, io::Error> {
         let mut new_request = HttpRequest::new(original.method().clone(), location.to_string());
         if let Some(user_agent) = original.headers().get("User-Agent") {
@@ -1733,7 +1747,7 @@ impl HttpClient {
         let mut stream = if let Some(s) = stream_option {
             s
         } else {
-            TcpStream::connect(&format!("{}:{}", host, port))?
+            self.connect_to_host(&host, port)?
         };
 
         if let Some(timeout) = self.timeout {
@@ -1876,7 +1890,7 @@ impl HttpClient {
 
     fn get_or_create_http2_connection(&mut self, connection_key: &str, host: &str, port: u16) -> Result<&mut Http2ConnectionEntry, io::Error> {
         if !self.http2_connections.contains_key(connection_key) {
-            let stream = TcpStream::connect(&format!("{}:{}", host, port))?;
+            let stream = self.connect_to_host(host, port)?;
             let connection = Http2Connection::new(stream).map_err(|e| {
                 io::Error::new(
                     io::ErrorKind::Other,
@@ -2689,11 +2703,19 @@ fn resolve_url(base: &str, relative: &str) -> String {
         return relative.to_string();
     }
 
-    if let Ok((scheme, host, port, _)) = parse_url(base) {
-        if relative.starts_with('/') {
-            format!("{}://{}:{}{}", scheme, host, port, relative)
+    if let Ok((scheme, host, port, path)) = parse_url(base) {
+        let default_port = if scheme == "https" { 443 } else { 80 };
+        let authority = if port == default_port {
+            host
         } else {
-            format!("{}://{}:{}/{}", scheme, host, port, relative)
+            format!("{}:{}", host, port)
+        };
+
+        if relative.starts_with('/') {
+            format!("{}://{}{}", scheme, authority, relative)
+        } else {
+            let dir = path.rsplit_once('/').map(|(dir, _)| dir).unwrap_or("");
+            format!("{}://{}{}/{}", scheme, authority, dir, relative)
         }
     } else {
         relative.to_string()

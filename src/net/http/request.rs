@@ -220,6 +220,10 @@ impl HttpRequest {
 
     pub fn set_body(mut self, body: impl Into<Vec<u8>>) -> Self {
         self.body = body.into();
+        if !self.body.is_empty() {
+            self.headers.insert("Content-Length", self.body.len().to_string());
+        }
+
         self
     }
 

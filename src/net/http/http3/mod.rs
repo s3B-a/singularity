@@ -927,7 +927,7 @@ mod tests {
 
     #[test]
     fn test_encode_decode_varint_roundtrip() {
-        let test_values = vec![0, 63, 64, 16383, 16384, 1073741823, 1073741824, u64::MAX / 2];
+        let test_values = vec![0, 63, 64, 16383, 16384, 1073741823, 1073741824, (1u64 << 62) - 1];
         
         for original in test_values {
             let encoded = encode_varint(original);

@@ -1103,7 +1103,7 @@ mod tests {
         assert_eq!(stream.readable(), 3);
 
         stream.process_frame(3, vec![6, 7, 8, 9], false).unwrap();
-        assert_eq!(stream.readable(), 13);
+        assert_eq!(stream.readable(), 7);
     }
 
     #[test]

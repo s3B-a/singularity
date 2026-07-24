@@ -232,7 +232,7 @@ impl Http3Connection {
             idle_timeout: config.max_idle_timeout,
             last_activity: Instant::now(),
             peer_transport_params: None,
-            max_data: 0,
+            max_data: config.initial_max_data,
             data_sent: 0,
             max_data_recieved: config.initial_max_data,
             data_recieved: 0,
@@ -717,7 +717,15 @@ impl Http3Connection {
             reason: reason.to_vec(),
         };
 
-        self.send_frame(PacketNumberSpace::ApplicationData, frame)?;
+        let pn_space = if self.crypto.has_keys(EncryptionLevel::Application) {
+            PacketNumberSpace::ApplicationData
+        } else if self.crypto.has_keys(EncryptionLevel::Handshake) {
+            PacketNumberSpace::Handshake
+        } else {
+            PacketNumberSpace::Initial
+        };
+
+        self.send_frame(pn_space, frame)?;
 
         Ok(())
     }

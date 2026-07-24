@@ -382,7 +382,7 @@ impl<R: Read> ChunkedDecoder<R> {
                 break;
             }
 
-            if ch != 'r' {
+            if ch != '\r' {
                 line.push(ch);
             }
         }
