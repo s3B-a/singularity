@@ -651,23 +651,7 @@ impl<'a> DerDecoder<'a>{
             return Err(Error::CryptoError("Invalid OBJECT IDENTIFIER element".to_string()));
         }
 
-        if element.data.is_empty() {
-            return Err(Error::CryptoError("Invalid OBJECT IDENTIFIER length".to_string()));
-        }
-
-        let mut oid = Vec::new();
-        let first_byte = element.data[0] as u64;
-
-        oid.push(first_byte / 40);
-        oid.push(first_byte % 40);
-        let mut i = 1;
-        while i < element.data.len() {
-            let (value, consumed) = decode_base128(&element.data[i..])?;
-            oid.push(value);
-            i += consumed;
-        }
-
-        Ok(oid)
+        decode_oid_content(&element.data)
     }
 
     /**
@@ -1004,12 +988,49 @@ fn decode_base128(data: &[u8]) -> Result<(u64, usize)> {
     Err(Error::CryptoError("Incomplete base128 integer".to_string()))
 }
 
+/**
+ * Decodes the raw content bytes of an OBJECT IDENTIFIER (i.e. already stripped of its
+ * tag/length, as produced by `DerDecoder::read_element`) into its dotted arc components.
+ * Args:
+ *    content - &[u8]: The OID's content bytes
+ *
+ * Returns:
+ *    Result<Vec<u64>>: The OID's dotted arc components, or an error if decoding fails
+ */
+pub fn decode_oid_content(content: &[u8]) -> Result<Vec<u64>> {
+    if content.is_empty() {
+        return Err(Error::CryptoError("Invalid OBJECT IDENTIFIER length".to_string()));
+    }
+
+    let mut oid = Vec::new();
+    let first_byte = content[0] as u64;
+
+    oid.push(first_byte / 40);
+    oid.push(first_byte % 40);
+    let mut i = 1;
+    while i < content.len() {
+        let (value, consumed) = decode_base128(&content[i..])?;
+        oid.push(value);
+        i += consumed;
+    }
+
+    Ok(oid)
+}
+
 // Commonly used OIDs rexported as constants
 pub mod oid {
     pub const RSA_ENCRYPTION: &[u64] = &[1, 2, 840, 113549, 1, 1, 1];
+    pub const SHA1_WITH_RSA_ENCRYPTION: &[u64] = &[1, 2, 840, 113549, 1, 1, 5];
+    pub const SHA256_WITH_RSA_ENCRYPTION: &[u64] = &[1, 2, 840, 113549, 1, 1, 11];
+    pub const SHA384_WITH_RSA_ENCRYPTION: &[u64] = &[1, 2, 840, 113549, 1, 1, 12];
+    pub const SHA512_WITH_RSA_ENCRYPTION: &[u64] = &[1, 2, 840, 113549, 1, 1, 13];
     pub const ECDSA_WITH_SHA256: &[u64] = &[1, 2, 840, 10045, 4, 3, 2];
+    pub const ECDSA_WITH_SHA384: &[u64] = &[1, 2, 840, 10045, 4, 3, 3];
+    pub const ECDSA_WITH_SHA512: &[u64] = &[1, 2, 840, 10045, 4, 3, 4];
     pub const EC_PUBLIC_KEY: &[u64] = &[1, 2, 840, 10045, 2, 1];
     pub const SECP256R1: &[u64] = &[1, 2, 840, 10045, 3, 1, 7];
+    pub const SECP384R1: &[u64] = &[1, 3, 132, 0, 34];
+    pub const SECP521R1: &[u64] = &[1, 3, 132, 0, 35];
     pub const ED25519: &[u64] = &[1, 3, 101, 112];
     pub const X25519: &[u64] = &[1, 3, 101, 110];
     pub const SHA256: &[u64] = &[2, 16, 840, 1, 101, 3, 4, 2, 1];

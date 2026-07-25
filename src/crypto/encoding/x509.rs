@@ -2,8 +2,39 @@
 // https://tools.ietf.org/html/rfc5280
 
 use crate::crypto::Result;
-use crate::crypto::encoding::asn1::DerDecoder;
+use crate::crypto::encoding::asn1::{DerDecoder, DerEncoder, Tag};
 use crate::crypto::encoding::pem;
+
+const KEY_USAGE_KEY_CERT_SIGN: u16 = 0x0400;
+
+mod ext_oid {
+    pub const SUBJECT_ALT_NAME: [u64; 4] = [2, 5, 29, 17];
+    pub const BASIC_CONSTRAINTS: [u64; 4] = [2, 5, 29, 19];
+    pub const KEY_USAGE: [u64; 4] = [2, 5, 29, 15];
+    pub const SUBJECT_KEY_IDENTIFIER: [u64; 4] = [2, 5, 29, 14];
+    pub const AUTHORITY_KEY_IDENTIFIER: [u64; 4] = [2, 5, 29, 35];
+    pub const EXTENDED_KEY_USAGE: [u64; 4] = [2, 5, 29, 37];
+    pub const EKU_SERVER_AUTH: [u64; 9] = [1, 3, 6, 1, 5, 5, 7, 3, 1];
+    pub const EKU_ANY: [u64; 5] = [2, 5, 29, 37, 0];
+}
+
+/**
+ * Reads an Extension's `extnID` and skips its OPTIONAL `critical` BOOLEAN (DEFAULT FALSE)
+ * without touching the following `extnValue` OCTET STRING
+ * Args:
+ *    ext - &mut DerDecoder: The decoder positioned at the start of an Extension SEQUENCE
+ *
+ * Returns:
+ *    Result<Vec<u64>>: The extension's OID
+ */
+fn read_extension_header(ext: &mut DerDecoder) -> Result<Vec<u64>> {
+    let oid = ext.object_identifier()?;
+    if ext.has_more() && ext.peek_tag().map(|t| t == Tag::Boolean as u8).unwrap_or(false) {
+        let _critical = ext.boolean()?;
+    }
+
+    Ok(oid)
+}
 
 // X.509 Name and Certificate structures
 #[derive(Clone, Debug)]
@@ -106,55 +137,20 @@ impl Certificate {
      *    Vec<u8>: The DER-encoded certificate bytes
      */
     pub fn to_der(&self) -> Vec<u8> {
-        let mut result = Vec::new();
-        result.extend_from_slice(&self.tbs);
-        let mut sig_alg = vec![0x30]; // SEQUENCE tag
-        let mut sig_alg_content = vec![0x06]; // OID tag
-        let mut oid_content = Vec::new();
-        if self.signature_algorithm.len() >= 2 {
-            oid_content.push((self.signature_algorithm[0] * 40 + self.signature_algorithm[1]) as u8);
-            for &arc in &self.signature_algorithm[2..] {
-                if arc < 128 {
-                    oid_content.push(arc as u8);
-                } else {
-                    let mut bytes = Vec::new();
-                    let mut val = arc;
-                    while val > 0 {
-                        bytes.insert(0, (val & 0x7F) as u8);
-                        val >>= 7;
-                    }
-                    for (i, &b) in bytes.iter().enumerate() {
-                        if i < bytes.len() - 1 {
-                            oid_content.push(b | 0x80);
-                        } else {
-                            oid_content.push(b);
-                        }
-                    }
-                }
-            }
-        }
-        
-        sig_alg_content.push(oid_content.len() as u8);
-        sig_alg_content.extend_from_slice(&oid_content);
-        sig_alg_content.push(0x05);
-        sig_alg_content.push(0x00);
-        
-        sig_alg.push(sig_alg_content.len() as u8);
-        sig_alg.extend_from_slice(&sig_alg_content);
-        result.extend_from_slice(&sig_alg);
-        
-        let mut sig_bits = vec![0x00];
-        sig_bits.extend_from_slice(&self.signature);
-        let mut bit_string = vec![0x03];
-        bit_string.push(sig_bits.len() as u8);
-        bit_string.extend_from_slice(&sig_bits);
-        result.extend_from_slice(&bit_string);
-        
-        let mut der = vec![0x30];
-        der.push(result.len() as u8);
-        der.extend_from_slice(&result);
-        
-        der
+        let mut sig_alg = DerEncoder::new();
+        sig_alg.sequence(|alg| {
+            let _ = alg.object_identifier(&self.signature_algorithm);
+            alg.null();
+        });
+
+        let mut cert = DerEncoder::new();
+        cert.sequence(|c| {
+            c.raw(&self.tbs);
+            c.raw(&sig_alg.finish());
+            c.bit_string(&self.signature, 0);
+        });
+
+        cert.finish()
     }
 
     /**
@@ -276,22 +272,79 @@ impl Certificate {
      *    Result<()>: Ok if verification succeeds, Err otherwise
      */
     pub fn verify_signature(&self, ca_cert: &Certificate) -> Result<()> {
-        use crate::crypto::asymmetric::rsa;
-        
-        let ca_public_key_bytes = ca_cert.public_key()
-            .ok_or_else(|| crate::crypto::Error::InvalidData("CA has no public key".to_string()))?;
-        
-        let ca_public_key = rsa::RsaPublicKey::from_bytes(&ca_public_key_bytes)
-            .map_err(|_| crate::crypto::Error::InvalidData("Invalid CA public key".to_string()))?;
-        
-        ca_public_key.verify(&self.tbs, &self.signature, rsa::RsaPadding::Pkcs1v15)
-            .and_then(|is_valid| {
-                if is_valid {
-                    Ok(())
+        use crate::crypto::Error;
+        use crate::crypto::asymmetric::{ecc_generic, ecdsa, rsa};
+        use crate::crypto::encoding::asn1::oid;
+        use crate::crypto::hash::sha2::{sha1, sha256, sha384, sha512};
+
+        let alg = ca_cert.subject_public_key_info.algorithm.as_slice();
+        let is_valid = if alg == oid::RSA_ENCRYPTION {
+            let ca_public_key_bytes = ca_cert.public_key().ok_or_else(|| Error::InvalidData("CA has no public key".to_string()))?;
+
+            let ca_public_key = rsa::RsaPublicKey::from_bytes(&ca_public_key_bytes)
+                .map_err(|_| Error::InvalidData("Invalid CA public key".to_string()))?;
+
+            let sig_alg = self.signature_algorithm.as_slice();
+            let (digest_info, digest): (&[u8], Vec<u8>) = if sig_alg == oid::SHA256_WITH_RSA_ENCRYPTION {
+                (&rsa::DIGEST_INFO_SHA256, sha256(&self.tbs).to_vec())
+            } else if sig_alg == oid::SHA384_WITH_RSA_ENCRYPTION {
+                (&rsa::DIGEST_INFO_SHA384, sha384(&self.tbs).to_vec())
+            } else if sig_alg == oid::SHA512_WITH_RSA_ENCRYPTION {
+                (&rsa::DIGEST_INFO_SHA512, sha512(&self.tbs).to_vec())
+            } else if sig_alg == oid::SHA1_WITH_RSA_ENCRYPTION {
+                (&rsa::DIGEST_INFO_SHA1, sha1(&self.tbs).to_vec())
+            } else {
+                return Err(Error::InvalidData(
+                    "Unsupported signature hash algorithm for RSA certificate".to_string(),
+                ));
+            };
+
+            ca_public_key.verify_pkcs1v15_digest(digest_info, &digest, &self.signature)?
+        } else if alg == oid::EC_PUBLIC_KEY {
+            let curve_oid = ca_cert.subject_public_key_info.param.as_ref()
+                .ok_or_else(|| Error::InvalidData("EC public key missing curve parameters".to_string()))
+                .and_then(|bytes| crate::crypto::encoding::asn1::decode_oid_content(bytes))?;
+
+            if curve_oid.as_slice() == oid::SECP256R1 {
+                let fixed_sig = ecc_generic::der_signature_to_fixed(&self.signature, 32)?;
+                ecdsa::verify(ecdsa::SignatureCurve::P256, &ca_cert.subject_public_key_info.public_key, &self.tbs, &fixed_sig)?
+            } else {
+                let curve = if curve_oid.as_slice() == oid::SECP384R1 {
+                    ecc_generic::NistCurve::P384
+                } else if curve_oid.as_slice() == oid::SECP521R1 {
+                    ecc_generic::NistCurve::P521
                 } else {
-                    Err(crate::crypto::Error::VerificationFailed)
-                }
-            })
+                    return Err(Error::InvalidData(
+                        "Unsupported EC curve for signature verification".to_string(),
+                    ));
+                };
+
+                let sig_alg = self.signature_algorithm.as_slice();
+                let digest: Vec<u8> = if sig_alg == oid::ECDSA_WITH_SHA384 {
+                    sha384(&self.tbs).to_vec()
+                } else if sig_alg == oid::ECDSA_WITH_SHA512 {
+                    sha512(&self.tbs).to_vec()
+                } else if sig_alg == oid::ECDSA_WITH_SHA256 {
+                    sha256(&self.tbs).to_vec()
+                } else {
+                    return Err(Error::InvalidData(
+                        "Unsupported signature hash algorithm for EC certificate".to_string(),
+                    ));
+                };
+
+                ecc_generic::verify_prehashed(curve, &ca_cert.subject_public_key_info.public_key, &digest, &self.signature)?
+            }
+        } else {
+            return Err(Error::InvalidData(
+                "Unsupported public key algorithm for signature verification".to_string(),
+            ));
+        };
+
+        if is_valid {
+            Ok(())
+        } else {
+            Err(Error::VerificationFailed)
+        }
     }
 
     /**
@@ -322,9 +375,8 @@ impl Certificate {
                 ext_seq.sequence(|exts| {
                     while exts.pos < exts.data.len() {
                         if let Ok(_) = exts.sequence(|ext| {
-                            let oid = ext.object_identifier()?;
-                            if oid == vec![2, 5, 29, 17] {
-                                let _ = ext.optional_context_specific(1, |_critical| Ok(())).ok();
+                            let oid = read_extension_header(ext)?;
+                            if oid == ext_oid::SUBJECT_ALT_NAME {
                                 let san_data = ext.octet_string()?;
                                 let mut san_decoder = DerDecoder::new(&san_data);
                                 if let Ok(_) = san_decoder.sequence(|san_seq| {
@@ -372,16 +424,16 @@ impl Certificate {
     }
 
     /**
-     * Checks if this is a CA certificate
+     * Reads the basicConstraints extension (RFC 5280 4.2.1.9): whether this certificate is a CA, and its pathLenConstraint if present
      * Args:
      *    &self: The Certificate instance
-     * 
+     *
      * Returns:
-     *    bool: True if this is a CA certificate
+     *    Result<(bool, Option<u32>)>: (is_ca, path_len_constraint)
      */
-    pub fn is_ca(&self) -> bool {
-        let mut decoder = DerDecoder::new(&self.tbs);        
-        if let Ok(_) = decoder.sequence(|tbs| {
+    pub fn get_basic_constraints(&self) -> Result<(bool, Option<u32>)> {
+        let mut decoder = DerDecoder::new(&self.tbs);
+        decoder.sequence(|tbs| {
             let _ = tbs.optional_context_specific(0, |v| v.integer_u64())?;
             let _ = tbs.integer()?;
             let _ = tbs.sequence(|alg| alg.object_identifier())?;
@@ -391,37 +443,134 @@ impl Certificate {
                 validity.read_element()?;
                 Ok(())
             })?;
+
             let _ = tbs.sequence(|subject_seq| parse_name(subject_seq))?;
             let _ = tbs.sequence(|spki| parse_spki(spki))?;
-
-            tbs.context_specific(3, |ext_seq| {
+            let result = tbs.optional_context_specific(3, |ext_seq| {
                 ext_seq.sequence(|exts| {
                     while exts.pos < exts.data.len() {
-                        if let Ok(is_ca) = exts.sequence(|ext| {
-                            let oid = ext.object_identifier()?;
-                            if oid == vec![2, 5, 29, 19] {
-                                let _ = ext.optional_context_specific(1, |_critical| Ok(())).ok();
-                                let bc_data = ext.octet_string()?;
-                                let mut bc_decoder = DerDecoder::new(&bc_data);
-                                
+                        if let Ok(found) = exts.sequence(|ext| {
+                            let oid = read_extension_header(ext)?;
+                            let value = ext.octet_string()?;
+                            if oid == ext_oid::BASIC_CONSTRAINTS {
+                                let mut bc_decoder = DerDecoder::new(&value);
                                 return bc_decoder.sequence(|bc| {
-                                    bc.boolean()
+                                    let is_ca = if bc.has_more() && bc.peek_tag().map(|t| t == Tag::Boolean as u8).unwrap_or(false) {
+                                        bc.boolean()?
+                                    } else {
+                                        false
+                                    };
+
+                                    let path_len = if bc.has_more() {
+                                        Some(bc.integer_u64()? as u32)
+                                    } else {
+                                        None
+                                    };
+
+                                    Ok(Some((is_ca, path_len)))
                                 });
                             }
-                            Ok(false)
+                            Ok(None)
                         }) {
-                            if is_ca {
-                                return Ok(true);
+                            if let Some(bc) = found {
+                                return Ok(bc);
                             }
                         }
                     }
-                    Ok(false)
+
+                    Ok((false, None))
                 })
-            })
-        }) {
-            true
-        } else {
-            false
+            })?;
+
+            Ok(result.unwrap_or((false, None)))
+        })
+    }
+
+    /**
+     * Checks if this is a CA certificate
+     * Args:
+     *    &self: The Certificate instance
+     *
+     * Returns:
+     *    bool: True if this is a CA certificate
+     */
+    pub fn is_ca(&self) -> bool {
+        self.get_basic_constraints().map(|(is_ca, _)| is_ca).unwrap_or(false)
+    }
+
+    /**
+     * Reads the extendedKeyUsage extension as a list of KeyPurposeId OIDs
+     * Args:
+     *    &self: The Certificate instance
+     *
+     * Returns:
+     *    Result<Vec<Vec<u64>>>: The list of extended key usage OIDs, empty if not present
+     */
+    pub fn get_extended_key_usage(&self) -> Result<Vec<Vec<u64>>> {
+        let mut decoder = DerDecoder::new(&self.tbs);
+        decoder.sequence(|tbs| {
+            let _ = tbs.optional_context_specific(0, |v| v.integer_u64())?;
+            let _ = tbs.integer()?;
+            let _ = tbs.sequence(|alg| alg.object_identifier())?;
+            let _ = tbs.sequence(|issuer_seq| parse_name(issuer_seq))?;
+            let _ = tbs.sequence(|validity| {
+                validity.read_element()?;
+                validity.read_element()?;
+                Ok(())
+            })?;
+
+            let _ = tbs.sequence(|subject_seq| parse_name(subject_seq))?;
+            let _ = tbs.sequence(|spki| parse_spki(spki))?;
+            let result = tbs.optional_context_specific(3, |ext_seq| {
+                ext_seq.sequence(|exts| {
+                    while exts.pos < exts.data.len() {
+                        if let Ok(found) = exts.sequence(|ext| {
+                            let oid = read_extension_header(ext)?;
+                            let value = ext.octet_string()?;
+                            if oid == ext_oid::EXTENDED_KEY_USAGE {
+                                let mut eku_decoder = DerDecoder::new(&value);
+                                let oids = eku_decoder.sequence(|seq| {
+                                    let mut out = Vec::new();
+                                    while seq.has_more() {
+                                        out.push(seq.object_identifier()?);
+                                    }
+                                    Ok(out)
+                                })?;
+
+                                return Ok(Some(oids));
+                            }
+                            Ok(None)
+                        }) {
+                            if let Some(oids) = found {
+                                return Ok(oids);
+                            }
+                        }
+                    }
+
+                    Ok(Vec::new())
+                })
+            })?;
+
+            Ok(result.unwrap_or_default())
+        })
+    }
+
+    /**
+     * Checks whether this certificate's extendedKeyUsage extension (if present) permits TLS
+     * server authentication
+     * Args:
+     *    &self: The Certificate instance
+     *
+     * Returns:
+     *    bool: True if EKU is absent, or present and includes serverAuth/anyExtendedKeyUsage
+     */
+    pub fn allows_server_auth(&self) -> bool {
+        match self.get_extended_key_usage() {
+            Ok(ekus) if ekus.is_empty() => true,
+            Ok(ekus) => ekus.iter().any(|oid| {
+                oid == &ext_oid::EKU_SERVER_AUTH || oid == &ext_oid::EKU_ANY
+            }),
+            Err(_) => true,
         }
     }
 
@@ -480,45 +629,48 @@ impl Certificate {
     pub fn get_authority_key_identifier(&self) -> Result<Vec<u8>> {
         let mut decoder = DerDecoder::new(&self.tbs);
         decoder.sequence(|tbs| {
-            let _ = tbs.optional_context_specific(0, |v| v.integer());
+            let _ = tbs.optional_context_specific(0, |v| v.integer_u64())?;
             let _ = tbs.integer()?;
-            let _ = tbs.sequence(|_| Ok(()))?;
-            let _ = tbs.set(|_| Ok(()))?;
-            let _ = tbs.sequence(|_| Ok(()))?;
-            let _ = tbs.set(|_| Ok(()))?;
-            let _ = tbs.sequence(|_| Ok(()))?;
+            let _ = tbs.sequence(|alg| alg.object_identifier())?;
+            let _ = tbs.sequence(|issuer_seq| parse_name(issuer_seq))?;
+            let _ = tbs.sequence(|validity| {
+                validity.read_element()?;
+                validity.read_element()?;
+                Ok(())
+            })?;
+
+            let _ = tbs.sequence(|subject_seq| parse_name(subject_seq))?;
+            let _ = tbs.sequence(|spki| parse_spki(spki))?;
             let result = tbs.optional_context_specific(3, |ext_seq| {
                 ext_seq.sequence(|exts| {
                     while exts.has_more() {
-                        let result = exts.sequence(|ext| {
-                            let oid = ext.object_identifier()?;
-                            let _ = ext.boolean().ok();
+                        if let Ok(found) = exts.sequence(|ext| {
+                            let oid = read_extension_header(ext)?;
                             let value = ext.octet_string()?;
-                            if oid == vec![2, 5, 29, 35] {
-                                let mut val_decoder = DerDecoder::new(&value);
-                                return val_decoder.sequence(|aki_seq| {
-                                    aki_seq.context_specific(0, |key_id| {
-                                        key_id.octet_string()
-                                    })
-                                });
+                            if oid == ext_oid::AUTHORITY_KEY_IDENTIFIER {
+                                let mut aki_decoder = DerDecoder::new(&value);
+                                let key_id = aki_decoder.sequence(|aki_seq| {
+                                    aki_seq.optional_context_specific(0, |key_id| Ok(key_id.data.to_vec()))
+                                })?;
+
+                                return Ok(Some(key_id.unwrap_or_default()));
                             }
-                            
-                            Ok(Vec::new())
-                        })?;
-                        
-                        if !result.is_empty() {
-                            return Ok(result);
+
+                            Ok(None)
+                        }) {
+                            if let Some(key_id) = found {
+                                if !key_id.is_empty() {
+                                    return Ok(key_id);
+                                }
+                            }
                         }
                     }
 
                     Ok(Vec::new())
                 })
-            });
-            
-            match result {
-                Ok(Some(vec)) => Ok(vec),
-                _ => Ok(Vec::new())
-            }
+            })?;
+
+            Ok(result.unwrap_or_default())
         })
     }
     
@@ -533,38 +685,44 @@ impl Certificate {
     pub fn get_subject_key_identifier(&self) -> Result<Vec<u8>> {
         let mut decoder = DerDecoder::new(&self.tbs);
         decoder.sequence(|tbs| {
-            let _ = tbs.optional_context_specific(0, |v| v.integer());
+            let _ = tbs.optional_context_specific(0, |v| v.integer_u64())?;
             let _ = tbs.integer()?;
-            let _ = tbs.sequence(|_| Ok(()))?;
-            let _ = tbs.set(|_| Ok(()))?;
-            let _ = tbs.sequence(|_| Ok(()))?;
-            let _ = tbs.set(|_| Ok(()))?;
-            let _ = tbs.sequence(|_| Ok(()))?;
+            let _ = tbs.sequence(|alg| alg.object_identifier())?;
+            let _ = tbs.sequence(|issuer_seq| parse_name(issuer_seq))?;
+            let _ = tbs.sequence(|validity| {
+                validity.read_element()?;
+                validity.read_element()?;
+                Ok(())
+            })?;
+
+            let _ = tbs.sequence(|subject_seq| parse_name(subject_seq))?;
+            let _ = tbs.sequence(|spki| parse_spki(spki))?;
             let result = tbs.optional_context_specific(3, |ext_seq| {
                 ext_seq.sequence(|exts| {
                     while exts.has_more() {
-                        let result = exts.sequence(|ext| {
-                            let oid = ext.object_identifier()?;
-                            let _ = ext.boolean().ok();
+                        if let Ok(found) = exts.sequence(|ext| {
+                            let oid = read_extension_header(ext)?;
                             let value = ext.octet_string()?;
-                            if oid == vec![2, 5, 29, 14] {
+                            if oid == ext_oid::SUBJECT_KEY_IDENTIFIER {
                                 let mut val_decoder = DerDecoder::new(&value);
-                                return val_decoder.octet_string();
+                                return Ok(Some(val_decoder.octet_string()?));
                             }
-                            
-                            Ok(Vec::new())
-                        })?;
-                        
-                        if !result.is_empty() {
-                            return Ok(result);
+
+                            Ok(None)
+                        }) {
+                            if let Some(key_id) = found {
+                                if !key_id.is_empty() {
+                                    return Ok(key_id);
+                                }
+                            }
                         }
                     }
 
                     Ok(Vec::new())
                 })
             })?;
-            
-            Ok(result.unwrap_or(Vec::new()))
+
+            Ok(result.unwrap_or_default())
         })
     }
     
@@ -579,21 +737,25 @@ impl Certificate {
     pub fn get_key_usage(&self) -> Result<u16> {
         let mut decoder = DerDecoder::new(&self.tbs);
         decoder.sequence(|tbs| {
-            let _ = tbs.optional_context_specific(0, |v| v.integer());
+            let _ = tbs.optional_context_specific(0, |v| v.integer_u64())?;
             let _ = tbs.integer()?;
-            let _ = tbs.sequence(|_| Ok(()))?;
-            let _ = tbs.set(|_| Ok(()))?;
-            let _ = tbs.sequence(|_| Ok(()))?;
-            let _ = tbs.set(|_| Ok(()))?;
-            let _ = tbs.sequence(|_| Ok(()))?;
-            match tbs.optional_context_specific(3, |ext_seq| {
+            let _ = tbs.sequence(|alg| alg.object_identifier())?;
+            let _ = tbs.sequence(|issuer_seq| parse_name(issuer_seq))?;
+            let _ = tbs.sequence(|validity| {
+                validity.read_element()?;
+                validity.read_element()?;
+                Ok(())
+            })?;
+
+            let _ = tbs.sequence(|subject_seq| parse_name(subject_seq))?;
+            let _ = tbs.sequence(|spki| parse_spki(spki))?;
+            let result = tbs.optional_context_specific(3, |ext_seq| {
                 ext_seq.sequence(|exts| {
                     while exts.has_more() {
-                        let result = exts.sequence(|ext| {
-                            let oid = ext.object_identifier()?;
-                            let _ = ext.boolean().ok();
+                        if let Ok(found) = exts.sequence(|ext| {
+                            let oid = read_extension_header(ext)?;
                             let value = ext.octet_string()?;
-                            if oid == vec![2, 5, 29, 15] {
+                            if oid == ext_oid::KEY_USAGE {
                                 let mut val_decoder = DerDecoder::new(&value);
                                 let (bits, _unused) = val_decoder.bit_string()?;
                                 let mut usage: u16 = 0;
@@ -601,25 +763,40 @@ impl Certificate {
                                     usage |= (byte as u16) << (8 * (1 - i));
                                 }
 
+                                return Ok(Some(usage));
+                            }
+
+                            Ok(None)
+                        }) {
+                            if let Some(usage) = found {
                                 return Ok(usage);
                             }
-                            
-                            Ok(0)
-                        })?;
-                        
-                        if result != 0 {
-                            return Ok(result);
                         }
                     }
 
                     Ok(0)
                 })
-            }) {
-                Ok(Some(usage)) => Ok(usage),
-                Ok(None) => Ok(0),
-                Err(e) => Err(e),
-            }
+            })?;
+
+            Ok(result.unwrap_or(0))
         })
+    }
+
+    /**
+     * Checks whether this certificate's KeyUsage extension (if present) asserts keyCertSign
+     * i.e. that the key may be used to verify signatures on other certificates
+     * Args:
+     *    &self: The Certificate instance
+     *
+     * Returns:
+     *    bool: True if KeyUsage is absent, or present with the keyCertSign bit set
+     */
+    pub fn can_sign_certificates(&self) -> bool {
+        match self.get_key_usage() {
+            Ok(0) => true,
+            Ok(usage) => usage & KEY_USAGE_KEY_CERT_SIGN != 0,
+            Err(_) => true,
+        }
     }
 }
 
@@ -640,8 +817,7 @@ fn parse_name(decoder: &mut DerDecoder) -> Result<Name> {
                     let oid = attr.object_identifier()?;
                     let value = attr.read_element()?;
                     if oid == [2, 5, 4, 3] {
-                        let mut val_decoder = DerDecoder::new(&value.data);
-                        common_name = Some(val_decoder.utf8_string().unwrap_or_default());
+                        common_name = Some(String::from_utf8_lossy(&value.data).to_string());
                     }
 
                     Ok(())
@@ -664,8 +840,17 @@ fn parse_name(decoder: &mut DerDecoder) -> Result<Name> {
  *    Result<SubjectPublicKeyInfo>: The parsed SubjectPublicKeyInfo or an error if parsing fails
  */
 fn parse_spki(decoder: &mut DerDecoder) -> Result<SubjectPublicKeyInfo> {
-    let algorithm = decoder.sequence(|alg| alg.object_identifier())?;
-    let param = decoder.optional_context_specific(0, |p| p.octet_string()).ok().flatten();
+    let (algorithm, param) = decoder.sequence(|alg| {
+        let oid = alg.object_identifier()?;
+        let param = if alg.has_more() {
+            Some(alg.read_element()?.data)
+        } else {
+            None
+        };
+
+        Ok((oid, param))
+    })?;
+
     let (public_key, _) = decoder.bit_string()?;
     Ok(SubjectPublicKeyInfo {
         algorithm,
@@ -1009,6 +1194,25 @@ mod tests {
         let name = super::parse_name(&mut decoder);
         assert!(name.is_ok());
         assert!(name.unwrap().common_name.is_none());
+    }
+
+    #[test]
+    fn test_parse_name_common_name_utf8() {
+        // SET { SEQUENCE { OID commonName, UTF8String "example.com" } }
+        let mut rdn = crate::crypto::encoding::asn1::DerEncoder::new();
+        rdn.sequence(|attr| {
+            let _ = attr.object_identifier(&[2, 5, 4, 3]);
+            attr.utf8_string("example.com");
+        });
+        let rdn_bytes = rdn.finish();
+
+        let mut name_bytes = vec![0x31];
+        name_bytes.push(rdn_bytes.len() as u8);
+        name_bytes.extend_from_slice(&rdn_bytes);
+
+        let mut decoder = DerDecoder::new(&name_bytes);
+        let name = super::parse_name(&mut decoder).unwrap();
+        assert_eq!(name.common_name.as_deref(), Some("example.com"));
     }
 
     #[test]
