@@ -9,6 +9,26 @@ use crate::crypto::random;
 use std::cmp::Ordering;
 use std::ops::{Add, Sub, Mul, Div};
 
+pub const DIGEST_INFO_SHA1: [u8; 15] = [
+    0x30, 0x21, 0x30, 0x09, 0x06, 0x05, 0x2b, 0x0e,
+    0x03, 0x02, 0x1a, 0x05, 0x00, 0x04, 0x14,
+];
+pub const DIGEST_INFO_SHA256: [u8; 19] = [
+    0x30, 0x31, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86,
+    0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01, 0x05,
+    0x00, 0x04, 0x20,
+];
+pub const DIGEST_INFO_SHA384: [u8; 19] = [
+    0x30, 0x41, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86,
+    0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x02, 0x05,
+    0x00, 0x04, 0x30,
+];
+pub const DIGEST_INFO_SHA512: [u8; 19] = [
+    0x30, 0x51, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86,
+    0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x03, 0x05,
+    0x00, 0x04, 0x40,
+];
+
 // RSA Key Sizes
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RsaKeySize {
@@ -366,6 +386,41 @@ impl RsaPublicKey {
     }
 
     /**
+     * Verifies a PKCS#1 v1.5 signature over an already-computed digest, against a specific
+     * declared hash algorithm (via its DigestInfo DER prefix - see the `DIGEST_INFO_*`
+     * constants). Unlike `verify` with `RsaPadding::Pkcs1v15`, which always hashes with SHA-256
+     * Args:
+     *    &self: The RsaPublicKey instance
+     *    digest_info - &[u8]: The expected DigestInfo DER prefix for the digest's hash algorithm
+     *    digest - &[u8]: The pre-computed message digest
+     *    signature - &[u8]: The signature to verify
+     *
+     * Returns:
+     *    Result<bool>: True if the signature is valid, false otherwise
+     */
+    pub fn verify_pkcs1v15_digest(&self, digest_info: &[u8], digest: &[u8], signature: &[u8]) -> Result<bool> {
+        if signature.len() != self.size.bytes() {
+            return Ok(false);
+        }
+
+        let s = BigNum::from_bytes_be(signature);
+        if s.cmp(&self.n) != Ordering::Less {
+            return Ok(false);
+        }
+
+        let m = s.mod_exp_montgomery(&self.e, &self.n)?;
+        let mut m_bytes = m.to_bytes_be();
+        let target_len = self.size.bytes();
+        if m_bytes.len() < target_len {
+            let mut padded = vec![0u8; target_len - m_bytes.len()];
+            padded.extend_from_slice(&m_bytes);
+            m_bytes = padded;
+        }
+
+        verify_pkcs1v15_encoded(&m_bytes, digest_info, digest)
+    }
+
+    /**
      * Converts the RSA public key to its components for serialization
      * Args:
      *    &self: The RsaPublicKey instance
@@ -406,39 +461,27 @@ impl RsaPublicKey {
      *    Result<Self>: The constructed RsaPublicKey or an error if construction fails
      */
     pub fn from_bytes(der: &[u8]) -> Result<Self> {
-        let mut index = 0;
-        if der[index] != 0x30 {
-            return Err(Error::CryptoError("Invalid DER format".to_string()));
-        }
+        use crate::crypto::encoding::asn1::DerDecoder;
 
-        index += 1;
-        let _len = der[index] as usize;
-        index += 1;
-        if der[index] != 0x02 {
-            return Err(Error::CryptoError("Invalid DER format".to_string()));
-        }
+        let mut decoder = DerDecoder::new(der);
+        let (n_bytes, e_bytes) = decoder.sequence(|seq| {
+                let n = seq.integer()?;
+                let e = seq.integer()?;
+                Ok((n, e))
+            }).map_err(|_| Error::CryptoError("Invalid DER format".to_string()))?;
 
-        index += 1;
-        let n_len = der[index] as usize;
-        index += 1;
-        let n_bytes = &der[index..index + n_len];
-        index += n_len;
-        if der[index] != 0x02 {
-            return Err(Error::CryptoError("Invalid DER format".to_string()));
-        }
-        
-        index += 1;
-        let e_len = der[index] as usize;
-        index += 1;
-        let e_bytes = &der[index..index + e_len];
-
-        let n = BigNum::from_bytes_be(n_bytes);
-        let e = BigNum::from_bytes_be(e_bytes);
+        let n = BigNum::from_bytes_be(&n_bytes);
+        let e = BigNum::from_bytes_be(&e_bytes);
         let size = match n.bit_length() {
             2048 => RsaKeySize::Rsa2048,
             3072 => RsaKeySize::Rsa3072,
             4096 => RsaKeySize::Rsa4096,
-            _ => return Err(Error::CryptoError("Unsupported RSA key size".to_string())),
+            _ => match n_bytes.len() {
+                0..=256 => RsaKeySize::Rsa2048,
+                257..=384 => RsaKeySize::Rsa3072,
+                385..=512 => RsaKeySize::Rsa4096,
+                _ => return Err(Error::CryptoError("Unsupported RSA key size".to_string())),
+            },
         };
 
         Ok(Self { n, e, size })
@@ -453,20 +496,18 @@ impl RsaPublicKey {
      *    Vec<u8>: The DER-encoded public key bytes
      */
     pub fn to_der(&self) -> Vec<u8> {
+        use crate::crypto::encoding::asn1::DerEncoder;
+
         let n_bytes = self.n.to_bytes_be();
         let e_bytes = self.e.to_bytes_be();
-        
-        let mut der = Vec::new();
-        der.push(0x30);
-        der.push((2 + n_bytes.len() + 2 + e_bytes.len()) as u8);
-        der.push(0x02);
-        der.push(n_bytes.len() as u8);
-        der.extend_from_slice(&n_bytes);
-        der.push(0x02);
-        der.push(e_bytes.len() as u8);
-        der.extend_from_slice(&e_bytes);
-        
-        der
+
+        let mut encoder = DerEncoder::new();
+        encoder.sequence(|seq| {
+            seq.integer(&n_bytes);
+            seq.integer(&e_bytes);
+        });
+
+        encoder.finish()
     }
 
     /**
@@ -1164,13 +1205,7 @@ fn unpad_pkcs1v15(data: &[u8], is_sign: bool) -> Result<Vec<u8>> {
  * Returns:
  *    Result<Vec<u8>>: The padded hash or an error if padding fails
  */
-fn pad_pkcs1v15_sign(hash: &[u8], key_size: usize) -> Result<Vec<u8>> {
-    let digest_info = [
-        0x30, 0x31, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86,
-        0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01, 0x05,
-        0x00, 0x04, 0x20,
-    ];
-    
+fn pad_pkcs1v15_encoded(digest_info: &[u8], hash: &[u8], key_size: usize) -> Result<Vec<u8>> {
     let t_len = digest_info.len() + hash.len();
     if t_len > key_size - 11 {
         return Err(Error::CryptoError("Hash too long for key size".to_string()));
@@ -1183,30 +1218,39 @@ fn pad_pkcs1v15_sign(hash: &[u8], key_size: usize) -> Result<Vec<u8>> {
     for i in 0..ps_len {
         padded[2 + i] = 0xff;
     }
-    
+
     padded[2 + ps_len] = 0x00;
-    padded[3 + ps_len..3 + ps_len + digest_info.len()].copy_from_slice(&digest_info);
+    padded[3 + ps_len..3 + ps_len + digest_info.len()].copy_from_slice(digest_info);
     padded[3 + ps_len + digest_info.len()..].copy_from_slice(hash);
-    
+
     Ok(padded)
 }
 
 /**
- * Verifies a PKCS#1 v1.5 signed hash
+ * Pads a SHA-256 hash using PKCS#1 v1.5 for signing
+ * Args:
+ *    hash - &[u8]: The SHA-256 hash to pad
+ *    key_size - usize: The RSA key size in bytes
+ * 
+ * Returns:
+ *    Result<Vec<u8>>: The padded hash or an error if padding fails
+ */
+fn pad_pkcs1v15_sign(hash: &[u8], key_size: usize) -> Result<Vec<u8>> {
+    pad_pkcs1v15_encoded(&DIGEST_INFO_SHA256, hash, key_size)
+}
+
+/**
+ * Verifies a PKCS#1 v1.5 signed hash against a specific DigestInfo prefix, i.e. a specific
+ * declared hash algorithm - unlike `RsaPadding::Pkcs1v15`, which always assumes SHA-256.
  * Args:
  *    padded - &[u8]: The padded signature
+ *    digest_info - &[u8]: The expected DigestInfo DER prefix (see `DIGEST_INFO_*` constants)
  *    hash - &[u8]: The original hash
  * 
  * Returns:
  *    Result<bool>: True if the signature is valid, false otherwise
  */
-fn verify_pkcs1v15_sign(padded: &[u8], hash: &[u8]) -> Result<bool> {
-    let digest_info = [
-        0x30, 0x31, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86,
-        0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01, 0x05,
-        0x00, 0x04, 0x20,
-    ];
-    
+fn verify_pkcs1v15_encoded(padded: &[u8], digest_info: &[u8], hash: &[u8]) -> Result<bool> {
     if padded.len() < digest_info.len() + hash.len() + 11 {
         return Ok(false);
     }
@@ -1239,8 +1283,20 @@ fn verify_pkcs1v15_sign(padded: &[u8], hash: &[u8]) -> Result<bool> {
         return Ok(false);
     }
     
-    Ok(&padded[start..start + digest_info.len()] == &digest_info[..]
-        && &padded[start + digest_info.len()..] == hash)
+    Ok(&padded[start..start + digest_info.len()] == digest_info && &padded[start + digest_info.len()..] == hash)
+}
+
+/**
+ * Verifies a PKCS#1 v1.5 signed SHA-256 hash
+ * Args:
+ *    padded - &[u8]: The padded signature
+ *    hash - &[u8]: The original SHA-256 hash
+ * 
+ * Returns:
+ *    Result<bool>: True if the signature is valid, false otherwise
+ */
+fn verify_pkcs1v15_sign(padded: &[u8], hash: &[u8]) -> Result<bool> {
+    verify_pkcs1v15_encoded(padded, &DIGEST_INFO_SHA256, hash)
 }
 
 /**
@@ -1510,6 +1566,24 @@ fn big_num_to_fixed_bytes(num: &BigNum, length: usize) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_public_key_der_roundtrip_2048() {
+        let key = RsaPrivateKey::generate(RsaKeySize::Rsa2048).unwrap();
+        let public = key.public_key();
+        let der = public.to_der();
+
+        assert!(der.len() > 128, "2048-bit key DER should exceed a single-byte length ({})", der.len());
+
+        let parsed = RsaPublicKey::from_bytes(&der).expect("should parse a real 2048-bit key");
+        assert_eq!(parsed.n, public.n);
+        assert_eq!(parsed.e, public.e);
+        assert_eq!(parsed.size, public.size);
+
+        let message = b"round-trip verification message";
+        let signature = key.sign(message, RsaPadding::Pkcs1v15).unwrap();
+        assert!(parsed.verify(message, &signature, RsaPadding::Pkcs1v15).unwrap());
+    }
 
     #[test]
     fn stress_test_rsa_pss_sign_verify() {

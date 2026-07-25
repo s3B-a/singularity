@@ -8,6 +8,7 @@ use crate::crypto::symmetric::chacha20::ChaCha20Poly1305;
 use crate::crypto::symmetric::gcm::GcmOptimized;
 use crate::net::http::compression::{self, CompressionAlgorithm, CompressionLevel};
 use crate::net::http::http2::alpn::{AlpnNegotiator, AlpnProtocol};
+use crate::net::https::trust_store::TrustStore;
 use crate::net::tcp::TcpStream;
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -72,7 +73,7 @@ pub struct TlsCfg {
     pub min_version: TlsVersion,
     pub max_version: TlsVersion,
     pub verify_peer: bool,
-    pub ca_certs: Vec<x509::Certificate>,
+    pub trust_store: TrustStore,
     pub session_cache: Option<SessionCache>,
     pub enable_session_resumption: bool,
     pub record_security: TlsRecordSecurityCfg,
@@ -1006,7 +1007,7 @@ impl TlsStream {
         Err(TlsError::NoSharedCipher)
     }
 
-    fn verify_certificate(&self, cert_msg: &[u8]) -> Result<(), TlsError> {
+    fn parse_certificate_chain(&self, cert_msg: &[u8]) -> Result<Vec<x509::Certificate>, TlsError> {
         if cert_msg.len() < 10 {
             return Err(TlsError::InvalidCertificate(
                 "Certificate message too short".to_string(),
@@ -1025,36 +1026,173 @@ impl TlsStream {
             | (cert_msg[pos + 2] as usize);
         
         pos += 3;
-        if cert_list_len == 0 || pos + 3 > cert_msg.len() {
+        if cert_list_len == 0 || pos + cert_list_len > cert_msg.len() {
             return Err(TlsError::InvalidCertificate(
                 "Certificate list truncated".to_string(),
             ));
         }
 
-        let cert_len = ((cert_msg[pos] as usize) << 16)
-            | ((cert_msg[pos + 1] as usize) << 8)
-            | (cert_msg[pos + 2] as usize);
-        
-        pos += 3;
-        if pos + cert_len > cert_msg.len() {
+        let list_end = pos + cert_list_len;
+        let mut chain = Vec::new();
+        while pos + 3 <= list_end {
+            let cert_len = ((cert_msg[pos] as usize) << 16)
+                | ((cert_msg[pos + 1] as usize) << 8)
+                | (cert_msg[pos + 2] as usize);
+
+            pos += 3;
+            if pos + cert_len > list_end {
+                return Err(TlsError::InvalidCertificate(
+                    "Certificate data truncated".to_string(),
+                ));
+            }
+
+            let cert_der = &cert_msg[pos..pos + cert_len];
+            let cert = x509::Certificate::from_der(cert_der).map_err(|e| {
+                TlsError::InvalidCertificate(format!("Failed to parse certificate: {:?}", e))
+            })?;
+
+            pos += cert_len;
+            if pos + 2 > list_end {
+                return Err(TlsError::InvalidCertificate(
+                    "Certificate entry missing extensions length".to_string(),
+                ));
+            }
+
+            let ext_len = u16::from_be_bytes([cert_msg[pos], cert_msg[pos + 1]]) as usize;
+            pos += 2;
+            if pos + ext_len > list_end {
+                return Err(TlsError::InvalidCertificate(
+                    "Certificate entry extensions truncated".to_string(),
+                ));
+            }
+
+            pos += ext_len;
+            chain.push(cert);
+        }
+
+        if chain.is_empty() {
             return Err(TlsError::InvalidCertificate(
-                "Certificate data truncated".to_string(),
+                "Certificate chain is empty".to_string(),
             ));
         }
-        
-        let cert_der = &cert_msg[pos..pos + cert_len];
-        let cert = x509::Certificate::from_der(cert_der).map_err(|e| {
-            TlsError::InvalidCertificate(format!("Failed to parse certificate: {:?}", e))
+
+        Ok(chain)
+    }
+
+    fn validate_certificate_chain(&self, chain: &[x509::Certificate]) -> Result<(), TlsError> {
+        if self.config.trust_store.is_empty() {
+            return Err(TlsError::VerificationFailed(
+                "No trust anchors configured; cannot verify certificate chain".to_string(),
+            ));
+        }
+
+        for cert in chain {
+            if !cert.is_valid_at_current_time() {
+                return Err(TlsError::InvalidCertificate(
+                    "Certificate in chain is expired or not yet valid".to_string(),
+                ));
+            }
+        }
+
+        if !chain[0].allows_server_auth() {
+            return Err(TlsError::VerificationFailed(
+                "Leaf certificate's extended key usage does not permit TLS server authentication"
+                    .to_string(),
+            ));
+        }
+
+        for i in 0..chain.len() - 1 {
+            let subject = &chain[i];
+            let issuer = &chain[i + 1];
+            if subject.issuer_raw() != issuer.subject_raw() {
+                return Err(TlsError::VerificationFailed(
+                    "Certificate chain name mismatch: issuer/subject do not chain".to_string(),
+                ));
+            }
+
+            subject.verify_signature(issuer).map_err(|_| {
+                TlsError::VerificationFailed(
+                    "Certificate chain signature verification failed".to_string(),
+                )
+            })?;
+
+            let (is_ca, path_len) = issuer.get_basic_constraints().map_err(|e| {
+                TlsError::InvalidCertificate(format!("Failed to read basicConstraints: {:?}", e))
+            })?;
+
+            if !is_ca {
+                return Err(TlsError::VerificationFailed(
+                    "Certificate chain contains a non-CA certificate acting as an issuer"
+                        .to_string(),
+                ));
+            }
+
+            if !issuer.can_sign_certificates() {
+                return Err(TlsError::VerificationFailed(
+                    "Issuer certificate's key usage does not permit certificate signing"
+                        .to_string(),
+                ));
+            }
+
+            if let Some(max_intermediates) = path_len {
+                if (i as u32) > max_intermediates {
+                    return Err(TlsError::VerificationFailed(
+                        "Certificate chain exceeds issuer's path length constraint".to_string(),
+                    ));
+                }
+            }
+        }
+
+        let top = chain.last().ok_or_else(|| {
+            TlsError::VerificationFailed("Certificate chain is empty".to_string())
         })?;
 
-        if !cert.is_valid_at_current_time() {
+        if self.config.trust_store.contains_exact(top) {
+            return Ok(());
+        }
+
+        let anchor = self.config.trust_store.find_issuer(top).ok_or_else(|| {
+            TlsError::VerificationFailed(
+                "Certificate chain does not terminate at a trusted root".to_string(),
+            )
+        })?;
+
+        if !anchor.is_valid_at_current_time() {
+            return Err(TlsError::InvalidCertificate(
+                "Trust anchor certificate is expired or not yet valid".to_string(),
+            ));
+        }
+
+        top.verify_signature(anchor).map_err(|_| {
+            TlsError::VerificationFailed(
+                "Certificate chain signature verification against trust anchor failed"
+                    .to_string(),
+            )
+        })?;
+
+        if let (true, Some(max_intermediates)) = anchor.get_basic_constraints().unwrap_or((true, None)) {
+            let total_intermediates = (chain.len() - 1) as u32;
+            if total_intermediates > max_intermediates {
+                return Err(TlsError::VerificationFailed(
+                    "Certificate chain exceeds trust anchor's path length constraint".to_string(),
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
+    fn verify_certificate(&self, cert_msg: &[u8]) -> Result<(), TlsError> {
+        let chain = self.parse_certificate_chain(cert_msg)?;
+        let leaf = &chain[0];
+        if !leaf.is_valid_at_current_time() {
             return Err(TlsError::InvalidCertificate(
                 "Certificate expired or not yet valid".to_string(),
             ));
         }
 
         if let Some(server_name) = &self.server_name {
-            if !server_name.is_empty() && !cert.matches_hostname(server_name) {
+            if !server_name.is_empty() && !leaf.matches_hostname(server_name) {
                 return Err(TlsError::InvalidCertificate(format!(
                     "Certificate hostname mismatch: expected {}",
                     server_name
@@ -1062,15 +1200,10 @@ impl TlsStream {
             }
         }
 
-        if self.config.verify_peer && !self.config.ca_certs.is_empty() {
-            let verified = self.config.ca_certs.iter().any(|ca| cert.verify_signature(ca).is_ok());
-            if !verified {
-                return Err(TlsError::VerificationFailed(
-                    "Certificate chain verification failed".to_string(),
-                ));
-            }
+        if self.config.verify_peer {
+            self.validate_certificate_chain(&chain)?;
         }
-        
+
         Ok(())
     }
 
@@ -1993,8 +2126,8 @@ impl Default for TlsCfg {
             ],
             min_version: TlsVersion::Tls1_2,
             max_version: TlsVersion::Tls1_3,
-            verify_peer: false,
-            ca_certs: vec![],
+            verify_peer: true,
+            trust_store: TrustStore::bundled(),
             session_cache: Some(SessionCache::new()),
             enable_session_resumption: true,
             record_security: TlsRecordSecurityCfg::default(),
@@ -2158,12 +2291,384 @@ mod tls_tests {
         }
     }
 
+    fn test_tls_stream_with_config(config: TlsCfg, server_name: Option<String>) -> TlsStream {
+        let (addr, _rx) = start_test_server();
+        let stream = TcpStream::connect(&addr).expect("Failed to connect");
+
+        TlsStream {
+            stream,
+            config,
+            state: ConnectionState::Initial,
+            version: TlsVersion::Tls1_3,
+            cipher_suite: 0,
+            keys: None,
+            handshake_msg: Vec::new(),
+            client_seq: 0,
+            server_seq: 0,
+            is_client: true,
+            buffer: Vec::new(),
+            server_name,
+            session_id: Vec::new(),
+            resuming_session: false,
+            alpn_negotiator: AlpnNegotiator::new(),
+            negotiated_protocol: None,
+            negotiated_record_compression: CompressionAlgorithm::Identity,
+        }
+    }
+
+    fn encode_test_name(seq: &mut crate::crypto::encoding::asn1::DerEncoder, cn: &str) {
+        use crate::crypto::encoding::asn1::DerEncoder;
+
+        let mut rdn = DerEncoder::new();
+        rdn.sequence(|attr| {
+            let _ = attr.object_identifier(&[2, 5, 4, 3]);
+            attr.utf8_string(cn);
+        });
+
+        let rdn_bytes = rdn.finish();
+        seq.write_tag(0x31, true);
+        seq.write_length(rdn_bytes.len());
+        seq.raw(&rdn_bytes);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_test_tbs(subject_cn: &str, issuer_cn: &str, public_key_der: &[u8], is_ca: bool, path_len: Option<u32>, key_usage_cert_sign: bool, eku_oids: &[&[u64]]) -> Vec<u8> {
+        use crate::crypto::encoding::asn1::DerEncoder;
+
+        let mut tbs = DerEncoder::new();
+        tbs.sequence(|s| {
+            s.context_specific(0, |v| {
+                v.integer_u64(2);
+            });
+
+            s.integer(&[1]);
+            s.sequence(|alg| {
+                let _ = alg.object_identifier(&[1, 2, 840, 113549, 1, 1, 11]);
+                alg.null();
+            });
+
+            s.sequence(|iss| encode_test_name(iss, issuer_cn));
+            s.sequence(|validity| {
+                validity.utc_time("240101000000Z");
+                validity.utc_time("340101000000Z");
+            });
+
+            s.sequence(|subj| encode_test_name(subj, subject_cn));
+            s.sequence(|spki| {
+                spki.sequence(|alg| {
+                    let _ = alg.object_identifier(&[1, 2, 840, 113549, 1, 1, 1]);
+                    alg.null();
+                });
+
+                spki.bit_string(public_key_der, 0);
+            });
+
+            s.context_specific(3, |ext_outer| {
+                ext_outer.sequence(|exts| {
+                    exts.sequence(|ext| {
+                        let _ = ext.object_identifier(&[2, 5, 29, 19]);
+                        ext.boolean(true);
+                        let mut bc = DerEncoder::new();
+                        bc.sequence(|bc_seq| {
+                            if is_ca {
+                                bc_seq.boolean(true);
+                            }
+
+                            if let Some(pl) = path_len {
+                                bc_seq.integer_u64(pl as u64);
+                            }
+                        });
+
+                        ext.octet_string(&bc.finish());
+                    });
+
+                    exts.sequence(|ext| {
+                        let _ = ext.object_identifier(&[2, 5, 29, 15]);
+                        ext.boolean(true);
+                        let mut ku = DerEncoder::new();
+                        let byte0: u8 = if key_usage_cert_sign { 0x04 } else { 0x80 };
+                        ku.bit_string(&[byte0], 0);
+                        ext.octet_string(&ku.finish());
+                    });
+
+                    if !eku_oids.is_empty() {
+                        exts.sequence(|ext| {
+                            let _ = ext.object_identifier(&[2, 5, 29, 37]);
+                            let mut eku = DerEncoder::new();
+                            eku.sequence(|eku_seq| {
+                                for oid in eku_oids {
+                                    let _ = eku_seq.object_identifier(oid);
+                                }
+                            });
+
+                            ext.octet_string(&eku.finish());
+                        });
+                    }
+                });
+            });
+        });
+
+        tbs.finish()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_test_cert(subject_cn: &str, issuer_cn: &str, subject_key: &rsa::RsaPublicKey, signing_key: &rsa::RsaPrivateKey, is_ca: bool, path_len: Option<u32>, key_usage_cert_sign: bool, eku_oids: &[&[u64]]) -> x509::Certificate {
+        let subject_key_der = subject_key.to_der();
+        let tbs = build_test_tbs(
+            subject_cn,
+            issuer_cn,
+            &subject_key_der,
+            is_ca,
+            path_len,
+            key_usage_cert_sign,
+            eku_oids,
+        );
+
+        let signature = signing_key.sign(&tbs, rsa::RsaPadding::Pkcs1v15).unwrap();
+
+        x509::Certificate {
+            tbs,
+            signature_algorithm: vec![1, 2, 840, 113549, 1, 1, 11],
+            signature,
+            subject: x509::Name { common_name: Some(subject_cn.to_string()) },
+            issuer: x509::Name { common_name: Some(issuer_cn.to_string()) },
+            subject_public_key_info: x509::SubjectPublicKeyInfo {
+                algorithm: vec![1, 2, 840, 113549, 1, 1, 1],
+                param: None,
+                public_key: subject_key_der,
+            },
+        }
+    }
+
+    const EKU_SERVER_AUTH: &[u64] = &[1, 3, 6, 1, 5, 5, 7, 3, 1];
+    const EKU_CODE_SIGNING: &[u64] = &[1, 3, 6, 1, 5, 5, 7, 3, 3];
+
+    #[test]
+    fn test_validate_certificate_chain_success() {
+        let root_key = rsa::RsaPrivateKey::generate(rsa::RsaKeySize::Rsa2048).unwrap();
+        let leaf_key = rsa::RsaPrivateKey::generate(rsa::RsaKeySize::Rsa2048).unwrap();
+
+        let root = build_test_cert(
+            "Test Root CA", "Test Root CA", &root_key.public_key(), &root_key,
+            true, None, true, &[],
+        );
+
+        let leaf = build_test_cert(
+            "example.com", "Test Root CA", &leaf_key.public_key(), &root_key,
+            false, None, false, &[EKU_SERVER_AUTH],
+        );
+
+        let mut trust_store = TrustStore::empty();
+        trust_store.add_cert(root.clone());
+
+        let mut config = TlsCfg::default();
+        config.verify_peer = true;
+        config.trust_store = trust_store;
+
+        let tls = test_tls_stream_with_config(config, Some("example.com".to_string()));
+        assert!(tls.validate_certificate_chain(&[leaf, root]).is_ok());
+    }
+
+    #[test]
+    fn test_validate_certificate_chain_intermediate_success() {
+        let root_key = rsa::RsaPrivateKey::generate(rsa::RsaKeySize::Rsa2048).unwrap();
+        let intermediate_key = rsa::RsaPrivateKey::generate(rsa::RsaKeySize::Rsa2048).unwrap();
+        let leaf_key = rsa::RsaPrivateKey::generate(rsa::RsaKeySize::Rsa2048).unwrap();
+
+        let root = build_test_cert(
+            "Test Root CA", "Test Root CA", &root_key.public_key(), &root_key,
+            true, None, true, &[],
+        );
+
+        let intermediate = build_test_cert(
+            "Test Intermediate CA", "Test Root CA", &intermediate_key.public_key(), &root_key,
+            true, Some(0), true, &[],
+        );
+
+        let leaf = build_test_cert(
+            "example.com", "Test Intermediate CA", &leaf_key.public_key(), &intermediate_key,
+            false, None, false, &[EKU_SERVER_AUTH],
+        );
+
+        let mut trust_store = TrustStore::empty();
+        trust_store.add_cert(root.clone());
+
+        let mut config = TlsCfg::default();
+        config.verify_peer = true;
+        config.trust_store = trust_store;
+
+        let tls = test_tls_stream_with_config(config, Some("example.com".to_string()));
+        assert!(tls.validate_certificate_chain(&[leaf, intermediate, root]).is_ok());
+    }
+
+    #[test]
+    fn test_validate_certificate_chain_fails_with_empty_trust_store() {
+        let root_key = rsa::RsaPrivateKey::generate(rsa::RsaKeySize::Rsa2048).unwrap();
+        let root = build_test_cert(
+            "Test Root CA", "Test Root CA", &root_key.public_key(), &root_key,
+            true, None, true, &[],
+        );
+
+        let config = TlsCfg { verify_peer: true, trust_store: TrustStore::empty(), ..TlsCfg::default() };
+        let tls = test_tls_stream_with_config(config, Some("example.com".to_string()));
+        assert!(tls.validate_certificate_chain(&[root]).is_err());
+    }
+
+    #[test]
+    fn test_validate_certificate_chain_fails_on_wrong_signer() {
+        let root_key = rsa::RsaPrivateKey::generate(rsa::RsaKeySize::Rsa2048).unwrap();
+        let other_key = rsa::RsaPrivateKey::generate(rsa::RsaKeySize::Rsa2048).unwrap();
+        let leaf_key = rsa::RsaPrivateKey::generate(rsa::RsaKeySize::Rsa2048).unwrap();
+
+        let root = build_test_cert(
+            "Test Root CA", "Test Root CA", &root_key.public_key(), &root_key,
+            true, None, true, &[],
+        );
+
+        let leaf = build_test_cert(
+            "example.com", "Test Root CA", &leaf_key.public_key(), &other_key,
+            false, None, false, &[EKU_SERVER_AUTH],
+        );
+
+        let mut trust_store = TrustStore::empty();
+        trust_store.add_cert(root.clone());
+
+        let config = TlsCfg { verify_peer: true, trust_store, ..TlsCfg::default() };
+        let tls = test_tls_stream_with_config(config, Some("example.com".to_string()));
+        assert!(tls.validate_certificate_chain(&[leaf, root]).is_err());
+    }
+
+    #[test]
+    fn test_validate_certificate_chain_fails_when_issuer_not_ca() {
+        let root_key = rsa::RsaPrivateKey::generate(rsa::RsaKeySize::Rsa2048).unwrap();
+        let leaf_key = rsa::RsaPrivateKey::generate(rsa::RsaKeySize::Rsa2048).unwrap();
+
+        let root = build_test_cert(
+            "Test Root CA", "Test Root CA", &root_key.public_key(), &root_key,
+            false, None, true, &[],
+        );
+
+        let leaf = build_test_cert(
+            "example.com", "Test Root CA", &leaf_key.public_key(), &root_key,
+            false, None, false, &[EKU_SERVER_AUTH],
+        );
+
+        let mut trust_store = TrustStore::empty();
+        trust_store.add_cert(root.clone());
+
+        let config = TlsCfg { verify_peer: true, trust_store, ..TlsCfg::default() };
+        let tls = test_tls_stream_with_config(config, Some("example.com".to_string()));
+        assert!(tls.validate_certificate_chain(&[leaf, root]).is_err());
+    }
+
+    #[test]
+    fn test_validate_certificate_chain_fails_on_eku_mismatch() {
+        let root_key = rsa::RsaPrivateKey::generate(rsa::RsaKeySize::Rsa2048).unwrap();
+        let leaf_key = rsa::RsaPrivateKey::generate(rsa::RsaKeySize::Rsa2048).unwrap();
+
+        let root = build_test_cert(
+            "Test Root CA", "Test Root CA", &root_key.public_key(), &root_key,
+            true, None, true, &[],
+        );
+
+        let leaf = build_test_cert(
+            "example.com", "Test Root CA", &leaf_key.public_key(), &root_key,
+            false, None, false, &[EKU_CODE_SIGNING],
+        );
+
+        let mut trust_store = TrustStore::empty();
+        trust_store.add_cert(root.clone());
+
+        let config = TlsCfg { verify_peer: true, trust_store, ..TlsCfg::default() };
+        let tls = test_tls_stream_with_config(config, Some("example.com".to_string()));
+        assert!(tls.validate_certificate_chain(&[leaf, root]).is_err());
+    }
+
+    #[test]
+    fn test_validate_certificate_chain_fails_on_path_len_violation() {
+        let root_key = rsa::RsaPrivateKey::generate(rsa::RsaKeySize::Rsa2048).unwrap();
+        let intermediate_key = rsa::RsaPrivateKey::generate(rsa::RsaKeySize::Rsa2048).unwrap();
+        let leaf_key = rsa::RsaPrivateKey::generate(rsa::RsaKeySize::Rsa2048).unwrap();
+
+        let root = build_test_cert(
+            "Test Root CA", "Test Root CA", &root_key.public_key(), &root_key,
+            true, None, true, &[],
+        );
+
+        let intermediate = build_test_cert(
+            "Test Intermediate CA", "Test Root CA", &intermediate_key.public_key(), &root_key,
+            true, Some(0), true, &[],
+        );
+
+        let sub_intermediate_key = rsa::RsaPrivateKey::generate(rsa::RsaKeySize::Rsa2048).unwrap();
+        let sub_intermediate = build_test_cert(
+            "Test Sub Intermediate CA", "Test Intermediate CA", &sub_intermediate_key.public_key(), &intermediate_key,
+            true, None, true, &[],
+        );
+
+        let leaf = build_test_cert(
+            "example.com", "Test Sub Intermediate CA", &leaf_key.public_key(), &sub_intermediate_key,
+            false, None, false, &[EKU_SERVER_AUTH],
+        );
+
+        let mut trust_store = TrustStore::empty();
+        trust_store.add_cert(root.clone());
+
+        let config = TlsCfg { verify_peer: true, trust_store, ..TlsCfg::default() };
+        let tls = test_tls_stream_with_config(config, Some("example.com".to_string()));
+        assert!(tls.validate_certificate_chain(&[leaf, sub_intermediate, intermediate, root]).is_err());
+    }
+
+    #[test]
+    fn test_verify_certificate_end_to_end_via_certificate_message() {
+        let root_key = rsa::RsaPrivateKey::generate(rsa::RsaKeySize::Rsa2048).unwrap();
+        let leaf_key = rsa::RsaPrivateKey::generate(rsa::RsaKeySize::Rsa2048).unwrap();
+
+        let root = build_test_cert(
+            "Test Root CA", "Test Root CA", &root_key.public_key(), &root_key,
+            true, None, true, &[],
+        );
+
+        let leaf = build_test_cert(
+            "example.com", "Test Root CA", &leaf_key.public_key(), &root_key,
+            false, None, false, &[EKU_SERVER_AUTH],
+        );
+
+        let mut trust_store = TrustStore::empty();
+        trust_store.add_cert(root.clone());
+
+        let config = TlsCfg { verify_peer: true, trust_store, ..TlsCfg::default() };
+        let tls = test_tls_stream_with_config(config, Some("example.com".to_string()));
+
+        let mut cert_msg = vec![0u8];
+        let mut cert_list = Vec::new();
+        for cert in [&leaf, &root] {
+            let der = cert.to_der();
+            let len = der.len() as u32;
+            cert_list.push(((len >> 16) & 0xff) as u8);
+            cert_list.push(((len >> 8) & 0xff) as u8);
+            cert_list.push((len & 0xff) as u8);
+            cert_list.extend_from_slice(&der);
+            cert_list.extend_from_slice(&0u16.to_be_bytes());
+        }
+
+        let list_len = cert_list.len() as u32;
+        cert_msg.push(((list_len >> 16) & 0xff) as u8);
+        cert_msg.push(((list_len >> 8) & 0xff) as u8);
+        cert_msg.push((list_len & 0xff) as u8);
+        cert_msg.extend_from_slice(&cert_list);
+
+        let result = tls.verify_certificate(&cert_msg);
+        assert!(result.is_ok(), "verify_certificate failed: {:?}", result);
+    }
+
     #[test]
     fn test_tls_config_default() {
         let cfg = TlsCfg::default();
         assert_eq!(cfg.min_version, TlsVersion::Tls1_2);
         assert_eq!(cfg.max_version, TlsVersion::Tls1_3);
-        assert!(!cfg.verify_peer);
+        assert!(cfg.verify_peer);
+        assert!(!cfg.trust_store.is_empty());
         assert_eq!(cfg.supported_ciphers.len(), 3);
         assert!(cfg.record_compression.enabled);
         assert!(cfg.record_security.enable_integrity);
