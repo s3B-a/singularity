@@ -191,7 +191,7 @@ impl RsaPrivateKey {
             return Err(Error::CryptoError("Ciphertext too large".to_string()));
         }
 
-        let m = rsa_decrypt_crt(&c, &self.p, &self.q, &self.dp, &self.dq, &self.qinv, &self.n)?;
+        let m = rsa_decrypt_crt(&c, &self.p, &self.q, &self.dp, &self.dq, &self.qinv, &self.n, &self.e)?;
         let key_size = self.size.bytes();
         let m_bytes = big_num_to_fixed_bytes(&m, key_size);
         
@@ -241,7 +241,7 @@ impl RsaPrivateKey {
         };
         
         let m = BigNum::from_bytes_be(&padded);
-        let s = rsa_decrypt_crt(&m, &self.p, &self.q, &self.dp, &self.dq, &self.qinv, &self.n)?;
+        let s = rsa_decrypt_crt(&m, &self.p, &self.q, &self.dp, &self.dq, &self.qinv, &self.n, &self.e)?;
         
         let mut s_bytes = s.to_bytes_be();
         let target_len = self.size.bytes();
@@ -1097,27 +1097,37 @@ fn random_range(min: &BigNum, max: &BigNum) -> Result<BigNum> {
  *    dq - &BigNum: d mod (q-1)
  *    qinv - &BigNum: q^(-1) mod p
  *    n - &BigNum: The modulus n
+ *    e - &BigNum: The public exponent, used to compute the RSA blinding factor
  * 
  * Returns:
  *    Result<BigNum>: The decrypted plaintext or an error if decryption fails
  */
-fn rsa_decrypt_crt(c: &BigNum, p: &BigNum, q: &BigNum, dp: &BigNum, dq: &BigNum, qinv: &BigNum, n: &BigNum) -> Result<BigNum> {
-    let m1 = c.mod_exp_montgomery(dp, p)?;
-    let m2 = c.mod_exp_montgomery(dq, q)?;
+fn rsa_decrypt_crt(c: &BigNum, p: &BigNum, q: &BigNum, dp: &BigNum, dq: &BigNum, qinv: &BigNum, n: &BigNum, e: &BigNum) -> Result<BigNum> {
+    let (r, r_inv) = loop {
+        let candidate = random_range(&BigNum::from_u64(2), n)?;
+        if let Ok(inv) = candidate.mod_inverse(n) {
+            break (candidate, inv);
+        }
+    };
+
+    let r_e = r.mod_exp_montgomery(e, n)?;
+    let c_blinded = (c * &r_e).modulo(n);
+    let m1 = c_blinded.mod_exp_montgomery_secure(dp, p, p.bit_length())?;
+    let m2 = c_blinded.mod_exp_montgomery_secure(dq, q, q.bit_length())?;
     let m2_mod_p = m2.modulo(p);
     let diff = if m1 >= m2_mod_p {
         &m1 - &m2_mod_p
     } else {
         p + &m1 - &m2_mod_p
     };
+
     let h = (&diff * qinv).modulo(p);
-    let mut m = &m2 + &(&h * q);
-    
-    if m >= *n {
-        m = &m - n;
+    let mut m_blinded = &m2 + &(&h * q);
+    if m_blinded >= *n {
+        m_blinded = &m_blinded - n;
     }
-    
-    Ok(m)
+
+    Ok((&m_blinded * &r_inv).modulo(n))
 }
 
 /**
@@ -1610,7 +1620,7 @@ mod tests {
                 let padded = pad_oaep_sha256(&msg, key.size.bytes()).unwrap();
                 let m = BigNum::from_bytes_be(&padded);
                 let c = m.mod_exp_montgomery(&public.e, &public.n).unwrap();
-                let recovered = rsa_decrypt_crt(&c, &key.p, &key.q, &key.dp, &key.dq, &key.qinv, &key.n).unwrap();
+                let recovered = rsa_decrypt_crt(&c, &key.p, &key.q, &key.dp, &key.dq, &key.qinv, &key.n, &key.e).unwrap();
                 assert_eq!(recovered, m, "CRT decrypt mismatch at iter={} msg_iter={}", iter, msg_iter);
             }
         }
