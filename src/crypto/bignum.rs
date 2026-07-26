@@ -448,15 +448,92 @@ impl BigNum {
         let mut result = ctx.to_montgomery(&BigNum::one());
         let base_mont = ctx.to_montgomery(self);
         let bit_length = exp.bit_length();
-        
         for i in (0..bit_length).rev() {
             result = ctx.multiply(&result, &result);
-            if exp.get_bit(i) {
-                result = ctx.multiply(&result, &base_mont);
-            }
+            let multiplied = ctx.multiply(&result, &base_mont);
+            result = BigNum::conditional_select(&result, &multiplied, exp.get_bit(i));
         }
         
         Ok(ctx.from_montgomery(&result))
+    }
+
+    /**
+     * Modular exponentiation using Montgomery multiplication, hardened for use with secret (private-key) exponents
+     * Args:
+     *    &self: The base BigNum
+     *    exp - &BigNum: The secret exponent BigNum used to raise the base
+     *    modulus - &BigNum: The modulus BigNum to reduce the result
+     *    exp_bits - usize: A public upper bound on the exponent's bit length to iterate over
+     * 
+     * Returns:
+     *    Result<BigNum>: The result of (self ^ exp) mod modulus or an error if modulus is zero or not odd
+     */
+    pub fn mod_exp_montgomery_secure(&self, exp: &BigNum, modulus: &BigNum, exp_bits: usize) -> Result<BigNum> {
+        let ctx = MontgomeryContext::new(modulus)?;
+        let target_limbs = (exp_bits + 63) / 64;
+        let mut padded_limbs = exp.limbs.clone();
+        if padded_limbs.len() < target_limbs {
+            padded_limbs.resize(target_limbs, 0);
+        }
+
+        let padded_exp = BigNum { limbs: padded_limbs };
+        let mut result = ctx.to_montgomery(&BigNum::one());
+        let base_mont = ctx.to_montgomery(self);
+        for i in (0..exp_bits).rev() {
+            result = ctx.multiply(&result, &result);
+            let multiplied = ctx.multiply(&result, &base_mont);
+            result = BigNum::conditional_select(&result, &multiplied, padded_exp.get_bit(i));
+        }
+
+        Ok(ctx.from_montgomery(&result))
+    }
+
+    /**
+     * Branch-free selection between two BigNums
+     * Args:
+     *    a - &BigNum: The value to return when `choice` is false
+     *    b - &BigNum: The value to return when `choice` is true
+     *    choice - bool: Which value to select
+     * 
+     * Returns:
+     *    BigNum: `b` if `choice`, else `a`
+     */
+    pub fn conditional_select(a: &BigNum, b: &BigNum, choice: bool) -> BigNum {
+        let mask = 0u64.wrapping_sub(choice as u64);
+        let len = a.limbs.len().max(b.limbs.len());
+        let mut limbs = Vec::with_capacity(len);
+        for i in 0..len {
+            let a_limb = a.limbs.get(i).copied().unwrap_or(0);
+            let b_limb = b.limbs.get(i).copied().unwrap_or(0);
+            limbs.push((a_limb & !mask) | (b_limb & mask));
+        }
+
+        BigNum::from_limbs(limbs)
+    }
+
+    /**
+     * Subtract `b` from `a` without branching on the result's sign
+     * Args:
+     *    a - &BigNum: The minuend
+     *    b - &BigNum: The subtrahend
+     *
+     * Returns:
+     *    (BigNum, bool): The (possibly wrapped) difference, and whether a borrow occurred (a < b)
+     */
+    fn sub_with_borrow(a: &BigNum, b: &BigNum) -> (BigNum, bool) {
+        let len = a.limbs.len().max(b.limbs.len());
+        let mut limbs = Vec::with_capacity(len);
+        let mut borrow = false;
+        for i in 0..len {
+            let a_limb = a.limbs.get(i).copied().unwrap_or(0);
+            let b_limb = b.limbs.get(i).copied().unwrap_or(0);
+            let (diff1, borrow1) = a_limb.overflowing_sub(b_limb);
+            let (diff2, borrow2) = diff1.overflowing_sub(borrow as u64);
+            limbs.push(diff2);
+            borrow = borrow1 | borrow2;
+        }
+
+        (BigNum { limbs }, borrow)
     }
 
     /**
@@ -1364,9 +1441,8 @@ impl MontgomeryContext {
         let mut result = BigNum::from_limbs(r[k..].to_vec());
         result.normalize();
         
-        if result >= self.modulus {
-            result = &result - &self.modulus;
-        }
+        let (subtracted, borrowed) = BigNum::sub_with_borrow(&result, &self.modulus);
+        result = BigNum::conditional_select(&result, &subtracted, !borrowed);
         
         result
     }
