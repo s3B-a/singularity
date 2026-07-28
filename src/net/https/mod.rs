@@ -1,7 +1,9 @@
 pub mod client;
+pub mod ct;
 pub mod tls;
 pub mod server;
 pub mod trust_store;
+pub mod revocation;
 
 use crate::crypto::constant_time_eq;
 use crate::crypto::encoding::pem;
