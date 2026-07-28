@@ -16,6 +16,8 @@ mod ext_oid {
     pub const EXTENDED_KEY_USAGE: [u64; 4] = [2, 5, 29, 37];
     pub const EKU_SERVER_AUTH: [u64; 9] = [1, 3, 6, 1, 5, 5, 7, 3, 1];
     pub const EKU_ANY: [u64; 5] = [2, 5, 29, 37, 0];
+    pub const CRL_DISTRIBUTION_POINTS: [u64; 4] = [2, 5, 29, 31];
+    pub const SIGNED_CERTIFICATE_TIMESTAMP_LIST: [u64; 10] = [1, 3, 6, 1, 4, 1, 11129, 2, 4, 2];
 }
 
 /**
@@ -272,79 +274,7 @@ impl Certificate {
      *    Result<()>: Ok if verification succeeds, Err otherwise
      */
     pub fn verify_signature(&self, ca_cert: &Certificate) -> Result<()> {
-        use crate::crypto::Error;
-        use crate::crypto::asymmetric::{ecc_generic, ecdsa, rsa};
-        use crate::crypto::encoding::asn1::oid;
-        use crate::crypto::hash::sha2::{sha1, sha256, sha384, sha512};
-
-        let alg = ca_cert.subject_public_key_info.algorithm.as_slice();
-        let is_valid = if alg == oid::RSA_ENCRYPTION {
-            let ca_public_key_bytes = ca_cert.public_key().ok_or_else(|| Error::InvalidData("CA has no public key".to_string()))?;
-
-            let ca_public_key = rsa::RsaPublicKey::from_bytes(&ca_public_key_bytes)
-                .map_err(|_| Error::InvalidData("Invalid CA public key".to_string()))?;
-
-            let sig_alg = self.signature_algorithm.as_slice();
-            let (digest_info, digest): (&[u8], Vec<u8>) = if sig_alg == oid::SHA256_WITH_RSA_ENCRYPTION {
-                (&rsa::DIGEST_INFO_SHA256, sha256(&self.tbs).to_vec())
-            } else if sig_alg == oid::SHA384_WITH_RSA_ENCRYPTION {
-                (&rsa::DIGEST_INFO_SHA384, sha384(&self.tbs).to_vec())
-            } else if sig_alg == oid::SHA512_WITH_RSA_ENCRYPTION {
-                (&rsa::DIGEST_INFO_SHA512, sha512(&self.tbs).to_vec())
-            } else if sig_alg == oid::SHA1_WITH_RSA_ENCRYPTION {
-                (&rsa::DIGEST_INFO_SHA1, sha1(&self.tbs).to_vec())
-            } else {
-                return Err(Error::InvalidData(
-                    "Unsupported signature hash algorithm for RSA certificate".to_string(),
-                ));
-            };
-
-            ca_public_key.verify_pkcs1v15_digest(digest_info, &digest, &self.signature)?
-        } else if alg == oid::EC_PUBLIC_KEY {
-            let curve_oid = ca_cert.subject_public_key_info.param.as_ref()
-                .ok_or_else(|| Error::InvalidData("EC public key missing curve parameters".to_string()))
-                .and_then(|bytes| crate::crypto::encoding::asn1::decode_oid_content(bytes))?;
-
-            if curve_oid.as_slice() == oid::SECP256R1 {
-                let fixed_sig = ecc_generic::der_signature_to_fixed(&self.signature, 32)?;
-                ecdsa::verify(ecdsa::SignatureCurve::P256, &ca_cert.subject_public_key_info.public_key, &self.tbs, &fixed_sig)?
-            } else {
-                let curve = if curve_oid.as_slice() == oid::SECP384R1 {
-                    ecc_generic::NistCurve::P384
-                } else if curve_oid.as_slice() == oid::SECP521R1 {
-                    ecc_generic::NistCurve::P521
-                } else {
-                    return Err(Error::InvalidData(
-                        "Unsupported EC curve for signature verification".to_string(),
-                    ));
-                };
-
-                let sig_alg = self.signature_algorithm.as_slice();
-                let digest: Vec<u8> = if sig_alg == oid::ECDSA_WITH_SHA384 {
-                    sha384(&self.tbs).to_vec()
-                } else if sig_alg == oid::ECDSA_WITH_SHA512 {
-                    sha512(&self.tbs).to_vec()
-                } else if sig_alg == oid::ECDSA_WITH_SHA256 {
-                    sha256(&self.tbs).to_vec()
-                } else {
-                    return Err(Error::InvalidData(
-                        "Unsupported signature hash algorithm for EC certificate".to_string(),
-                    ));
-                };
-
-                ecc_generic::verify_prehashed(curve, &ca_cert.subject_public_key_info.public_key, &digest, &self.signature)?
-            }
-        } else {
-            return Err(Error::InvalidData(
-                "Unsupported public key algorithm for signature verification".to_string(),
-            ));
-        };
-
-        if is_valid {
-            Ok(())
-        } else {
-            Err(Error::VerificationFailed)
-        }
+        verify_tbs_signature(&self.tbs, &self.signature_algorithm, &self.signature, &ca_cert.subject_public_key_info)
     }
 
     /**
@@ -725,7 +655,211 @@ impl Certificate {
             Ok(result.unwrap_or_default())
         })
     }
-    
+
+    /**
+     * Finds a single extension by OID and returns its raw extnValue (the OCTET STRING content,
+     * still DER-encoded for most extensions as callers decode further as needed)
+     * Args:
+     *    &self: The Certificate instance
+     *    target_oid - &[u64]: The OID of the extension to find
+     *
+     * Returns:
+     *    Result<Option<Vec<u8>>>: The extension's raw extnValue bytes, or None if not present
+     */
+    fn find_extension_value(&self, target_oid: &[u64]) -> Result<Option<Vec<u8>>> {
+        let mut decoder = DerDecoder::new(&self.tbs);
+        decoder.sequence(|tbs| {
+            let _ = tbs.optional_context_specific(0, |v| v.integer_u64())?;
+            let _ = tbs.integer()?;
+            let _ = tbs.sequence(|alg| alg.object_identifier())?;
+            let _ = tbs.sequence(|issuer_seq| parse_name(issuer_seq))?;
+            let _ = tbs.sequence(|validity| {
+                validity.read_element()?;
+                validity.read_element()?;
+                Ok(())
+            })?;
+
+            let _ = tbs.sequence(|subject_seq| parse_name(subject_seq))?;
+            let _ = tbs.sequence(|spki| parse_spki(spki))?;
+            let result = tbs.optional_context_specific(3, |ext_seq| {
+                ext_seq.sequence(|exts| {
+                    while exts.has_more() {
+                        if let Ok(found) = exts.sequence(|ext| {
+                            let oid = read_extension_header(ext)?;
+                            let value = ext.octet_string()?;
+                            if oid == target_oid {
+                                return Ok(Some(value));
+                            }
+
+                            Ok(None)
+                        }) {
+                            if found.is_some() {
+                                return Ok(found);
+                            }
+                        }
+                    }
+
+                    Ok(None)
+                })
+            })?;
+
+            Ok(result.flatten())
+        })
+    }
+
+    /**
+     * Gets the CRL Distribution Point URIs from the certificate extensions
+     * Args:
+     *    &self: The Certificate instance
+     *
+     * Returns:
+     *    Result<Vec<String>>: The CRL distribution point URLs, empty if none present
+     */
+    pub fn get_crl_distribution_points(&self) -> Result<Vec<String>> {
+        let value = match self.find_extension_value(&ext_oid::CRL_DISTRIBUTION_POINTS)? {
+            Some(v) => v,
+            None => return Ok(Vec::new()),
+        };
+
+        let mut urls = Vec::new();
+        let mut decoder = DerDecoder::new(&value);
+        let _ = decoder.sequence(|points| {
+            while points.has_more() {
+                let _ = points.sequence(|dp| {
+                    let _ = dp.optional_context_specific(0, |dpn| {
+                        let _ = dpn.optional_context_specific(0, |full_name| {
+                            while full_name.has_more() {
+                                let tag = full_name.peek_tag()?;
+                                if (tag & 0xC0) == 0x80 && (tag & 0x1F) == 6 {
+                                    let uri_bytes = full_name.context_specific(6, |v| Ok(v.data.to_vec()))?;
+                                    if let Ok(uri) = String::from_utf8(uri_bytes) {
+                                        urls.push(uri);
+                                    }
+                                } else {
+                                    let _ = full_name.read_element()?;
+                                }
+                            }
+
+                            Ok(())
+                        });
+
+                        Ok(())
+                    });
+
+                    Ok(())
+                });
+            }
+
+            Ok(())
+        });
+
+        Ok(urls)
+    }
+
+    /**
+     * Gets the raw embedded SignedCertificateTimestampList from the certificate's 
+     * `1.3.6.1.4.1.11129.2.4.2` extension
+     * Args:
+     *    &self: The Certificate instance
+     *
+     * Returns:
+     *    Result<Vec<u8>>: The raw SCT list bytes, or empty if the extension is absent
+     */
+    pub fn get_sct_list(&self) -> Result<Vec<u8>> {
+        let value = match self.find_extension_value(&ext_oid::SIGNED_CERTIFICATE_TIMESTAMP_LIST)? {
+            Some(v) => v,
+            None => return Ok(Vec::new()),
+        };
+
+        let mut inner = DerDecoder::new(&value);
+        inner.octet_string()
+    }
+
+    /**
+     * Reconstructs the "precertificate" TBSCertificate a CT log would have originally signed
+     * Args:
+     *    &self: The Certificate instance
+     *
+     * Returns:
+     *    Result<Vec<u8>>: The DER-encoded precertificate TBSCertificate
+     */
+    pub fn tbs_for_precert(&self) -> Result<Vec<u8>> {
+        const POISON_OID: [u64; 10] = [1, 3, 6, 1, 4, 1, 11129, 2, 4, 3];
+
+        let mut decoder = DerDecoder::new(&self.tbs);
+        decoder.sequence(|tbs| {
+            let start = tbs.get_pos();
+            let _ = tbs.optional_context_specific(0, |v| v.integer_u64())?;
+            let _ = tbs.integer()?;
+            let _ = tbs.sequence(|alg| alg.object_identifier())?;
+            let _ = tbs.sequence(|issuer_seq| parse_name(issuer_seq))?;
+            let _ = tbs.sequence(|validity| {
+                validity.read_element()?;
+                validity.read_element()?;
+                Ok(())
+            })?;
+
+            let _ = tbs.sequence(|subject_seq| parse_name(subject_seq))?;
+            let _ = tbs.sequence(|spki| parse_spki(spki))?;
+            let preamble_end = tbs.get_pos();
+            let mut new_tbs = tbs.data[start..preamble_end].to_vec();
+
+            let filtered_extensions: Option<Vec<u8>> = tbs.optional_context_specific(3, |ext_wrapper| {
+                ext_wrapper.sequence(|ext_seq| {
+                    let mut kept = Vec::new();
+                    while ext_seq.has_more() {
+                        let ext_start = ext_seq.get_pos();
+                        let elem = ext_seq.read_element()?;
+                        let ext_end = ext_seq.get_pos();
+                        let mut peek = DerDecoder::new(&elem.data);
+                        let oid = read_extension_header(&mut peek)?;
+                        if oid == ext_oid::SIGNED_CERTIFICATE_TIMESTAMP_LIST {
+                            let mut null_der = DerEncoder::new();
+                            null_der.null();
+                            let null_bytes = null_der.finish();
+
+                            let mut poison_body = DerEncoder::new();
+                            poison_body.object_identifier(&POISON_OID)?;
+                            poison_body.boolean(true);
+                            poison_body.octet_string(&null_bytes);
+                            let poison_body_bytes = poison_body.finish();
+
+                            let mut poison_ext = DerEncoder::new();
+                            poison_ext.write_tag(Tag::Sequence as u8, true);
+                            poison_ext.write_length(poison_body_bytes.len());
+                            poison_ext.raw(&poison_body_bytes);
+                            kept.extend_from_slice(&poison_ext.finish());
+                        } else {
+                            kept.extend_from_slice(&ext_seq.data[ext_start..ext_end]);
+                        }
+                    }
+
+                    Ok(kept)
+                })
+            })?;
+
+            if let Some(filtered) = filtered_extensions {
+                let mut ext_seq_enc = DerEncoder::new();
+                ext_seq_enc.write_tag(Tag::Sequence as u8, true);
+                ext_seq_enc.write_length(filtered.len());
+                ext_seq_enc.raw(&filtered);
+                let ext_seq_bytes = ext_seq_enc.finish();
+
+                let mut ctx3 = DerEncoder::new();
+                ctx3.write_tag(0x80 | 3, true);
+                ctx3.write_length(ext_seq_bytes.len());
+                ctx3.raw(&ext_seq_bytes);
+                new_tbs.extend_from_slice(&ctx3.finish());
+            }
+
+            let mut result = DerEncoder::new();
+            result.write_tag(Tag::Sequence as u8, true);
+            result.write_length(new_tbs.len());
+            result.raw(&new_tbs);
+            Ok(result.finish())
+        })
+    }
+
     /**
      * Gets the Key Usage bits from the certificate extensions, if present
      * Args:
@@ -801,6 +935,89 @@ impl Certificate {
 }
 
 /**
+ * Verifies a `tbs`+`signatureAlgorithm`+`signature` triple against an issuer's SubjectPublicKeyInfo
+ * Args:
+ *    tbs - &[u8]: The DER-encoded to-be-signed structure the signature covers
+ *    signature_algorithm - &[u64]: The OID of the signature algorithm used
+ *    signature - &[u8]: The raw signature bytes
+ *    issuer_spki - &SubjectPublicKeyInfo: The issuer's public key info
+ *
+ * Returns:
+ *    Result<()>: Ok if the signature verifies, or an error otherwise
+ */
+pub fn verify_tbs_signature(tbs: &[u8], signature_algorithm: &[u64], signature: &[u8], issuer_spki: &SubjectPublicKeyInfo) -> Result<()> {
+    use crate::crypto::Error;
+    use crate::crypto::asymmetric::{ecc_generic, ecdsa, rsa};
+    use crate::crypto::encoding::asn1::oid;
+    use crate::crypto::hash::sha2::{sha1, sha256, sha384, sha512};
+
+    let alg = issuer_spki.algorithm.as_slice();
+    let is_valid = if alg == oid::RSA_ENCRYPTION {
+        let ca_public_key = rsa::RsaPublicKey::from_bytes(&issuer_spki.public_key)
+            .map_err(|_| Error::InvalidData("Invalid CA public key".to_string()))?;
+
+        let (digest_info, digest): (&[u8], Vec<u8>) = if signature_algorithm == oid::SHA256_WITH_RSA_ENCRYPTION {
+            (&rsa::DIGEST_INFO_SHA256, sha256(tbs).to_vec())
+        } else if signature_algorithm == oid::SHA384_WITH_RSA_ENCRYPTION {
+            (&rsa::DIGEST_INFO_SHA384, sha384(tbs).to_vec())
+        } else if signature_algorithm == oid::SHA512_WITH_RSA_ENCRYPTION {
+            (&rsa::DIGEST_INFO_SHA512, sha512(tbs).to_vec())
+        } else if signature_algorithm == oid::SHA1_WITH_RSA_ENCRYPTION {
+            (&rsa::DIGEST_INFO_SHA1, sha1(tbs).to_vec())
+        } else {
+            return Err(Error::InvalidData(
+                "Unsupported signature hash algorithm for RSA certificate".to_string(),
+            ));
+        };
+
+        ca_public_key.verify_pkcs1v15_digest(digest_info, &digest, signature)?
+    } else if alg == oid::EC_PUBLIC_KEY {
+        let curve_oid = issuer_spki.param.as_ref()
+            .ok_or_else(|| Error::InvalidData("EC public key missing curve parameters".to_string()))
+            .and_then(|bytes| crate::crypto::encoding::asn1::decode_oid_content(bytes))?;
+
+        if curve_oid.as_slice() == oid::SECP256R1 {
+            let fixed_sig = ecc_generic::der_signature_to_fixed(signature, 32)?;
+            ecdsa::verify(ecdsa::SignatureCurve::P256, &issuer_spki.public_key, tbs, &fixed_sig)?
+        } else {
+            let curve = if curve_oid.as_slice() == oid::SECP384R1 {
+                ecc_generic::NistCurve::P384
+            } else if curve_oid.as_slice() == oid::SECP521R1 {
+                ecc_generic::NistCurve::P521
+            } else {
+                return Err(Error::InvalidData(
+                    "Unsupported EC curve for signature verification".to_string(),
+                ));
+            };
+
+            let digest: Vec<u8> = if signature_algorithm == oid::ECDSA_WITH_SHA384 {
+                sha384(tbs).to_vec()
+            } else if signature_algorithm == oid::ECDSA_WITH_SHA512 {
+                sha512(tbs).to_vec()
+            } else if signature_algorithm == oid::ECDSA_WITH_SHA256 {
+                sha256(tbs).to_vec()
+            } else {
+                return Err(Error::InvalidData(
+                    "Unsupported signature hash algorithm for EC certificate".to_string(),
+                ));
+            };
+
+            ecc_generic::verify_prehashed(curve, &issuer_spki.public_key, &digest, signature)?
+        }
+    } else {
+        return Err(Error::InvalidData(
+            "Unsupported public key algorithm for signature verification".to_string(),
+        ));
+    };
+
+    if is_valid {
+        Ok(())
+    } else {
+        Err(Error::VerificationFailed)
+    }
+}
+
+/**
  * Parses an X.509 Name from a DerDecoder
  * Args:
  *    decoder - &mut DerDecoder: The DerDecoder positioned at the Name
@@ -867,7 +1084,7 @@ fn parse_spki(decoder: &mut DerDecoder) -> Result<SubjectPublicKeyInfo> {
  * Returns:
  *    Result<i64>: Unix timestamp (seconds since epoch) or error
  */
-fn parse_time(decoder: &mut DerDecoder) -> Result<i64> {
+pub(crate) fn parse_time(decoder: &mut DerDecoder) -> Result<i64> {
     let elem = decoder.read_element()?;
     
     match elem.tag {
@@ -1186,6 +1403,131 @@ mod tests {
         let cert = Certificate::from_der(MINIMAL_DER).unwrap();
         let pem = cert.to_pem();
         assert!(pem.contains("BEGIN CERTIFICATE"));
+    }
+
+    fn der_seq(content: &[u8]) -> Vec<u8> {
+        let mut enc = DerEncoder::new();
+        enc.write_tag(Tag::Sequence as u8, true);
+        enc.write_length(content.len());
+        enc.raw(content);
+        enc.finish()
+    }
+
+    fn der_context(tag_num: u8, constructed: bool, content: &[u8]) -> Vec<u8> {
+        let mut enc = DerEncoder::new();
+        enc.write_tag(0x80 | tag_num, constructed);
+        enc.write_length(content.len());
+        enc.raw(content);
+        enc.finish()
+    }
+
+    fn der_extension(oid: &[u64], critical: bool, extn_value: &[u8]) -> Vec<u8> {
+        let mut enc = DerEncoder::new();
+        enc.object_identifier(oid).unwrap();
+        if critical {
+            enc.boolean(true);
+        }
+        enc.octet_string(extn_value);
+        der_seq(&enc.finish())
+    }
+
+    fn build_test_tbs_with_extensions(extensions: &[Vec<u8>]) -> Vec<u8> {
+        const PREAMBLE: &[u8] = &[
+            0xA0, 0x03, 0x02, 0x01, 0x02,
+            0x02, 0x01, 0x01,
+            0x30, 0x0D, 0x06, 0x09, 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x05, 0x05, 0x00,
+            0x30, 0x02, 0x31, 0x00,
+            0x30, 0x06, 0x17, 0x01, 0x30, 0x17, 0x01, 0x30,
+            0x30, 0x02, 0x31, 0x00,
+            0x30, 0x0D, 0x30, 0x08, 0x06, 0x06, 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x03, 0x01, 0x00,
+        ];
+
+        let mut exts_concat = Vec::new();
+        for ext in extensions {
+            exts_concat.extend_from_slice(ext);
+        }
+
+        let exts_seq = der_seq(&exts_concat);
+        let exts_wrapped = der_context(3, true, &exts_seq);
+
+        let mut body = PREAMBLE.to_vec();
+        body.extend_from_slice(&exts_wrapped);
+        der_seq(&body)
+    }
+
+    fn cert_with_tbs(tbs: Vec<u8>) -> Certificate {
+        Certificate {
+            tbs,
+            signature_algorithm: vec![1, 2, 840, 113549, 1, 1, 5],
+            signature: vec![0u8],
+            subject: Name { common_name: None },
+            issuer: Name { common_name: None },
+            subject_public_key_info: SubjectPublicKeyInfo {
+                algorithm: vec![1, 2, 840, 113549, 1, 1, 1],
+                param: None,
+                public_key: vec![],
+            },
+        }
+    }
+
+    #[test]
+    fn test_get_crl_distribution_points_extracts_uri() {
+        let uri = der_context(6, false, b"http://crl.example.com/ca.crl");
+        let full_name = der_context(0, true, &uri);
+        let dp_name = der_context(0, true, &full_name);
+        let distribution_point = der_seq(&dp_name);
+        let crl_dp_value = der_seq(&distribution_point);
+        let ext = der_extension(&ext_oid::CRL_DISTRIBUTION_POINTS, false, &crl_dp_value);
+
+        let tbs = build_test_tbs_with_extensions(&[ext]);
+        let cert = cert_with_tbs(tbs);
+
+        let urls = cert.get_crl_distribution_points().unwrap();
+        assert_eq!(urls, vec!["http://crl.example.com/ca.crl".to_string()]);
+    }
+
+    #[test]
+    fn test_get_crl_distribution_points_empty_when_absent() {
+        let tbs = build_test_tbs_with_extensions(&[]);
+        let cert = cert_with_tbs(tbs);
+        assert!(cert.get_crl_distribution_points().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_get_sct_list_roundtrip() {
+        let raw_sct_list = vec![0x00, 0x05, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE];
+        let mut inner_octet = DerEncoder::new();
+        inner_octet.octet_string(&raw_sct_list);
+        let ext = der_extension(&ext_oid::SIGNED_CERTIFICATE_TIMESTAMP_LIST, false, &inner_octet.finish());
+
+        let tbs = build_test_tbs_with_extensions(&[ext]);
+        let cert = cert_with_tbs(tbs);
+
+        assert_eq!(cert.get_sct_list().unwrap(), raw_sct_list);
+    }
+
+    #[test]
+    fn test_tbs_for_precert_swaps_sct_extension_for_poison() {
+        const POISON_OID: [u64; 10] = [1, 3, 6, 1, 4, 1, 11129, 2, 4, 3];
+
+        let raw_sct_list = vec![0x00, 0x02, 0x11, 0x22];
+        let mut inner_octet = DerEncoder::new();
+        inner_octet.octet_string(&raw_sct_list);
+        let sct_ext = der_extension(&ext_oid::SIGNED_CERTIFICATE_TIMESTAMP_LIST, false, &inner_octet.finish());
+        let aki_ext = der_extension(&ext_oid::AUTHORITY_KEY_IDENTIFIER, false, &[0x30, 0x00]);
+
+        let tbs = build_test_tbs_with_extensions(&[aki_ext.clone(), sct_ext]);
+        let cert = cert_with_tbs(tbs);
+
+        let precert_tbs = cert.tbs_for_precert().unwrap();
+        let precert_cert = cert_with_tbs(precert_tbs);
+
+        assert!(precert_cert.get_sct_list().unwrap().is_empty());
+        assert!(precert_cert.find_extension_value(&POISON_OID).unwrap().is_some());
+        assert_eq!(
+            precert_cert.get_authority_key_identifier().unwrap(),
+            cert_with_tbs(build_test_tbs_with_extensions(&[aki_ext])).get_authority_key_identifier().unwrap()
+        );
     }
 
     #[test]

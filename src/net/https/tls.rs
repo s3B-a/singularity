@@ -1,6 +1,7 @@
-use crate::crypto::asymmetric::{ecdh, rsa};
+﻿use crate::crypto::asymmetric::{ecdh, rsa};
 use crate::crypto::constant_time_eq;
 use crate::crypto::encoding::{pem, x509};
+use crate::crypto::hash::hmac::hmac_sha256;
 use crate::crypto::hash::sha2::{self, sha256};
 use crate::crypto::kdf::hkdf;
 use crate::crypto::random;
@@ -8,6 +9,8 @@ use crate::crypto::symmetric::chacha20::ChaCha20Poly1305;
 use crate::crypto::symmetric::gcm::GcmOptimized;
 use crate::net::http::compression::{self, CompressionAlgorithm, CompressionLevel};
 use crate::net::http::http2::alpn::{AlpnNegotiator, AlpnProtocol};
+use crate::net::https::ct::{self, CtLogBundle};
+use crate::net::https::revocation::{self, CrlCache, RevocationPolicy};
 use crate::net::https::trust_store::TrustStore;
 use crate::net::tcp::TcpStream;
 use std::collections::HashMap;
@@ -78,12 +81,18 @@ pub struct TlsCfg {
     pub enable_session_resumption: bool,
     pub record_security: TlsRecordSecurityCfg,
     pub record_compression: TlsRecordCompressionCfg,
+    pub enable_revocation_checking: bool,
+    pub revocation_policy: RevocationPolicy,
+    pub crl_cache: CrlCache,
+    pub enable_certificate_transparency: bool,
+    pub ct_log_bundle: CtLogBundle,
 }
 
 #[derive(Debug, Clone)]
 pub struct TlsSession {
     pub session_id: Vec<u8>,
-    pub master_secret: Vec<u8>,
+    pub resumption_master_secret: Vec<u8>,
+    pub ticket_nonce: Vec<u8>,
     pub cipher_suite: u16,
     pub created_at: SystemTime,
     pub server_name: String,
@@ -127,6 +136,49 @@ struct TlsKeys {
     server_write_key: Vec<u8>,
     client_write_iv: Vec<u8>,
     server_write_iv: Vec<u8>,
+    client_traffic_secret: Vec<u8>,
+    server_traffic_secret: Vec<u8>,
+}
+
+struct ClientPskOffer {
+    ticket: Vec<u8>,
+    binder: Vec<u8>,
+    truncated_transcript_hash: Vec<u8>,
+}
+
+fn empty_hash() -> [u8; 32] {
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(b"");
+    hasher.finalize()
+}
+
+fn hkdf_expand_label_raw(secret: &[u8], label: &[u8], context: &[u8], length: usize) -> Result<Vec<u8>, TlsError> {
+    let mut hkdf_label = Vec::new();
+    let full_label = [b"tls13 ", label].concat();
+    hkdf_label.extend_from_slice(&(length as u16).to_be_bytes());
+    hkdf_label.push(full_label.len() as u8);
+    hkdf_label.extend_from_slice(&full_label);
+    hkdf_label.push(context.len() as u8);
+    hkdf_label.extend_from_slice(context);
+
+    hkdf::Hkdf::expand(secret, &hkdf_label, length)
+        .map_err(|e| TlsError::CipherError(format!("HKDF expand failed: {:?}", e)))
+}
+
+fn verify_psk_binder(offer: &ClientPskOffer, psk: &[u8]) -> Result<bool, TlsError> {
+    let early_secret = hkdf::Hkdf::extract(Some(&[0u8; 32]), psk);
+    let binder_key = hkdf_expand_label_raw(&early_secret, b"res binder", &empty_hash(), 32)?;
+    let finished_key = hkdf_expand_label_raw(&binder_key, b"finished", b"", 32)?;
+    let expected = hmac_sha256(&finished_key, &offer.truncated_transcript_hash);
+    Ok(constant_time_eq(&expected, &offer.binder))
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        s.push_str(&format!("{:02x}", b));
+    }
+    s
 }
 
 #[derive(Debug, Clone)]
@@ -153,19 +205,35 @@ pub struct TlsStream {
     alpn_negotiator: AlpnNegotiator,
     negotiated_protocol: Option<AlpnProtocol>,
     negotiated_record_compression: CompressionAlgorithm,
+    early_secret: Vec<u8>,
+    master_secret: Vec<u8>,
+    resumption_master_secret: Vec<u8>,
+    peer_leaf_certificate: Option<x509::Certificate>,
 }
 
 impl TlsSession {
-    pub fn new(session_id: Vec<u8>, master_secret: Vec<u8>, cipher_suite: u16, server_name: String, protocol_version: TlsVersion) -> Self {
+    pub fn new(
+        session_id: Vec<u8>,
+        resumption_master_secret: Vec<u8>,
+        ticket_nonce: Vec<u8>,
+        cipher_suite: u16,
+        server_name: String,
+        protocol_version: TlsVersion,
+    ) -> Self {
         Self {
             session_id,
-            master_secret,
+            resumption_master_secret,
+            ticket_nonce,
             cipher_suite,
             created_at: SystemTime::now(),
             server_name,
             protocol_version,
             ticket: None,
         }
+    }
+
+    pub fn psk(&self) -> Result<Vec<u8>, TlsError> {
+        hkdf_expand_label_raw(&self.resumption_master_secret, b"resumption", &self.ticket_nonce, 32)
     }
 
     pub fn is_valid(&self) -> bool {
@@ -237,6 +305,10 @@ impl TlsStream {
             alpn_negotiator: AlpnNegotiator::new(),
             negotiated_protocol: None,
             negotiated_record_compression: CompressionAlgorithm::Identity,
+            early_secret: Vec::new(),
+            master_secret: Vec::new(),
+            resumption_master_secret: Vec::new(),
+            peer_leaf_certificate: None,
         };
 
         tls_stream.client_handshake()?;
@@ -262,6 +334,10 @@ impl TlsStream {
             alpn_negotiator: AlpnNegotiator::new(),
             negotiated_protocol: None,
             negotiated_record_compression: CompressionAlgorithm::Identity,
+            early_secret: Vec::new(),
+            master_secret: Vec::new(),
+            resumption_master_secret: Vec::new(),
+            peer_leaf_certificate: None,
         };
 
         tls_stream.server_handshake()?;
@@ -278,13 +354,16 @@ impl TlsStream {
         let client_public = ecdh_key.public_key();
         let resumable_session = if self.config.enable_session_resumption {
             if let (Some(cache), Some(server_name)) = (&self.config.session_cache, &self.server_name) {
-                cache.get(server_name).filter(|s| s.is_valid())
+                cache.get(server_name).filter(|s| s.is_valid() && s.ticket.is_some())
             } else {
                 None
             }
         } else {
             None
         };
+
+        let offered_psk = resumable_session.as_ref().map(|s| s.psk()).transpose()?;
+        self.set_early_secret(offered_psk.as_deref());
 
         let client_hello = if let Some(ref session) = resumable_session {
             self.resuming_session = true;
@@ -309,7 +388,7 @@ impl TlsStream {
         self.handshake_msg.extend_from_slice(&server_hello);
         
         let (
-            server_random,
+            _server_random,
             selected_cipher,
             peer_public_key,
             negotiated_version,
@@ -318,16 +397,12 @@ impl TlsStream {
 
         self.version = negotiated_version;
         self.cipher_suite = selected_cipher;
-        if session_resumed && self.resuming_session {
-            if let Some(session) = resumable_session {
-                let shared_secret = session.master_secret;
-                self.derive_keys(&client_random, &server_random, &shared_secret)?;
-                self.state = ConnectionState::Connected;
-                return Ok(());
-            }
+
+        if self.resuming_session && !session_resumed {
+            self.resuming_session = false;
+            self.set_early_secret(None);
         }
 
-        self.resuming_session = false;
         if peer_public_key.is_empty() {
             return Err(TlsError::HandshakeFailed(
                 "No peer public key received".to_string(),
@@ -343,7 +418,8 @@ impl TlsStream {
             TlsError::HandshakeFailed(format!("ECDH exchange failed: {:?}", e))
         })?;
 
-        self.derive_keys(&client_random, &server_random, &shared_secret)?;
+        self.derive_handshake_keys(&shared_secret)?;
+        let mut saw_certificate = false;
         loop {
             let (msg_type, msg_data) = self.recieve_handshake_message()?;
             match msg_type {
@@ -353,16 +429,16 @@ impl TlsStream {
                 HANDSHAKE_CERTIFICATE => {
                     self.handshake_msg.extend_from_slice(&msg_data);
                     self.verify_certificate(&msg_data)?;
+                    saw_certificate = true;
                 }
                 HANDSHAKE_CERTIFICATE_VERIFY => {
+                    self.verify_certificate_verify(&msg_data)?;
                     self.handshake_msg.extend_from_slice(&msg_data);
                 }
                 HANDSHAKE_FINISHED => {
                     self.verify_finished(&msg_data, false)?;
+                    self.handshake_msg.extend_from_slice(&msg_data);
                     break;
-                }
-                HANDSHAKE_NEW_SESSION_TICKET => {
-                    self.handle_new_session_ticket(&msg_data)?;
                 }
                 _ => {
                     return Err(TlsError::HandshakeFailed(format!(
@@ -373,10 +449,30 @@ impl TlsStream {
             }
         }
 
+        if !self.resuming_session && !saw_certificate {
+            return Err(TlsError::HandshakeFailed(
+                "Server completed the handshake without presenting a certificate".to_string(),
+            ));
+        }
+
         let finished_msg = self.compute_finished(true)?;
         self.send_handshake_message(HANDSHAKE_FINISHED, &finished_msg)?;
+        self.handshake_msg.extend_from_slice(&finished_msg);
+        self.resumption_master_secret = self.compute_resumption_master_secret()?;
+        self.derive_application_keys()?;
         self.state = ConnectionState::Connected;
-        self.save_session(&shared_secret)?;
+        if self.config.enable_session_resumption && self.config.session_cache.is_some() {
+            let timed_out_ok = self.set_read_timeout(Some(Duration::from_secs(3))).is_ok();
+            if let Ok((msg_type, msg_data)) = self.recieve_handshake_message() {
+                if msg_type == HANDSHAKE_NEW_SESSION_TICKET {
+                    let _ = self.handle_new_session_ticket(&msg_data);
+                }
+            }
+
+            if timed_out_ok {
+                let _ = self.set_read_timeout(None);
+            }
+        }
 
         Ok(())
     }
@@ -391,9 +487,29 @@ impl TlsStream {
         }
 
         self.handshake_msg.extend_from_slice(&client_hello);
-        let (client_random, client_ciphers, client_public_key, client_versions) = self.parse_client_hello(&client_hello)?;
+        let (_client_random, client_ciphers, client_public_key, client_versions, psk_offer) =
+            self.parse_client_hello(&client_hello)?;
         self.version = self.negotiate_version(&client_versions)?;
         self.cipher_suite = self.select_cipher_suite(&client_ciphers)?;
+
+        let mut accepted_psk: Option<Vec<u8>> = None;
+        if self.config.enable_session_resumption {
+            if let (Some(offer), Some(cache)) = (&psk_offer, &self.config.session_cache) {
+                let ticket_key = hex_encode(&offer.ticket);
+                if let Some(session) = cache.get(&ticket_key).filter(|s| s.is_valid()) {
+                    if let Ok(psk) = session.psk() {
+                        if verify_psk_binder(offer, &psk).unwrap_or(false) {
+                            accepted_psk = Some(psk);
+                            cache.remove(&ticket_key);
+                        }
+                    }
+                }
+            }
+        }
+
+        self.resuming_session = accepted_psk.is_some();
+        self.set_early_secret(accepted_psk.as_deref());
+
         let ecdh_private = ecdh::EcdhPrivateKey::generate(ecdh::EcdhCurve::X25519).map_err(|e| {
             TlsError::HandshakeFailed(format!("Failed to generate ECDH key: {:?}", e))
         })?;
@@ -415,7 +531,7 @@ impl TlsStream {
         let encrypted_extensions = self.build_encrypted_extensions()?;
         self.handshake_msg.extend_from_slice(&encrypted_extensions);
         self.send_handshake_message(HANDSHAKE_ENCRYPTED_EXTENSIONS, &encrypted_extensions)?;
-        if !self.config.cert_chain.is_empty() {
+        if !self.resuming_session && !self.config.cert_chain.is_empty() {
             let certificate = self.build_certificate()?;
             self.handshake_msg.extend_from_slice(&certificate);
             self.send_handshake_message(HANDSHAKE_CERTIFICATE, &certificate)?;
@@ -428,14 +544,20 @@ impl TlsStream {
         let server_finished = self.compute_finished(false)?;
         self.handshake_msg.extend_from_slice(&server_finished);
         self.send_handshake_message(HANDSHAKE_FINISHED, &server_finished)?;
-        self.derive_application_keys(&shared_secret)?;
+
         let (finished_type, client_finished) = self.recieve_handshake_message()?;
         if finished_type != HANDSHAKE_FINISHED {
             return Err(TlsError::HandshakeFailed("Expected Finished".to_string()));
         }
 
         self.verify_finished(&client_finished, true)?;
+        self.handshake_msg.extend_from_slice(&client_finished);
+        self.derive_application_keys()?;
         self.state = ConnectionState::Connected;
+        if self.config.enable_session_resumption && self.config.session_cache.is_some() {
+            let ticket_msg = self.build_new_session_ticket()?;
+            self.send_handshake_message(HANDSHAKE_NEW_SESSION_TICKET, &ticket_msg)?;
+        }
 
         Ok(())
     }
@@ -586,24 +708,6 @@ impl TlsStream {
         ext.extend_from_slice(&2u16.to_be_bytes());
         ext.push(1);
         ext.push(1);
-        if let Some(ticket) = &session.ticket {
-            ext.extend_from_slice(&41u16.to_be_bytes());
-
-            let identities_len = 2 + ticket.len() + 4;
-            let binders_len = 33;
-            let psk_ext_len = 2 + identities_len + 2 + binders_len;
-
-            ext.extend_from_slice(&(psk_ext_len as u16).to_be_bytes());
-
-            ext.extend_from_slice(&(identities_len as u16).to_be_bytes());
-            ext.extend_from_slice(&(ticket.len() as u16).to_be_bytes());
-            ext.extend_from_slice(ticket);
-            ext.extend_from_slice(&session.age().to_be_bytes());
-
-            ext.extend_from_slice(&(binders_len as u16).to_be_bytes());
-            ext.push(32);
-            ext.extend_from_slice(&[0u8; 32]);
-        }
 
         if let Some(host) = &self.server_name {
             if !host.is_empty() {
@@ -618,6 +722,39 @@ impl TlsStream {
                 ext.extend_from_slice(&(host_bytes.len() as u16).to_be_bytes());
                 ext.extend_from_slice(host_bytes);
             }
+        }
+
+        if let Some(ticket) = &session.ticket {
+            ext.extend_from_slice(&41u16.to_be_bytes());
+
+            let identities_len = 2 + ticket.len() + 4;
+            let binders_len = 33;
+            let psk_ext_len = 2 + identities_len + 2 + binders_len;
+
+            ext.extend_from_slice(&(psk_ext_len as u16).to_be_bytes());
+            ext.extend_from_slice(&(identities_len as u16).to_be_bytes());
+            ext.extend_from_slice(&(ticket.len() as u16).to_be_bytes());
+            ext.extend_from_slice(ticket);
+            ext.extend_from_slice(&session.age().to_be_bytes());
+            ext.extend_from_slice(&(binders_len as u16).to_be_bytes());
+            ext.push(32);
+            ext.extend_from_slice(&[0u8; 32]);
+            hello.extend_from_slice(&(ext.len() as u16).to_be_bytes());
+            hello.extend_from_slice(&ext);
+
+            let truncate_at = hello.len() - 33;
+            let mut hasher = sha2::Sha256::new();
+            hasher.update(&hello[..truncate_at]);
+            let truncated_transcript_hash = hasher.finalize().to_vec();
+
+            let binder_key = self.hkdf_expand_label(&self.early_secret, b"res binder", &empty_hash(), 32)?;
+            let finished_key = self.hkdf_expand_label(&binder_key, b"finished", b"", 32)?;
+            let binder = hmac_sha256(&finished_key, &truncated_transcript_hash);
+
+            let binder_start = hello.len() - 32;
+            hello[binder_start..].copy_from_slice(&binder);
+
+            return Ok(hello);
         }
 
         hello.extend_from_slice(&(ext.len() as u16).to_be_bytes());
@@ -653,6 +790,12 @@ impl TlsStream {
             ext.extend_from_slice(&((2 + proto_wire.len()) as u16).to_be_bytes());
             ext.extend_from_slice(&(proto_wire.len() as u16).to_be_bytes());
             ext.extend_from_slice(proto_wire);
+        }
+
+        if self.resuming_session {
+            ext.extend_from_slice(&41u16.to_be_bytes());
+            ext.extend_from_slice(&2u16.to_be_bytes());
+            ext.extend_from_slice(&0u16.to_be_bytes());
         }
 
         hello.extend_from_slice(&(ext.len() as u16).to_be_bytes());
@@ -741,10 +884,7 @@ impl TlsStream {
         let transcript_hash = self.compute_transcript_hash();
         let finished_key = self.derive_finished_key(is_client)?;
 
-        let mut hasher = sha2::Sha256::new();
-        hasher.update(&finished_key);
-        hasher.update(&transcript_hash);
-        Ok(hasher.finalize().to_vec())
+        Ok(hmac_sha256(&finished_key, &transcript_hash).to_vec())
     }
 
     fn verify_finished(&self, finished_msg: &[u8], is_client: bool) -> Result<(), TlsError> {
@@ -758,7 +898,7 @@ impl TlsStream {
         Ok(())
     }
 
-    fn parse_client_hello(&self, data: &[u8]) -> Result<([u8; 32], Vec<u16>, Vec<u8>, Vec<u16>), TlsError> {
+    fn parse_client_hello(&self, data: &[u8]) -> Result<([u8; 32], Vec<u16>, Vec<u8>, Vec<u16>, Option<ClientPskOffer>), TlsError> {
         if data.len() < 38 {
             return Err(TlsError::DecodeError("ClientHello too short".to_string()));
         }
@@ -798,6 +938,7 @@ impl TlsStream {
         pos += 1 + comp_len;
         let mut public_key = Vec::new();
         let mut supported_versions = Vec::new();
+        let mut psk_offer: Option<ClientPskOffer> = None;
         if pos + 2 <= data.len() {
             let ext_len = u16::from_be_bytes([data[pos], data[pos + 1]]) as usize;
             pos += 2;
@@ -831,6 +972,45 @@ impl TlsStream {
                     }
                 }
 
+                if ext_type == 41 {
+                    (|| -> Option<()> {
+                        let ext_start = pos;
+                        let mut ppos = ext_start;
+                        let identities_len = u16::from_be_bytes([*data.get(ppos)?, *data.get(ppos + 1)?]) as usize;
+                        ppos += 2;
+                        let identities_end = ppos + identities_len;
+                        if identities_end > ext_start + ext_data_len || identities_end > data.len() {
+                            return None;
+                        }
+
+                        let ticket_len = u16::from_be_bytes([*data.get(ppos)?, *data.get(ppos + 1)?]) as usize;
+                        ppos += 2;
+                        if ppos + ticket_len + 4 > data.len() {
+                            return None;
+                        }
+
+                        let ticket = data[ppos..ppos + ticket_len].to_vec();
+                        ppos = identities_end;
+
+                        let binders_vec_len = u16::from_be_bytes([*data.get(ppos)?, *data.get(ppos + 1)?]) as usize;
+                        let truncate_at = ppos + 2;
+                        ppos += 2;
+                        let binder_len = *data.get(ppos)? as usize;
+                        ppos += 1;
+                        if binder_len + 1 > binders_vec_len || ppos + binder_len > data.len() {
+                            return None;
+                        }
+
+                        let binder = data[ppos..ppos + binder_len].to_vec();
+                        let mut hasher = sha2::Sha256::new();
+                        hasher.update(&data[..truncate_at]);
+                        let truncated_transcript_hash = hasher.finalize().to_vec();
+
+                        psk_offer = Some(ClientPskOffer { ticket, binder, truncated_transcript_hash });
+                        Some(())
+                    })();
+                }
+
                 pos += ext_data_len;
             }
         }
@@ -839,7 +1019,7 @@ impl TlsStream {
             supported_versions.push(u16::from_be_bytes([data[0], data[1]]));
         }
 
-        Ok((client_random, ciphers, public_key, supported_versions))
+        Ok((client_random, ciphers, public_key, supported_versions, psk_offer))
     }
 
     fn parse_server_hello(&self, data: &[u8]) -> Result<([u8; 32], u16, Vec<u8>, TlsVersion, bool), TlsError> {
@@ -854,11 +1034,6 @@ impl TlsStream {
         let session_id_len = data[pos] as usize;
         pos += 1;
 
-        let session_resumed = !self.session_id.is_empty()
-            && session_id_len == self.session_id.len()
-            && pos + session_id_len <= data.len()
-            && &data[pos..pos + session_id_len] == &self.session_id[..];
-
         pos += session_id_len;
         if pos + 2 > data.len() {
             return Err(TlsError::DecodeError(
@@ -872,6 +1047,7 @@ impl TlsStream {
 
         let mut public_key = Vec::new();
         let mut negotiated_version = TlsVersion::Tls1_2;
+        let mut session_resumed = false;
         if pos + 2 <= data.len() {
             let ext_len = u16::from_be_bytes([data[pos], data[pos + 1]]) as usize;
             pos += 2;
@@ -894,7 +1070,7 @@ impl TlsStream {
                 }
 
                 if ext_type == 51 && ext_data_len >= 4 {
-                    let mut kpos = pos + 2;
+                    let mut kpos = pos;
                     if kpos + 2 <= pos + ext_data_len {
                         let group = u16::from_be_bytes([data[kpos], data[kpos + 1]]);
                         kpos += 2;
@@ -907,6 +1083,10 @@ impl TlsStream {
                             }
                         }
                     }
+                }
+
+                if ext_type == 41 {
+                    session_resumed = true;
                 }
 
                 pos += ext_data_len;
@@ -929,6 +1109,10 @@ impl TlsStream {
             ));
         }
 
+        if !self.config.enable_session_resumption || self.resumption_master_secret.is_empty() {
+            return Ok(());
+        }
+
         let mut pos = 0;
         let _lifetime = u32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
         pos += 4;
@@ -939,7 +1123,13 @@ impl TlsStream {
         }
 
         let nonce_len = data[pos] as usize;
-        pos += 1 + nonce_len;
+        pos += 1;
+        if pos + nonce_len > data.len() {
+            return Ok(());
+        }
+
+        let ticket_nonce = data[pos..pos + nonce_len].to_vec();
+        pos += nonce_len;
         if pos + 2 > data.len() {
             return Ok(());
         }
@@ -952,47 +1142,58 @@ impl TlsStream {
 
         let ticket = data[pos..pos + ticket_len].to_vec();
         if let (Some(cache), Some(server_name)) = (&self.config.session_cache, &self.server_name) {
-            if let Some(keys) = &self.keys {
-                let mut session = TlsSession::new(
-                    self.session_id.clone(),
-                    keys.client_write_key.clone(),
-                    self.cipher_suite,
-                    server_name.clone(),
-                    self.version,
-                );
-
-                session.ticket = Some(ticket);
-                cache.insert(server_name.clone(), session);
-            }
-        }
-
-        Ok(())
-    }
-
-    fn save_session(&mut self, shared_secret: &[u8]) -> Result<(), TlsError> {
-        if !self.config.enable_session_resumption {
-            return Ok(());
-        }
-
-        if let (Some(cache), Some(server_name)) = (&self.config.session_cache, &self.server_name) {
-            if self.session_id.is_empty() {
-                let mut sid = vec![0u8; 32];
-                let _ = random::fill_random(&mut sid);
-                self.session_id = sid;
-            }
-
-            let session = TlsSession::new(
-                self.session_id.clone(),
-                shared_secret.to_vec(),
+            let mut sid = vec![0u8; 32];
+            let _ = random::fill_random(&mut sid);
+            let mut session = TlsSession::new(
+                sid,
+                self.resumption_master_secret.clone(),
+                ticket_nonce,
                 self.cipher_suite,
                 server_name.clone(),
                 self.version,
             );
 
+            session.ticket = Some(ticket);
             cache.insert(server_name.clone(), session);
         }
 
         Ok(())
+    }
+
+    fn build_new_session_ticket(&mut self) -> Result<Vec<u8>, TlsError> {
+        self.resumption_master_secret = self.compute_resumption_master_secret()?;
+
+        let mut ticket_nonce = vec![0u8; 8];
+        let _ = random::fill_random(&mut ticket_nonce);
+        let mut ticket_id = vec![0u8; 32];
+        let _ = random::fill_random(&mut ticket_id);
+
+        if let Some(cache) = &self.config.session_cache {
+            let mut session = TlsSession::new(
+                Vec::new(),
+                self.resumption_master_secret.clone(),
+                ticket_nonce.clone(),
+                self.cipher_suite,
+                String::new(),
+                self.version,
+            );
+
+            session.ticket = Some(ticket_id.clone());
+            cache.insert(hex_encode(&ticket_id), session);
+        }
+
+        let mut msg = Vec::new();
+        msg.extend_from_slice(&(MAX_SESSION_LIFETIME.as_secs() as u32).to_be_bytes());
+        let mut age_add = [0u8; 4];
+        let _ = random::fill_random(&mut age_add);
+        msg.extend_from_slice(&age_add);
+        msg.push(ticket_nonce.len() as u8);
+        msg.extend_from_slice(&ticket_nonce);
+        msg.extend_from_slice(&(ticket_id.len() as u16).to_be_bytes());
+        msg.extend_from_slice(&ticket_id);
+        msg.extend_from_slice(&0u16.to_be_bytes());
+
+        Ok(msg)
     }
 
     fn select_cipher_suite(&self, client_ciphers: &[u16]) -> Result<u16, TlsError> {
@@ -1182,9 +1383,10 @@ impl TlsStream {
         Ok(())
     }
 
-    fn verify_certificate(&self, cert_msg: &[u8]) -> Result<(), TlsError> {
+    fn verify_certificate(&mut self, cert_msg: &[u8]) -> Result<(), TlsError> {
         let chain = self.parse_certificate_chain(cert_msg)?;
         let leaf = &chain[0];
+        self.peer_leaf_certificate = Some(leaf.clone());
         if !leaf.is_valid_at_current_time() {
             return Err(TlsError::InvalidCertificate(
                 "Certificate expired or not yet valid".to_string(),
@@ -1202,9 +1404,58 @@ impl TlsStream {
 
         if self.config.verify_peer {
             self.validate_certificate_chain(&chain)?;
+
+            if self.config.enable_revocation_checking {
+                self.check_chain_revocation(&chain)?;
+            }
+
+            if self.config.enable_certificate_transparency {
+                self.check_certificate_transparency(&chain)?;
+            }
         }
 
         Ok(())
+    }
+
+    fn check_chain_revocation(&self, chain: &[x509::Certificate]) -> Result<(), TlsError> {
+        for i in 0..chain.len().saturating_sub(1) {
+            match revocation::check_revocation(&chain[i], &chain[i + 1], &self.config.crl_cache) {
+                revocation::RevocationStatus::Revoked => {
+                    return Err(TlsError::VerificationFailed(
+                        "Certificate has been revoked".to_string(),
+                    ));
+                }
+                revocation::RevocationStatus::Unknown(reason) => {
+                    if self.config.revocation_policy == RevocationPolicy::HardFail {
+                        return Err(TlsError::VerificationFailed(format!(
+                            "Revocation check failed: {}",
+                            reason
+                        )));
+                    }
+                }
+                revocation::RevocationStatus::Good => {}
+            }
+        }
+
+        Ok(())
+    }
+
+    fn check_certificate_transparency(&self, chain: &[x509::Certificate]) -> Result<(), TlsError> {
+        let leaf = &chain[0];
+        let issuer = if chain.len() > 1 {
+            Some(&chain[1])
+        } else {
+            self.config.trust_store.find_issuer(leaf)
+        };
+
+        let issuer = issuer.ok_or_else(|| {
+            TlsError::VerificationFailed(
+                "Certificate Transparency check failed: no issuer certificate available to verify embedded SCTs".to_string(),
+            )
+        })?;
+
+        ct::verify_embedded_scts(leaf, issuer, &self.config.ct_log_bundle)
+            .map_err(|e| TlsError::VerificationFailed(format!("Certificate Transparency check failed: {}", e)))
     }
 
     fn verify_certificate_verify(&self, verify_msg: &[u8]) -> Result<(), TlsError> {
@@ -1214,57 +1465,66 @@ impl TlsStream {
             ));
         }
 
-        for cert in &self.config.cert_chain {
-            let public_key_bytes = cert.public_key()
-                .ok_or_else(|| TlsError::InvalidCertificate("Missing public key".to_string()))?;
+        let peer_cert = self.peer_leaf_certificate.as_ref().ok_or_else(|| {
+            TlsError::VerificationFailed(
+                "No peer certificate on file to verify CertificateVerify against".to_string(),
+            )
+        })?;
+        
+        let public_key_bytes = peer_cert.public_key()
+            .ok_or_else(|| TlsError::InvalidCertificate("Peer certificate missing public key".to_string()))?;
+        
+        let public_key = rsa::RsaPublicKey::from_bytes(&public_key_bytes).map_err(|_| {
+            TlsError::InvalidCertificate("Failed to parse peer public key".to_string())
+        })?;
 
-            let public_key = rsa::RsaPublicKey::from_bytes(&public_key_bytes).map_err(|_| {
-                TlsError::InvalidCertificate("Failed to parse public key".to_string())
-            })?;
-
-            let signature_len = u16::from_be_bytes([verify_msg[2], verify_msg[3]]) as usize;
-            if 4 + signature_len > verify_msg.len() {
-                return Err(TlsError::VerificationFailed(
-                    "CertificateVerify signature truncated".to_string(),
-                ));
-            }
-
-            let signature = &verify_msg[4..4 + signature_len];
-            let transcript_hash = self.compute_transcript_hash();
-            let mut to_verify = Vec::new();
-            to_verify.extend_from_slice(&[0x20u8; 64]);
-            if self.is_client {
-                to_verify.extend_from_slice(b"TLS 1.3, client CertificateVerify");
-            } else {
-                to_verify.extend_from_slice(b"TLS 1.3, server CertificateVerify");
-            }
-
-            to_verify.push(0);
-            to_verify.extend_from_slice(&transcript_hash);
-            if public_key.verify(&to_verify, signature, rsa::RsaPadding::Pkcs1v15).unwrap_or(false) {
-                return Ok(());
-            }
+        let signature_len = u16::from_be_bytes([verify_msg[2], verify_msg[3]]) as usize;
+        if 4 + signature_len > verify_msg.len() {
+            return Err(TlsError::VerificationFailed(
+                "CertificateVerify signature truncated".to_string(),
+            ));
         }
 
-        Err(TlsError::VerificationFailed(
-            "CertificateVerify verification failed".to_string(),
-        ))
+        let signature = &verify_msg[4..4 + signature_len];
+        let transcript_hash = self.compute_transcript_hash();
+        let mut to_verify = Vec::new();
+        to_verify.extend_from_slice(&[0x20u8; 64]);
+        if self.is_client {
+            to_verify.extend_from_slice(b"TLS 1.3, server CertificateVerify");
+        } else {
+            to_verify.extend_from_slice(b"TLS 1.3, client CertificateVerify");
+        }
+
+        to_verify.push(0);
+        to_verify.extend_from_slice(&transcript_hash);
+        if public_key.verify(&to_verify, signature, rsa::RsaPadding::Pkcs1v15).unwrap_or(false) {
+            Ok(())
+        } else {
+            Err(TlsError::VerificationFailed(
+                "CertificateVerify verification failed".to_string(),
+            ))
+        }
+    }
+
+    fn set_early_secret(&mut self, psk: Option<&[u8]>) {
+        let ikm = psk.unwrap_or(&[0u8; 32]);
+        self.early_secret = hkdf::Hkdf::extract(Some(&[0u8; 32]), ikm);
     }
 
     fn derive_handshake_keys(&mut self, shared_secret: &[u8]) -> Result<(), TlsError> {
-        let mut hasher = sha2::Sha256::new();
-        hasher.update(b"");
-        let empty_hash = hasher.finalize();
+        let empty_hash = empty_hash();
 
-        let early_secret = hkdf::Hkdf::extract(Some(&[0u8; 32]), &[0u8; 32]);
-        let derived = self.hkdf_expand_label(&early_secret, b"derived", &empty_hash, 32)?;
+        let derived = self.hkdf_expand_label(&self.early_secret.clone(), b"derived", &empty_hash, 32)?;
         let handshake_secret = hkdf::Hkdf::extract(Some(&derived), shared_secret);
         let transcript_hash = self.compute_transcript_hash();
         let client_hs_secret =
             self.hkdf_expand_label(&handshake_secret, b"c hs traffic", &transcript_hash, 32)?;
-        
+
         let server_hs_secret =
             self.hkdf_expand_label(&handshake_secret, b"s hs traffic", &transcript_hash, 32)?;
+
+        let derived2 = self.hkdf_expand_label(&handshake_secret, b"derived", &empty_hash, 32)?;
+        self.master_secret = hkdf::Hkdf::extract(Some(&derived2), &[0u8; 32]);
 
         let key_len = Self::aead_key_len(self.cipher_suite);
         let client_write_key = self.hkdf_expand_label(&client_hs_secret, b"key", b"", key_len)?;
@@ -1276,19 +1536,17 @@ impl TlsStream {
             server_write_key,
             client_write_iv,
             server_write_iv,
+            client_traffic_secret: client_hs_secret,
+            server_traffic_secret: server_hs_secret,
         });
 
         Ok(())
     }
 
-    fn derive_keys(&mut self, _client_random: &[u8; 32], _server_random: &[u8; 32], shared_secret: &[u8]) -> Result<(), TlsError> {
-        self.derive_application_keys(shared_secret)
-    }
-
-    fn derive_application_keys(&mut self, shared_secret: &[u8]) -> Result<(), TlsError> {
+    fn derive_application_keys(&mut self) -> Result<(), TlsError> {
         let handshake_hash = self.compute_transcript_hash();
-        let client_app_secret = self.hkdf_expand_label(shared_secret, b"c ap traffic", &handshake_hash, 32)?;
-        let server_app_secret = self.hkdf_expand_label(shared_secret, b"s ap traffic", &handshake_hash, 32)?;
+        let client_app_secret = self.hkdf_expand_label(&self.master_secret.clone(), b"c ap traffic", &handshake_hash, 32)?;
+        let server_app_secret = self.hkdf_expand_label(&self.master_secret.clone(), b"s ap traffic", &handshake_hash, 32)?;
         let key_len = Self::aead_key_len(self.cipher_suite);
         let client_write_key = self.hkdf_expand_label(&client_app_secret, b"key", b"", key_len)?;
         let client_write_iv = self.hkdf_expand_label(&client_app_secret, b"iv", b"", 12)?;
@@ -1300,33 +1558,31 @@ impl TlsStream {
             server_write_key,
             client_write_iv,
             server_write_iv,
+            client_traffic_secret: client_app_secret,
+            server_traffic_secret: server_app_secret,
         });
 
         Ok(())
     }
 
+    fn compute_resumption_master_secret(&self) -> Result<Vec<u8>, TlsError> {
+        let transcript_hash = self.compute_transcript_hash();
+        self.hkdf_expand_label(&self.master_secret.clone(), b"res master", &transcript_hash, 32)
+    }
+
     fn derive_finished_key(&self, is_client: bool) -> Result<Vec<u8>, TlsError> {
         let keys = self.keys.as_ref().ok_or_else(|| TlsError::HandshakeFailed("Keys not derived".to_string()))?;
         let base = if is_client {
-            &keys.client_write_key
+            &keys.client_traffic_secret
         } else {
-            &keys.server_write_key
+            &keys.server_traffic_secret
         };
 
         self.hkdf_expand_label(base, b"finished", b"", 32)
     }
 
     fn hkdf_expand_label(&self, secret: &[u8], label: &[u8], context: &[u8], length: usize) -> Result<Vec<u8>, TlsError> {
-        let mut hkdf_label = Vec::new();
-        let full_label = [b"tls13 ", label].concat();
-        hkdf_label.extend_from_slice(&(length as u16).to_be_bytes());
-        hkdf_label.push(full_label.len() as u8);
-        hkdf_label.extend_from_slice(&full_label);
-        hkdf_label.push(context.len() as u8);
-        hkdf_label.extend_from_slice(context);
-
-        hkdf::Hkdf::expand(secret, &hkdf_label, length)
-            .map_err(|e| TlsError::CipherError(format!("HKDF expand failed: {:?}", e)))
+        hkdf_expand_label_raw(secret, label, context, length)
     }
 
     fn compute_transcript_hash(&self) -> Vec<u8> {
@@ -2088,6 +2344,10 @@ impl TlsStream {
             alpn_negotiator: self.alpn_negotiator.clone(),
             negotiated_protocol: self.negotiated_protocol,
             negotiated_record_compression: self.negotiated_record_compression,
+            early_secret: self.early_secret.clone(),
+            master_secret: self.master_secret.clone(),
+            resumption_master_secret: self.resumption_master_secret.clone(),
+            peer_leaf_certificate: self.peer_leaf_certificate.clone(),
         })
     }
 }
@@ -2132,6 +2392,11 @@ impl Default for TlsCfg {
             enable_session_resumption: true,
             record_security: TlsRecordSecurityCfg::default(),
             record_compression: TlsRecordCompressionCfg::default(),
+            enable_revocation_checking: true,
+            revocation_policy: RevocationPolicy::default(),
+            crl_cache: CrlCache::new(),
+            enable_certificate_transparency: false,
+            ct_log_bundle: CtLogBundle::bundled(),
         }
     }
 }
@@ -2276,6 +2541,8 @@ mod tls_tests {
                 server_write_key: vec![0x22; 16],
                 client_write_iv: vec![0x33; 12],
                 server_write_iv: vec![0x44; 12],
+                client_traffic_secret: vec![0x55; 32],
+                server_traffic_secret: vec![0x66; 32],
             }),
             handshake_msg: Vec::new(),
             client_seq: 0,
@@ -2288,6 +2555,10 @@ mod tls_tests {
             alpn_negotiator: AlpnNegotiator::new(),
             negotiated_protocol: None,
             negotiated_record_compression: CompressionAlgorithm::Identity,
+            early_secret: Vec::new(),
+            master_secret: Vec::new(),
+            resumption_master_secret: Vec::new(),
+            peer_leaf_certificate: None,
         }
     }
 
@@ -2313,6 +2584,10 @@ mod tls_tests {
             alpn_negotiator: AlpnNegotiator::new(),
             negotiated_protocol: None,
             negotiated_record_compression: CompressionAlgorithm::Identity,
+            early_secret: Vec::new(),
+            master_secret: Vec::new(),
+            resumption_master_secret: Vec::new(),
+            peer_leaf_certificate: None,
         }
     }
 
@@ -2638,7 +2913,7 @@ mod tls_tests {
         trust_store.add_cert(root.clone());
 
         let config = TlsCfg { verify_peer: true, trust_store, ..TlsCfg::default() };
-        let tls = test_tls_stream_with_config(config, Some("example.com".to_string()));
+        let mut tls = test_tls_stream_with_config(config, Some("example.com".to_string()));
 
         let mut cert_msg = vec![0u8];
         let mut cert_list = Vec::new();
@@ -2660,6 +2935,87 @@ mod tls_tests {
 
         let result = tls.verify_certificate(&cert_msg);
         assert!(result.is_ok(), "verify_certificate failed: {:?}", result);
+    }
+
+    #[test]
+    fn test_verify_certificate_verify_checks_peers_actual_key() {
+        let leaf_key = rsa::RsaPrivateKey::generate(rsa::RsaKeySize::Rsa2048).unwrap();
+        let unrelated_key = rsa::RsaPrivateKey::generate(rsa::RsaKeySize::Rsa2048).unwrap();
+
+        let leaf = build_test_cert(
+            "example.com", "Test Root CA", &leaf_key.public_key(), &leaf_key,
+            false, None, false, &[EKU_SERVER_AUTH],
+        );
+
+        let mut tls = test_tls_stream_with_config(TlsCfg::default(), Some("example.com".to_string()));
+        tls.peer_leaf_certificate = Some(leaf);
+
+        let transcript_hash = tls.compute_transcript_hash();
+        let mut to_sign = vec![0x20u8; 64];
+        to_sign.extend_from_slice(b"TLS 1.3, server CertificateVerify");
+        to_sign.push(0);
+        to_sign.extend_from_slice(&transcript_hash);
+
+        let build_verify_msg = |signature: Vec<u8>| {
+            let mut msg = 0x0804u16.to_be_bytes().to_vec();
+            msg.extend_from_slice(&(signature.len() as u16).to_be_bytes());
+            msg.extend_from_slice(&signature);
+            msg
+        };
+
+        let forged_signature = unrelated_key.sign(&to_sign, rsa::RsaPadding::Pkcs1v15).unwrap();
+        assert!(tls.verify_certificate_verify(&build_verify_msg(forged_signature)).is_err());
+
+        let real_signature = leaf_key.sign(&to_sign, rsa::RsaPadding::Pkcs1v15).unwrap();
+        assert!(tls.verify_certificate_verify(&build_verify_msg(real_signature)).is_ok());
+    }
+
+    #[test]
+    fn test_verify_certificate_enforces_ct_when_enabled() {
+        let root_key = rsa::RsaPrivateKey::generate(rsa::RsaKeySize::Rsa2048).unwrap();
+        let leaf_key = rsa::RsaPrivateKey::generate(rsa::RsaKeySize::Rsa2048).unwrap();
+
+        let root = build_test_cert(
+            "Test Root CA", "Test Root CA", &root_key.public_key(), &root_key,
+            true, None, true, &[],
+        );
+
+        let leaf = build_test_cert(
+            "example.com", "Test Root CA", &leaf_key.public_key(), &root_key,
+            false, None, false, &[EKU_SERVER_AUTH],
+        );
+
+        let mut trust_store = TrustStore::empty();
+        trust_store.add_cert(root.clone());
+
+        let config = TlsCfg {
+            verify_peer: true,
+            trust_store,
+            enable_certificate_transparency: true,
+            ..TlsCfg::default()
+        };
+        let mut tls = test_tls_stream_with_config(config, Some("example.com".to_string()));
+
+        let mut cert_msg = vec![0u8];
+        let mut cert_list = Vec::new();
+        for cert in [&leaf, &root] {
+            let der = cert.to_der();
+            let len = der.len() as u32;
+            cert_list.push(((len >> 16) & 0xff) as u8);
+            cert_list.push(((len >> 8) & 0xff) as u8);
+            cert_list.push((len & 0xff) as u8);
+            cert_list.extend_from_slice(&der);
+            cert_list.extend_from_slice(&0u16.to_be_bytes());
+        }
+
+        let list_len = cert_list.len() as u32;
+        cert_msg.push(((list_len >> 16) & 0xff) as u8);
+        cert_msg.push(((list_len >> 8) & 0xff) as u8);
+        cert_msg.push((list_len & 0xff) as u8);
+        cert_msg.extend_from_slice(&cert_list);
+
+        let err = tls.verify_certificate(&cert_msg).unwrap_err();
+        assert!(format!("{}", err).contains("Certificate Transparency"), "unexpected error: {}", err);
     }
 
     #[test]
@@ -2697,6 +3053,10 @@ mod tls_tests {
             alpn_negotiator: AlpnNegotiator::new(),
             negotiated_protocol: None,
             negotiated_record_compression: CompressionAlgorithm::Identity,
+            early_secret: Vec::new(),
+            master_secret: Vec::new(),
+            resumption_master_secret: Vec::new(),
+            peer_leaf_certificate: None,
         };
 
         let client_ciphers = vec![0x1301, 0x1302];
@@ -2727,6 +3087,10 @@ mod tls_tests {
             alpn_negotiator: AlpnNegotiator::new(),
             negotiated_protocol: None,
             negotiated_record_compression: CompressionAlgorithm::Identity,
+            early_secret: Vec::new(),
+            master_secret: Vec::new(),
+            resumption_master_secret: Vec::new(),
+            peer_leaf_certificate: None,
         };
 
         let client_hello = vec![
@@ -2829,5 +3193,118 @@ mod tls_tests {
         let digest = sha256(b"digest-example");
         let b64 = pem::encode(&digest);
         assert!(!b64.is_empty());
+    }
+
+    #[test]
+    fn test_psk_binder_rejects_wrong_psk() {
+        let offer = ClientPskOffer {
+            ticket: vec![1, 2, 3],
+            binder: vec![0u8; 32],
+            truncated_transcript_hash: vec![0xAB; 32],
+        };
+
+        let real_psk = vec![0x11; 32];
+        let binder_key = hkdf_expand_label_raw(
+            &hkdf::Hkdf::extract(Some(&[0u8; 32]), &real_psk),
+            b"res binder",
+            &empty_hash(),
+            32,
+        ).unwrap();
+        let finished_key = hkdf_expand_label_raw(&binder_key, b"finished", b"", 32).unwrap();
+        let real_binder = hmac_sha256(&finished_key, &offer.truncated_transcript_hash);
+        let real_offer = ClientPskOffer { binder: real_binder.to_vec(), ..offer };
+
+        assert!(verify_psk_binder(&real_offer, &real_psk).unwrap());
+
+        let wrong_psk = vec![0x22; 32];
+        assert!(!verify_psk_binder(&real_offer, &wrong_psk).unwrap());
+    }
+
+    #[test]
+    fn test_psk_binder_rejects_tampered_transcript() {
+        let psk = vec![0x33; 32];
+        let binder_key = hkdf_expand_label_raw(
+            &hkdf::Hkdf::extract(Some(&[0u8; 32]), &psk),
+            b"res binder",
+            &empty_hash(),
+            32,
+        ).unwrap();
+        let finished_key = hkdf_expand_label_raw(&binder_key, b"finished", b"", 32).unwrap();
+        let binder = hmac_sha256(&finished_key, &vec![0xCC; 32]);
+
+        let offer = ClientPskOffer {
+            ticket: vec![1, 2, 3],
+            binder: binder.to_vec(),
+            truncated_transcript_hash: vec![0xDD; 32],
+        };
+
+        assert!(!verify_psk_binder(&offer, &psk).unwrap());
+    }
+
+    #[test]
+    fn test_full_handshake_and_psk_resumption_round_trip() {
+        let leaf_key = rsa::RsaPrivateKey::generate(rsa::RsaKeySize::Rsa2048).unwrap();
+        let leaf = build_test_cert(
+            "example.com", "example.com", &leaf_key.public_key(), &leaf_key,
+            false, None, false, &[EKU_SERVER_AUTH],
+        );
+
+        let mut trust_store = TrustStore::empty();
+        trust_store.add_cert(leaf.clone());
+
+        let mut server_cfg = TlsCfg::default();
+        server_cfg.cert_chain = vec![leaf];
+        server_cfg.private_key = leaf_key;
+        server_cfg.enable_session_resumption = true;
+        server_cfg.session_cache = Some(SessionCache::new());
+
+        let mut client_cfg = TlsCfg::default();
+        client_cfg.verify_peer = true;
+        client_cfg.trust_store = trust_store;
+        client_cfg.enable_session_resumption = true;
+        client_cfg.session_cache = Some(SessionCache::new());
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
+        let server_cfg_1 = server_cfg.clone();
+        let server_thread = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept");
+            TlsStream::new_server(stream, server_cfg_1).expect("server handshake")
+        });
+
+        let stream = TcpStream::connect(&addr).expect("connect");
+        let client = TlsStream::new_client_with_sni(stream, client_cfg.clone(), "example.com".to_string())
+            .expect("client handshake");
+        assert!(!client.resuming_session, "first connection has no ticket to resume");
+        drop(client);
+        let server = server_thread.join().expect("server thread");
+        assert!(!server.resuming_session);
+
+        let cached = client_cfg.session_cache.as_ref().unwrap().get("example.com")
+            .expect("expected a resumable session to be cached after the first connection");
+        assert!(!cached.resumption_master_secret.is_empty());
+        assert!(cached.ticket.is_some());
+
+        let listener2 = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr2 = format!("127.0.0.1:{}", listener2.local_addr().unwrap().port());
+        let server_cfg_2 = server_cfg.clone();
+        let server_thread2 = thread::spawn(move || {
+            let (stream, _) = listener2.accept().expect("accept");
+            let mut tls = TlsStream::new_server(stream, server_cfg_2).expect("server handshake (resumed)");
+            let resumed = tls.resuming_session;
+            let mut buf = [0u8; 16];
+            let n = tls.read(&mut buf).expect("server read");
+            assert_eq!(&buf[..n], b"ping");
+            resumed
+        });
+
+        let stream2 = TcpStream::connect(&addr2).expect("connect");
+        let mut client2 = TlsStream::new_client_with_sni(stream2, client_cfg.clone(), "example.com".to_string())
+            .expect("client handshake (resumed)");
+        assert!(client2.resuming_session, "client should have resumed via PSK");
+        client2.write_all(b"ping").expect("client write");
+
+        let server_resumed = server_thread2.join().expect("server thread 2");
+        assert!(server_resumed, "server should have accepted the PSK and resumed");
     }
 }
