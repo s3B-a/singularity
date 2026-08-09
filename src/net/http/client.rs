@@ -11,7 +11,7 @@ use crate::crypto::encoding::pem;
 use crate::crypto::hash::hmac::hmac_sha256;
 use crate::crypto::hash::sha2::sha256;
 use crate::crypto::random;
-use crate::net::connection_pool::ConnectionPool;
+use crate::net::connection_pool::{ConnectionPool, PooledProtocol};
 use crate::net::cookie::{parse_set_cookie, Cookie, CookieJar};
 use crate::net::dns::DnsResolver;
 use crate::net::http::compression::{self, CompressionAlgorithm, CompressionLevel};
@@ -1455,7 +1455,7 @@ impl HttpClient {
         let conn = if let Some(existing) = self.http2_connections.get_mut(&connection_key) {
             existing
         } else {
-            let tcp_stream = self.connection_pool.get_or_connect(host, port)?;
+            let tcp_stream = self.connection_pool.get_or_connect(host, port, PooledProtocol::Http2)?;
             let http2_conn = Http2Connection::new(tcp_stream)
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
 
@@ -1512,7 +1512,7 @@ impl HttpClient {
     }
 
     fn create_http1_connection(&self, host: &str, port: u16) -> io::Result<Http1ConnectionEntry> {
-        let tcp_stream = self.connection_pool.get_or_connect(host, port)?;
+        let tcp_stream = self.connection_pool.get_or_connect(host, port, PooledProtocol::Http1)?;
         tcp_stream.set_read_timeout(self.timeout)?;
         tcp_stream.set_write_timeout(self.timeout)?;
 
