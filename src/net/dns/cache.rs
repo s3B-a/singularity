@@ -1,3 +1,4 @@
+use super::packet::ResponseCode;
 use super::record::{DnsRecord, RecordType};
 use crate::crypto::constant_time_eq;
 use crate::crypto::encoding::pem;
@@ -10,6 +11,19 @@ use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
 const CACHE_STATS_MAGIC: &str = "SINGULARITY_DNS_CACHE_STATS_V1";
+
+#[derive(Debug, Clone, Copy)]
+struct NegativeCacheEntry {
+    response_code: ResponseCode,
+    ttl: u32,
+    inserted_at: Instant,
+}
+
+impl NegativeCacheEntry {
+    fn is_expired(&self) -> bool {
+        self.inserted_at.elapsed().as_secs() as u32 >= self.ttl
+    }
+}
 
 #[derive(Clone)]
 struct CacheEntry {
@@ -70,6 +84,7 @@ impl CacheEntry {
 #[derive(Clone)]
 pub struct DnsCache {
     cache: Arc<RwLock<HashMap<CacheKey, Vec<CacheEntry>>>>,
+    negative_cache: Arc<RwLock<HashMap<CacheKey, NegativeCacheEntry>>>,
     max_size: usize,
 }
 
@@ -103,6 +118,7 @@ impl DnsCache {
     pub fn new(max_size: usize) -> Self {
         Self {
             cache: Arc::new(RwLock::new(HashMap::new())),
+            negative_cache: Arc::new(RwLock::new(HashMap::new())),
             max_size,
         }
     }
@@ -121,6 +137,26 @@ impl DnsCache {
         }
 
         cache.entry(key.clone()).or_insert_with(Vec::new).push(CacheEntry::new(record, &key.name_hash));
+        self.negative_cache.write().unwrap().remove(&key);
+    }
+
+    pub fn insert_negative(&self, name: &str, record_type: RecordType, response_code: ResponseCode, ttl: u32) {
+        let key = CacheKey::new(name.to_string(), record_type);
+        let mut negative = self.negative_cache.write().unwrap();
+        negative.insert(
+            key,
+            NegativeCacheEntry {
+                response_code,
+                ttl,
+                inserted_at: Instant::now(),
+            },
+        );
+    }
+
+    pub fn get_negative(&self, name: &str, record_type: RecordType) -> Option<ResponseCode> {
+        let key = CacheKey::new(name.to_string(), record_type);
+        let negative = self.negative_cache.read().unwrap();
+        negative.get(&key).filter(|entry| !entry.is_expired()).map(|entry| entry.response_code)
     }
 
     pub fn insert_many(&self, name: &str, records: Vec<DnsRecord>) {
@@ -152,6 +188,7 @@ impl DnsCache {
     pub fn clear(&self) {
         let mut cache = self.cache.write().unwrap();
         cache.clear();
+        self.negative_cache.write().unwrap().clear();
     }
 
     pub fn remove(&self, name: &str, record_type: RecordType) {
@@ -170,6 +207,7 @@ impl DnsCache {
     pub fn cleanup(&self) {
         let mut cache = self.cache.write().unwrap();
         self.cleanup_expired(&mut cache);
+        self.negative_cache.write().unwrap().retain(|_, entry| !entry.is_expired());
     }
 
     pub fn size(&self) -> usize {
@@ -554,6 +592,36 @@ mod tests {
         assert_eq!(parsed.total_keys, 1);
         assert_eq!(parsed.total_entries, 1);
         assert_eq!(parsed.expired_entries, 0);
+    }
+
+    #[test]
+    fn test_negative_cache_hit_and_expiry() {
+        let cache = DnsCache::new(100);
+        assert!(cache.get_negative("nowhere.example", RecordType::A).is_none());
+
+        cache.insert_negative("nowhere.example", RecordType::A, ResponseCode::NameError, 1);
+        assert_eq!(
+            cache.get_negative("nowhere.example", RecordType::A),
+            Some(ResponseCode::NameError)
+        );
+
+        thread::sleep(std::time::Duration::from_secs(2));
+        assert!(cache.get_negative("nowhere.example", RecordType::A).is_none());
+    }
+
+    #[test]
+    fn test_positive_insert_clears_negative_entry() {
+        let cache = DnsCache::new(100);
+        cache.insert_negative("example.com", RecordType::A, ResponseCode::NameError, 300);
+        assert!(cache.get_negative("example.com", RecordType::A).is_some());
+
+        cache.insert(
+            "example.com",
+            DnsRecord::a("example.com".to_string(), 300, Ipv4Addr::new(93, 184, 216, 34)),
+        );
+
+        assert!(cache.get_negative("example.com", RecordType::A).is_none());
+        assert!(cache.get("example.com", RecordType::A).is_some());
     }
 
     #[test]

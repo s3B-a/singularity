@@ -805,6 +805,24 @@ mod tests {
     }
 
     #[test]
+    fn test_pool_is_protocol_aware() {
+        use crate::net::tcp::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind must succeed");
+        let addr = listener.local_addr().expect("local_addr must succeed");
+
+        let pool = ConnectionPool::new();
+        let stream = TcpStream::connect(addr).expect("connect must succeed");
+        let _server_side = listener.accept().expect("accept must succeed");
+
+        pool.return_connection(&addr.ip().to_string(), addr.port(), PooledProtocol::Http2, stream);
+
+        let key = ConnectionPool::derive_pool_key(&addr.ip().to_string(), addr.port());
+        assert!(pool.try_get(&key, PooledProtocol::Http1).is_none());
+        assert!(pool.try_get(&key, PooledProtocol::Http2).is_some());
+    }
+
+    #[test]
     fn test_snapshot_without_integrity_still_imports() {
         let pool = ConnectionPool::new().with_security(PoolSecurityCfg {
             enable_integrity: false,

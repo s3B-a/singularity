@@ -1047,6 +1047,24 @@ mod tests {
     }
 
     #[test]
+    fn test_decompress_bounded_rejects_oversized_output() {
+        let data = vec![b'a'; 200_000];
+        let compressed = compress(&data, CompressionLevel::Best).unwrap();
+
+        let result = decompress_bounded(&compressed, 1024);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_decompress_bounded_allows_output_under_limit() {
+        let data = vec![b'a'; 1024];
+        let compressed = compress(&data, CompressionLevel::Default).unwrap();
+
+        let result = decompress_bounded(&compressed, 1024 * 1024).unwrap();
+        assert_eq!(result, data);
+    }
+
+    #[test]
     fn test_adler32_baseline() {
         let data = b"adler32-check";
         let checksum = adler32(data);

@@ -15,6 +15,19 @@ use std::time::Duration;
 
 const RESOLVER_PROFILE_MAGIC: &str = "SINGULARITY_DNS_RESOLVER_PROFILE_V1";
 
+const DEFAULT_NEGATIVE_TTL: u32 = 300;
+const MAX_NEGATIVE_TTL: u32 = 3600;
+
+fn negative_ttl_from_response(response: &DnsResponse) -> u32 {
+    response.authority().iter().find_map(|record| {
+        if let super::record::RecordData::SOA { minimum, .. } = &record.data {
+            Some((*minimum).min(record.ttl))
+        } else {
+            None
+        }
+    }).unwrap_or(DEFAULT_NEGATIVE_TTL).min(MAX_NEGATIVE_TTL)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SecureResolverProfileMeta {
     pub algorithm: CompressionAlgorithm,
@@ -133,6 +146,17 @@ impl DnsResolver {
             if let Some(records) = self.cache.get(name, record_type) {
                 return Ok(records);
             }
+
+            if let Some(cached_response_code) = self.cache.get_negative(name, record_type) {
+                if cached_response_code == super::packet::ResponseCode::NoError {
+                    return Ok(Vec::new());
+                }
+
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("DNS query failed (cached): {:?}", cached_response_code),
+                ));
+            }
         }
 
         let servers = self.get_servers();
@@ -147,6 +171,11 @@ impl DnsResolver {
         let packet = query.query_with_retries(name, record_type, &servers, self.retries)?;
         let response = DnsResponse::new(packet);
         if !response.is_successful() {
+            if self.enable_cache {
+                let ttl = negative_ttl_from_response(&response);
+                self.cache.insert_negative(name, record_type, response.response_code(), ttl);
+            }
+
             return Err(io::Error::new(
                 io::ErrorKind::Other,
                 format!("DNS query failed: {:?}", response.response_code()),
@@ -154,8 +183,13 @@ impl DnsResolver {
         }
 
         let records = response.answers().to_vec();
-        if self.enable_cache && !records.is_empty() {
-            self.cache.insert_many(name, records.clone());
+        if self.enable_cache {
+            if !records.is_empty() {
+                self.cache.insert_many(name, records.clone());
+            } else {
+                let ttl = negative_ttl_from_response(&response);
+                self.cache.insert_negative(name, record_type, response.response_code(), ttl);
+            }
         }
 
         Ok(records)

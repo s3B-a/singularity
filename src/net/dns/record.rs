@@ -22,6 +22,11 @@ pub enum RecordType {
     AAAA = 28,
     SRV = 33,
     OPT = 41,
+    DS = 43,
+    RRSIG = 46,
+    NSEC = 47,
+    DNSKEY = 48,
+    NSEC3 = 50,
     Unknown(u16),
 }
 
@@ -38,6 +43,11 @@ impl RecordType {
             28 => RecordType::AAAA,
             33 => RecordType::SRV,
             41 => RecordType::OPT,
+            43 => RecordType::DS,
+            46 => RecordType::RRSIG,
+            47 => RecordType::NSEC,
+            48 => RecordType::DNSKEY,
+            50 => RecordType::NSEC3,
             _ => RecordType::Unknown(value),
         }
     }
@@ -54,6 +64,11 @@ impl RecordType {
             RecordType::AAAA => 28,
             RecordType::SRV => 33,
             RecordType::OPT => 41,
+            RecordType::DS => 43,
+            RecordType::RRSIG => 46,
+            RecordType::NSEC => 47,
+            RecordType::DNSKEY => 48,
+            RecordType::NSEC3 => 50,
             RecordType::Unknown(v) => v,
         }
     }
@@ -117,6 +132,33 @@ pub enum RecordData {
         weight: u16,
         port: u16,
         target: String,
+    },
+    RRSIG {
+        type_covered: u16,
+        algorithm: u8,
+        labels: u8,
+        original_ttl: u32,
+        signature_expiration: u32,
+        signature_inception: u32,
+        key_tag: u16,
+        signer_name: String,
+        signature: Vec<u8>,
+    },
+    DNSKEY {
+        flags: u16,
+        protocol: u8,
+        algorithm: u8,
+        public_key: Vec<u8>,
+    },
+    DS {
+        key_tag: u16,
+        algorithm: u8,
+        digest_type: u8,
+        digest: Vec<u8>,
+    },
+    NSEC {
+        next_domain_name: String,
+        type_bit_maps: Vec<u8>,
     },
     Unknown(Vec<u8>),
 }
@@ -300,6 +342,11 @@ impl fmt::Display for RecordType {
             RecordType::AAAA => write!(f, "AAAA"),
             RecordType::SRV => write!(f, "SRV"),
             RecordType::OPT => write!(f, "OPT"),
+            RecordType::DS => write!(f, "DS"),
+            RecordType::RRSIG => write!(f, "RRSIG"),
+            RecordType::NSEC => write!(f, "NSEC"),
+            RecordType::DNSKEY => write!(f, "DNSKEY"),
+            RecordType::NSEC3 => write!(f, "NSEC3"),
             RecordType::Unknown(v) => write!(f, "Unknown({})", v),
         }
     }
@@ -328,6 +375,22 @@ impl fmt::Display for RecordData {
             }
             RecordData::SRV { priority, weight, port, target } => {
                 write!(f, "{} {} {} {}", priority, weight, port, target)
+            }
+            RecordData::RRSIG { type_covered, algorithm, labels, original_ttl, signature_expiration, signature_inception, key_tag, signer_name, .. } => {
+                write!(
+                    f,
+                    "{} {} {} {} {} {} {} {}",
+                    type_covered, algorithm, labels, original_ttl, signature_expiration, signature_inception, key_tag, signer_name
+                )
+            }
+            RecordData::DNSKEY { flags, protocol, algorithm, public_key } => {
+                write!(f, "{} {} {} <{} bytes>", flags, protocol, algorithm, public_key.len())
+            }
+            RecordData::DS { key_tag, algorithm, digest_type, digest } => {
+                write!(f, "{} {} {} <{} bytes>", key_tag, algorithm, digest_type, digest.len())
+            }
+            RecordData::NSEC { next_domain_name, type_bit_maps } => {
+                write!(f, "{} <{} bytes>", next_domain_name, type_bit_maps.len())
             }
             RecordData::Unknown(data) => {
                 write!(f, "<{} bytes>", data.len())
@@ -437,6 +500,10 @@ fn record_data_kind(data: &RecordData) -> &'static str {
         RecordData::PTR(_) => "PTR",
         RecordData::SOA { .. } => "SOA",
         RecordData::SRV { .. } => "SRV",
+        RecordData::RRSIG { .. } => "RRSIG",
+        RecordData::DNSKEY { .. } => "DNSKEY",
+        RecordData::DS { .. } => "DS",
+        RecordData::NSEC { .. } => "NSEC",
         RecordData::Unknown(_) => "UNKNOWN",
     }
 }
@@ -485,7 +552,44 @@ fn encode_record_data(data: &RecordData) -> Vec<u8> {
             out.extend_from_slice(&port.to_be_bytes());
             out.extend_from_slice(&(target.len() as u16).to_be_bytes());
             out.extend_from_slice(target.as_bytes());
-            
+
+            out
+        }
+        RecordData::RRSIG {type_covered, algorithm, labels, original_ttl, signature_expiration, signature_inception, key_tag, signer_name, signature} => {
+            let mut out = Vec::new();
+            out.extend_from_slice(&type_covered.to_be_bytes());
+            out.push(*algorithm);
+            out.push(*labels);
+            out.extend_from_slice(&original_ttl.to_be_bytes());
+            out.extend_from_slice(&signature_expiration.to_be_bytes());
+            out.extend_from_slice(&signature_inception.to_be_bytes());
+            out.extend_from_slice(&key_tag.to_be_bytes());
+            out.extend_from_slice(&(signer_name.len() as u16).to_be_bytes());
+            out.extend_from_slice(signer_name.as_bytes());
+            out.extend_from_slice(signature);
+            out
+        }
+        RecordData::DNSKEY {flags, protocol, algorithm, public_key} => {
+            let mut out = Vec::new();
+            out.extend_from_slice(&flags.to_be_bytes());
+            out.push(*protocol);
+            out.push(*algorithm);
+            out.extend_from_slice(public_key);
+            out
+        }
+        RecordData::DS {key_tag, algorithm, digest_type, digest} => {
+            let mut out = Vec::new();
+            out.extend_from_slice(&key_tag.to_be_bytes());
+            out.push(*algorithm);
+            out.push(*digest_type);
+            out.extend_from_slice(digest);
+            out
+        }
+        RecordData::NSEC {next_domain_name, type_bit_maps} => {
+            let mut out = Vec::new();
+            out.extend_from_slice(&(next_domain_name.len() as u16).to_be_bytes());
+            out.extend_from_slice(next_domain_name.as_bytes());
+            out.extend_from_slice(type_bit_maps);
             out
         }
         RecordData::Unknown(data) => data.clone(),
@@ -524,6 +628,10 @@ fn decode_record_data(kind: &str, payload: &[u8]) -> io::Result<RecordData> {
         "TXT" => decode_txt(payload),
         "SOA" => decode_soa(payload),
         "SRV" => decode_srv(payload),
+        "RRSIG" => decode_rrsig(payload),
+        "DNSKEY" => decode_dnskey(payload),
+        "DS" => decode_ds(payload),
+        "NSEC" => decode_nsec(payload),
         "UNKNOWN" => Ok(RecordData::Unknown(payload.to_vec())),
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -680,6 +788,104 @@ fn decode_srv(payload: &[u8]) -> io::Result<RecordData> {
         weight,
         port,
         target,
+    })
+}
+
+fn decode_rrsig(payload: &[u8]) -> io::Result<RecordData> {
+    if payload.len() < 18 {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid RRSIG payload"));
+    }
+
+    let type_covered = u16::from_be_bytes([payload[0], payload[1]]);
+    let algorithm = payload[2];
+    let labels = payload[3];
+    let original_ttl = u32::from_be_bytes([payload[4], payload[5], payload[6], payload[7]]);
+    let signature_expiration = u32::from_be_bytes([payload[8], payload[9], payload[10], payload[11]]);
+    let signature_inception = u32::from_be_bytes([payload[12], payload[13], payload[14], payload[15]]);
+    let key_tag = u16::from_be_bytes([payload[16], payload[17]]);
+
+    let mut idx = 18usize;
+    if idx + 2 > payload.len() {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid RRSIG signer name length"));
+    }
+
+    let name_len = u16::from_be_bytes([payload[idx], payload[idx + 1]]) as usize;
+    idx += 2;
+    if idx + name_len > payload.len() {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid RRSIG signer name"));
+    }
+
+    let signer_name = String::from_utf8(payload[idx..idx + name_len].to_vec())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid RRSIG signer name"))?;
+    idx += name_len;
+    let signature = payload[idx..].to_vec();
+
+    Ok(RecordData::RRSIG {
+        type_covered,
+        algorithm,
+        labels,
+        original_ttl,
+        signature_expiration,
+        signature_inception,
+        key_tag,
+        signer_name,
+        signature,
+    })
+}
+
+fn decode_dnskey(payload: &[u8]) -> io::Result<RecordData> {
+    if payload.len() < 4 {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid DNSKEY payload"));
+    }
+
+    let flags = u16::from_be_bytes([payload[0], payload[1]]);
+    let protocol = payload[2];
+    let algorithm = payload[3];
+    let public_key = payload[4..].to_vec();
+
+    Ok(RecordData::DNSKEY {
+        flags,
+        protocol,
+        algorithm,
+        public_key,
+    })
+}
+
+fn decode_ds(payload: &[u8]) -> io::Result<RecordData> {
+    if payload.len() < 4 {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid DS payload"));
+    }
+
+    let key_tag = u16::from_be_bytes([payload[0], payload[1]]);
+    let algorithm = payload[2];
+    let digest_type = payload[3];
+    let digest = payload[4..].to_vec();
+
+    Ok(RecordData::DS {
+        key_tag,
+        algorithm,
+        digest_type,
+        digest,
+    })
+}
+
+fn decode_nsec(payload: &[u8]) -> io::Result<RecordData> {
+    if payload.len() < 2 {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid NSEC payload"));
+    }
+
+    let name_len = u16::from_be_bytes([payload[0], payload[1]]) as usize;
+    if 2 + name_len > payload.len() {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid NSEC next domain name"));
+    }
+
+    let next_domain_name = String::from_utf8(payload[2..2 + name_len].to_vec())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid NSEC next domain name"))?;
+    let type_bit_maps = payload[2 + name_len..].to_vec();
+
+    Ok(RecordData::NSEC {
+        next_domain_name,
+        type_bit_maps,
     })
 }
 
