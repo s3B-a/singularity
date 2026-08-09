@@ -18,6 +18,33 @@ const RESOLVER_PROFILE_MAGIC: &str = "SINGULARITY_DNS_RESOLVER_PROFILE_V1";
 const DEFAULT_NEGATIVE_TTL: u32 = 300;
 const MAX_NEGATIVE_TTL: u32 = 3600;
 
+fn interleave_address_families(primary: Vec<IpAddr>, secondary: Vec<IpAddr>) -> Vec<IpAddr> {
+    let mut result = Vec::with_capacity(primary.len() + secondary.len());
+    let mut primary = primary.into_iter();
+    let mut secondary = secondary.into_iter();
+    loop {
+        match (primary.next(), secondary.next()) {
+            (Some(a), Some(b)) => {
+                result.push(a);
+                result.push(b);
+            }
+            (Some(a), None) => {
+                result.push(a);
+                result.extend(primary);
+                break;
+            }
+            (None, Some(b)) => {
+                result.push(b);
+                result.extend(secondary);
+                break;
+            }
+            (None, None) => break,
+        }
+    }
+
+    result
+}
+
 fn negative_ttl_from_response(response: &DnsResponse) -> u32 {
     response.authority().iter().find_map(|record| {
         if let super::record::RecordData::SOA { minimum, .. } = &record.data {
@@ -287,15 +314,10 @@ impl DnsResolver {
     }
 
     pub fn resolve_host(&self, name: &str) -> io::Result<Vec<IpAddr>> {
-        let mut addresses = Vec::new();
-        if let Ok(ipv4_addrs) = self.resolve_ipv4(name) {
-            addresses.extend(ipv4_addrs.into_iter().map(IpAddr::V4));
-        }
+        let ipv6_addrs: Vec<IpAddr> = self.resolve_ipv6(name).map(|addrs| addrs.into_iter().map(IpAddr::V6).collect()).unwrap_or_default();
+        let ipv4_addrs: Vec<IpAddr> = self.resolve_ipv4(name).map(|addrs| addrs.into_iter().map(IpAddr::V4).collect()).unwrap_or_default();
 
-        if let Ok(ipv6_addrs) = self.resolve_ipv6(name) {
-            addresses.extend(ipv6_addrs.into_iter().map(IpAddr::V6));
-        }
-
+        let addresses = interleave_address_families(ipv6_addrs, ipv4_addrs);
         if addresses.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
@@ -702,6 +724,36 @@ fn parse_bool(v: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_interleave_address_families_alternates_ipv6_first() {
+        let v6a = IpAddr::V6(Ipv6Addr::new(1, 0, 0, 0, 0, 0, 0, 1));
+        let v6b = IpAddr::V6(Ipv6Addr::new(2, 0, 0, 0, 0, 0, 0, 1));
+        let v4a = IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1));
+        let v4b = IpAddr::V4(Ipv4Addr::new(2, 2, 2, 2));
+
+        let result = interleave_address_families(vec![v6a, v6b], vec![v4a, v4b]);
+        assert_eq!(result, vec![v6a, v4a, v6b, v4b]);
+    }
+
+    #[test]
+    fn test_interleave_address_families_uneven_lists() {
+        let v6a = IpAddr::V6(Ipv6Addr::new(1, 0, 0, 0, 0, 0, 0, 1));
+        let v4a = IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1));
+        let v4b = IpAddr::V4(Ipv4Addr::new(2, 2, 2, 2));
+
+        let result = interleave_address_families(vec![v6a], vec![v4a, v4b]);
+        assert_eq!(result, vec![v6a, v4a, v4b]);
+    }
+
+    #[test]
+    fn test_interleave_address_families_one_empty() {
+        let v4a = IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1));
+        let v4b = IpAddr::V4(Ipv4Addr::new(2, 2, 2, 2));
+
+        let result = interleave_address_families(Vec::new(), vec![v4a, v4b]);
+        assert_eq!(result, vec![v4a, v4b]);
+    }
 
     #[test]
     fn test_resolver_creation() {

@@ -24,6 +24,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 const HTTP_CLIENT_PROFILE_BLOB_MAGIC: &str = "SINGULARITY_HTTP_CLIENT_PROFILE_BLOB_V1";
 const HTTP_CLIENT_PROFILE_BLOB_CONTEXT: &str = "SINGULARITY_HTTP_CLIENT_PROFILE_BLOB_BINDING_V1";
 
+const HAPPY_EYEBALLS_ATTEMPT_DELAY: Duration = Duration::from_millis(250);
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SecureHttpClientProfileMeta {
     pub algorithm: CompressionAlgorithm,
@@ -1553,17 +1555,9 @@ impl HttpClient {
 
     fn connect_to_host(&self, host: &str, port: u16) -> io::Result<TcpStream> {
         let ip_addresses = self.resolve_host(host)?;
-        let mut last_error = None;
-        for ip in ip_addresses {
-            match TcpStream::connect(SocketAddr::new(ip, port)) {
-                Ok(stream) => return Ok(stream),
-                Err(e) => last_error = Some(e),
-            }
-        }
-
-        Err(last_error.unwrap_or_else(|| {
-            io::Error::new(io::ErrorKind::Other, format!("Failed to connect to {}:{}", host, port))
-        }))
+        let per_attempt_timeout = self.timeout.unwrap_or(Duration::from_secs(30));
+        race_connect(&ip_addresses, port, per_attempt_timeout)
+            .map_err(|e| io::Error::new(e.kind(), format!("Failed to connect to {}:{}: {}", host, port, e)))
     }
 
     fn build_redirect_request(&self, original: &HttpRequest, location: &str) -> Result<HttpRequest, io::Error> {
@@ -2667,6 +2661,44 @@ fn parse_bool(v: &str) -> io::Result<bool> {
     }
 }
 
+fn race_connect(addresses: &[IpAddr], port: u16, per_attempt_timeout: Duration) -> io::Result<TcpStream> {
+    if addresses.is_empty() {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "no addresses to connect to"));
+    }
+
+    if addresses.len() == 1 {
+        return TcpStream::connect_timeout(SocketAddr::new(addresses[0], port), per_attempt_timeout);
+    }
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let attempts = addresses.len();
+    for (index, &ip) in addresses.iter().enumerate() {
+        let tx = tx.clone();
+        let delay = HAPPY_EYEBALLS_ATTEMPT_DELAY.saturating_mul(index as u32);
+        std::thread::spawn(move || {
+            if !delay.is_zero() {
+                std::thread::sleep(delay);
+            }
+
+            let result = TcpStream::connect_timeout(SocketAddr::new(ip, port), per_attempt_timeout);
+            let _ = tx.send((index, result));
+        });
+    }
+
+    drop(tx);
+
+    let mut last_error = None;
+    for _ in 0..attempts {
+        match rx.recv() {
+            Ok((_, Ok(stream))) => return Ok(stream),
+            Ok((_, Err(e))) => last_error = Some(e),
+            Err(_) => break,
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| io::Error::new(io::ErrorKind::Other, "all connection attempts failed")))
+}
+
 fn parse_url(url: &str) -> Result<(String, String, u16, String), io::Error> {
     let url_lower = url.to_lowercase();
     let (scheme, rest) = if url_lower.starts_with("http://") {
@@ -2780,5 +2812,34 @@ mod tests {
 
         let relative = "relative";
         assert_eq!(resolve_url(base, relative), "http://example.com/a/b/relative");
+    }
+
+    #[test]
+    fn test_race_connect_succeeds_despite_unreachable_address() {
+        use crate::net::tcp::TcpListener;
+        use std::net::Ipv4Addr;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind must succeed");
+        let addr = listener.local_addr().expect("local_addr must succeed");
+
+        // 192.0.2.0/24 is TEST-NET-1, which is reserved for documentation and guaranteed to never be routable
+        let unreachable = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
+        let addresses = vec![unreachable, addr.ip()];
+
+        let result = race_connect(&addresses, addr.port(), Duration::from_millis(500));
+        assert!(result.is_ok(), "expected the reachable address to win the race: {:?}", result.err());
+    }
+
+    #[test]
+    fn test_race_connect_fails_when_all_addresses_unreachable() {
+        use std::net::Ipv4Addr;
+
+        let addresses = vec![
+            IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
+            IpAddr::V4(Ipv4Addr::new(192, 0, 2, 2)),
+        ];
+
+        let result = race_connect(&addresses, 65000, Duration::from_millis(500));
+        assert!(result.is_err());
     }
 }
