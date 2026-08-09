@@ -6,8 +6,8 @@ use crate::crypto::hash::sha2::sha256;
 use crate::crypto::random;
 use crate::net::http::compression::{self, CompressionAlgorithm, CompressionLevel};
 use std::fmt::Write;
-use std::io;
-use std::net::{SocketAddr, UdpSocket};
+use std::io::{self, Read as _, Write as _};
+use std::net::{SocketAddr, TcpStream, UdpSocket};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const QUERY_BLOB_MAGIC: &str = "SINGULARITY_DNS_QUERY_BLOB_V1";
@@ -91,6 +91,12 @@ impl DnsQuery {
         let data = packet.write()?;
         let response = self.send_and_receive(server, &data)?;
         let parsed = DnsPacket::read(&response)?;
+
+        if parsed.header.truncated {
+            let tcp_response = self.send_and_receive_tcp(server, &data)?;
+            let tcp_parsed = DnsPacket::read(&tcp_response)?;
+            return self.verify_and_advance_id(tcp_parsed);
+        }
 
         self.verify_and_advance_id(parsed)
     }
@@ -350,6 +356,32 @@ impl DnsQuery {
         let mut buffer = vec![0u8; 4096];
         let (size, _) = socket.recv_from(&mut buffer)?;
         buffer.truncate(size);
+
+        Ok(buffer)
+    }
+
+    fn send_and_receive_tcp(&self, server: SocketAddr, wire: &[u8]) -> io::Result<Vec<u8>> {
+        if wire.len() > u16::MAX as usize {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "DNS message too large for TCP framing",
+            ));
+        }
+
+        let mut stream = TcpStream::connect_timeout(&server, self.timeout)?;
+        stream.set_read_timeout(Some(self.timeout))?;
+        stream.set_write_timeout(Some(self.timeout))?;
+
+        let len_prefix = (wire.len() as u16).to_be_bytes();
+        stream.write_all(&len_prefix)?;
+        stream.write_all(wire)?;
+
+        let mut resp_len_buf = [0u8; 2];
+        stream.read_exact(&mut resp_len_buf)?;
+        let resp_len = u16::from_be_bytes(resp_len_buf) as usize;
+
+        let mut buffer = vec![0u8; resp_len];
+        stream.read_exact(&mut buffer)?;
 
         Ok(buffer)
     }
