@@ -369,8 +369,6 @@ pub fn compress(algorithm: CompressionAlgorithm, data: &[u8], level: Compression
     }
 }
 
-/// Default cap on decompressed output size, applied by `decompress()` to every
-/// algorithm so a small crafted payload cannot expand into unbounded memory use.
 pub const MAX_DECOMPRESSED_SIZE: usize = 64 * 1024 * 1024;
 
 pub fn decompress(algorithm: CompressionAlgorithm, data: &[u8]) -> io::Result<Vec<u8>> {
