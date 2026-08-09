@@ -326,6 +326,67 @@ impl ZstdDecompressor {
 
         Ok(output)
     }
+
+    fn decompress_blocks_bounded(&mut self, data: &[u8], mut offset: usize, max_output_size: usize) -> io::Result<Vec<u8>> {
+        let mut output = Vec::new();
+        let mut last_block = false;
+        while offset < data.len() && !last_block {
+            if offset + 3 > data.len() {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "Block header truncated"));
+            }
+
+            let header_byte1 = data[offset] as u32;
+            let header_byte2 = data[offset + 1] as u32;
+            let header_byte3 = data[offset + 2] as u32;
+            let header = header_byte1 | (header_byte2 << 8) | (header_byte3 << 16);
+            offset += 3;
+
+            last_block = (header & 1) != 0;
+            let block_type = (header >> 1) & 0x3;
+            let block_size = (((header >> 3) & 0x1FFFFF) + 1) as usize;
+            if offset + block_size > data.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("Block data truncated: need {} bytes at offset {}, have {} total bytes",
+                        block_size, offset, data.len()
+                    ),
+                ));
+            }
+
+            match block_type {
+                0 | 2 | 3 => {
+                    output.extend_from_slice(&data[offset..offset + block_size]);
+                    self.window.push_slice(&data[offset..offset + block_size]);
+                }
+                1 => {
+                    if block_size > 0 {
+                        let byte = data[offset];
+                        for _ in 0..block_size {
+                            output.push(byte);
+                            self.window.push(byte);
+                        }
+                    }
+                }
+                _ => {
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid block type"));
+                }
+            }
+
+            if output.len() > max_output_size {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "decompressed output exceeds maximum allowed size of {} bytes",
+                        max_output_size
+                    ),
+                ));
+            }
+
+            offset += block_size;
+        }
+
+        Ok(output)
+    }
 }
 
 pub fn select_secure_zstd_algorithm(accept_encoding: &str) -> CompressionAlgorithm {
@@ -480,6 +541,32 @@ pub fn compress(data: &[u8], level: CompressionLevel) -> io::Result<Vec<u8>> {
 pub fn decompress(data: &[u8]) -> io::Result<Vec<u8>> {
     let mut decompressor = ZstdDecompressor::new();
     decompressor.decompress(data)
+}
+
+pub fn decompress_bounded(data: &[u8], max_output_size: usize) -> io::Result<Vec<u8>> {
+    let mut decompressor = ZstdDecompressor::new();
+    if data.len() < 5 {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "Input too short for ZSTD frame"));
+    }
+
+    let magic = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+    if magic != ZSTD_MAGIC {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid ZSTD magic number"));
+    }
+
+    let (frame_header, header_size) = FrameHeader::parse(&data[4..])?;
+    let _ = frame_header.version;
+    let data_start = 4 + header_size;
+    if data_start > data.len() {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "Frame header exceeds input"));
+    }
+
+    if data_start == data.len() {
+        return Ok(Vec::new());
+    }
+
+    let output = decompressor.decompress_blocks_bounded(data, data_start, max_output_size)?;
+    Ok(output)
 }
 
 impl Compressor for ZstdCompressor {

@@ -569,6 +569,42 @@ pub fn decompress(data: &[u8]) -> io::Result<Vec<u8>> {
     decompressor.decompress(data)
 }
 
+pub fn decompress_bounded(data: &[u8], max_output_size: usize) -> io::Result<Vec<u8>> {
+    let mut decompressor = BrotliDecompressor::new();
+    let mut output = Vec::new();
+    if data.len() < 4 || &data[0..4] != [0xce, 0xb2, 0xcf, 0x81] {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Invalid Brotli magic number",
+        ));
+    }
+
+    let mut offset = 4;
+    loop {
+        if offset >= data.len() {
+            break;
+        }
+
+        let (metablock_output, islast) = decompressor.decompress_metablock(data, &mut offset)?;
+        output.extend_from_slice(&metablock_output);
+        if output.len() > max_output_size {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "decompressed output exceeds maximum allowed size of {} bytes",
+                    max_output_size
+                ),
+            ));
+        }
+
+        if islast {
+            break;
+        }
+    }
+
+    Ok(output)
+}
+
 fn compute_brotli_blob_tag(nonce: &[u8], algorithm: CompressionAlgorithm, raw_size: usize, encoded_payload: &[u8]) -> [u8; 32] {
     let mut mac_input = Vec::new();
     mac_input.extend_from_slice(BROTLI_BLOB_CONTEXT.as_bytes());

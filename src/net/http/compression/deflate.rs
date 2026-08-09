@@ -263,13 +263,38 @@ impl DeflateCompressor {
 
 pub struct DeflateDecompressor {
     window: SlidingWindow,
+    max_output_size: Option<usize>,
 }
 
 impl DeflateDecompressor {
     pub fn new() -> Self {
         Self {
             window: SlidingWindow::new(MAX_MATCH_DISTANCE),
+            max_output_size: None,
         }
+    }
+
+    pub fn with_limit(max_output_size: usize) -> Self {
+        Self {
+            window: SlidingWindow::new(MAX_MATCH_DISTANCE),
+            max_output_size: Some(max_output_size),
+        }
+    }
+
+    fn check_output_limit(&self, output_len: usize) -> io::Result<()> {
+        if let Some(limit) = self.max_output_size {
+            if output_len > limit {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "decompressed output exceeds maximum allowed size of {} bytes",
+                        limit
+                    ),
+                ));
+            }
+        }
+
+        Ok(())
     }
 
     fn decompress_block(&mut self, reader: &mut BitReader) -> io::Result<Vec<u8>> {
@@ -279,7 +304,7 @@ impl DeflateDecompressor {
                 ||io::Error::new(io::ErrorKind::UnexpectedEof, "Unexpected EOF reading BFINAL"))?;
             let btype = reader.read_bits(2).ok_or_else(
                 || io::Error::new(io::ErrorKind::UnexpectedEof, "Unexpected EOF reading BTYPE"))? as u8;
-            
+
             match btype {
                 BLOCKTYPE_UNCOMPRESSED => {
                     self.read_uncompressed_block(reader, &mut output)?;
@@ -296,6 +321,7 @@ impl DeflateDecompressor {
                 }
             }
 
+            self.check_output_limit(output.len())?;
             if bfinal == 1 {
                 break;
             }
@@ -514,15 +540,17 @@ impl DeflateDecompressor {
                 }
                 Some(sym) if sym > 285 => {
                     return Err(io::Error::new(
-                        io::ErrorKind::InvalidData, 
+                        io::ErrorKind::InvalidData,
                         format!("Invalid symbol: {} (must be 0-285 or 256)", sym)));
                 }
                 _ => {
                     return Err(io::Error::new(
-                        io::ErrorKind::InvalidData, 
+                        io::ErrorKind::InvalidData,
                         format!("Invalid symbol: {:?}", symbol)));
                 }
             }
+
+            self.check_output_limit(output.len())?;
         }
 
         Ok(())
@@ -747,6 +775,11 @@ pub fn compress(data: &[u8], level: CompressionLevel) -> io::Result<Vec<u8>> {
 
 pub fn decompress(data: &[u8]) -> io::Result<Vec<u8>> {
     let mut decompressor = DeflateDecompressor::new();
+    decompressor.decompress(data)
+}
+
+pub fn decompress_bounded(data: &[u8], max_output_size: usize) -> io::Result<Vec<u8>> {
+    let mut decompressor = DeflateDecompressor::with_limit(max_output_size);
     decompressor.decompress(data)
 }
 
