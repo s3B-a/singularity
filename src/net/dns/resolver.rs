@@ -7,6 +7,7 @@ use crate::crypto::encoding::pem;
 use crate::crypto::hash::sha2::sha256;
 use crate::crypto::random;
 use crate::net::http::compression::{self, CompressionAlgorithm, CompressionLevel};
+use crate::net::https::tls::TlsCfg;
 use std::collections::HashMap;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -64,6 +65,18 @@ pub struct SecureResolverProfileMeta {
     pub encoded_size: usize,
 }
 
+pub fn well_known_dot_servers() -> Vec<(SocketAddr, &'static str)> {
+    vec![
+        (SocketAddr::new(IpAddr::V4(Ipv4Addr::new(91, 239, 100, 100)), 853), "anycast.uncensoreddns.org"), // UncensoredDNS
+        (SocketAddr::new(IpAddr::V4(Ipv4Addr::new(89, 233, 43, 71)), 853), "unicast.uncensoreddns.org"), // UncensoredDNS
+        (SocketAddr::new(IpAddr::V4(Ipv4Addr::new(9, 9, 9, 9)), 853), "dns.quad9.net"),       // Quad9
+        (SocketAddr::new(IpAddr::V4(Ipv4Addr::new(149, 112, 112, 112)), 853), "dns.quad9.net"), // Quad9
+        (SocketAddr::new(IpAddr::V4(Ipv4Addr::new(194, 242, 2, 2)), 853), "dns.mullvad.net"), // MullvadDNS
+        (SocketAddr::new(IpAddr::V4(Ipv4Addr::new(94, 140, 14, 14)), 853), "dns.adguard-dns.com"), // AdGuardDNS
+        (SocketAddr::new(IpAddr::V4(Ipv4Addr::new(94, 140, 15, 15)), 853), "dns.adguard-dns.com"), // AdGuardDNS
+    ]
+}
+
 pub struct DnsResolver {
     cache: DnsCache,
     servers: Arc<RwLock<Vec<SocketAddr>>>,
@@ -95,10 +108,9 @@ impl DnsResolver {
             SocketAddr::new(IpAddr::V4(Ipv4Addr::new(84, 200, 70, 40)), 53), // DNS.WATCH
             SocketAddr::new(IpAddr::V4(Ipv4Addr::new(91, 239, 100, 100)), 53), // UncensoredDNS
             SocketAddr::new(IpAddr::V4(Ipv4Addr::new(89, 233, 43, 71)), 53), // UncensoredDNS
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(9, 9, 9, 9)), 53),      // Quad9
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(9, 9, 9, 9)), 53),     // Quad9
             SocketAddr::new(IpAddr::V4(Ipv4Addr::new(149, 112, 112, 112)), 53), // Quad9
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(193, 138, 219, 74)), 53), // MullvadDNS
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(193, 138, 218, 74)), 53), // MullvadDNS
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(194, 242, 2, 2)), 53), // MullvadDNS
             SocketAddr::new(IpAddr::V4(Ipv4Addr::new(94, 140, 14, 14)), 53), // AdGuardDNS
             SocketAddr::new(IpAddr::V4(Ipv4Addr::new(94, 140, 15, 15)), 53), // AdGuardDNS
         ]
@@ -222,6 +234,7 @@ impl DnsResolver {
         Ok(records)
     }
 
+    #[deprecated(note = "This function is not confidential, use resolve_dot for genuine DNS confidentiality.")]
     pub fn resolve_secure(&self, name: &str, record_type: RecordType, algorithm: CompressionAlgorithm) -> io::Result<Vec<DnsRecord>> {
         if self.enable_cache {
             if let Some(records) = self.cache.get(name, record_type) {
@@ -273,6 +286,52 @@ impl DnsResolver {
                 "Secure DNS query failed with no specific error",
             )
         }))
+    }
+
+    pub fn resolve_dot(&self, name: &str, record_type: RecordType, server_addr: SocketAddr, server_name: &str, tls_cfg: &TlsCfg) -> io::Result<Vec<DnsRecord>> {
+        if self.enable_cache {
+            if let Some(records) = self.cache.get(name, record_type) {
+                return Ok(records);
+            }
+
+            if let Some(cached_response_code) = self.cache.get_negative(name, record_type) {
+                if cached_response_code == super::packet::ResponseCode::NoError {
+                    return Ok(Vec::new());
+                }
+
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("DNS query failed (cached): {:?}", cached_response_code),
+                ));
+            }
+        }
+
+        let mut query = self.build_query();
+        let packet = query.query_dot(name, record_type, server_addr, server_name, tls_cfg)?;
+        let response = DnsResponse::new(packet);
+        if !response.is_successful() {
+            if self.enable_cache {
+                let ttl = negative_ttl_from_response(&response);
+                self.cache.insert_negative(name, record_type, response.response_code(), ttl);
+            }
+
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                format!("DNS query failed: {:?}", response.response_code()),
+            ));
+        }
+
+        let records = response.answers().to_vec();
+        if self.enable_cache {
+            if !records.is_empty() {
+                self.cache.insert_many(name, records.clone());
+            } else {
+                let ttl = negative_ttl_from_response(&response);
+                self.cache.insert_negative(name, record_type, response.response_code(), ttl);
+            }
+        }
+
+        Ok(records)
     }
 
     pub fn resolve_ipv4(&self, name: &str) -> io::Result<Vec<Ipv4Addr>> {

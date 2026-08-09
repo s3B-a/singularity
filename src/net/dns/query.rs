@@ -5,6 +5,8 @@ use crate::crypto::encoding::pem;
 use crate::crypto::hash::sha2::sha256;
 use crate::crypto::random;
 use crate::net::http::compression::{self, CompressionAlgorithm, CompressionLevel};
+use crate::net::https::tls::{TlsCfg, TlsStream};
+use crate::net::tcp::TcpStream as DotTcpStream;
 use std::fmt::Write;
 use std::io::{self, Read as _, Write as _};
 use std::net::{SocketAddr, TcpStream, UdpSocket};
@@ -101,6 +103,7 @@ impl DnsQuery {
         self.verify_and_advance_id(parsed)
     }
 
+    #[deprecated(note = "This function is not secure against eavesdropping; use query_dot for confidentiality.")]
     pub fn query_secure(&mut self, name: &str, record_type: RecordType, server: SocketAddr, algorithm: CompressionAlgorithm) -> io::Result<DnsPacket> {
         let packet = DnsPacket::new_query(self.id, name.to_string(), record_type);
         let secure_wire = super::encode_secure_dns_packet(&packet, algorithm)?;
@@ -126,6 +129,41 @@ impl DnsQuery {
             Err(e) if self.secure_fallback_to_plain => self.query_plain(name, record_type, server),
             Err(e) => Err(e),
         }
+    }
+
+    pub fn query_dot(&mut self, name: &str, record_type: RecordType, server_addr: SocketAddr, server_name: &str, tls_cfg: &TlsCfg) -> io::Result<DnsPacket> {
+        let packet = DnsPacket::new_query(self.id, name.to_string(), record_type);
+        let wire = packet.write()?;
+        if wire.len() > u16::MAX as usize {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "DNS message too large for DoT framing",
+            ));
+        }
+
+        let tcp_stream = DotTcpStream::connect_timeout(server_addr, self.timeout).map_err(|e| {
+            io::Error::new(e.kind(), format!("DoT TCP connect to {} failed: {}", server_addr, e))
+        })?;
+
+        tcp_stream.set_read_timeout(Some(self.timeout))?;
+        tcp_stream.set_write_timeout(Some(self.timeout))?;
+
+        let mut tls_stream = TlsStream::new_client_with_sni(tcp_stream, tls_cfg.clone(), server_name.to_string())
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("DoT TLS handshake with {} failed: {:?}", server_name, e)))?;
+
+        let len_prefix = (wire.len() as u16).to_be_bytes();
+        tls_stream.write_all(&len_prefix)?;
+        tls_stream.write_all(&wire)?;
+
+        let mut resp_len_buf = [0u8; 2];
+        tls_stream.read_exact(&mut resp_len_buf)?;
+        let resp_len = u16::from_be_bytes(resp_len_buf) as usize;
+
+        let mut buffer = vec![0u8; resp_len];
+        tls_stream.read_exact(&mut buffer)?;
+
+        let parsed = DnsPacket::read(&buffer)?;
+        self.verify_and_advance_id(parsed)
     }
 
     pub fn query_with_retries(&mut self, name: &str, record_type: RecordType, servers: &[SocketAddr], retries: usize) -> io::Result<DnsPacket> {
