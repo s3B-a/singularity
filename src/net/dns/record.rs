@@ -160,6 +160,14 @@ pub enum RecordData {
         next_domain_name: String,
         type_bit_maps: Vec<u8>,
     },
+    NSEC3 {
+        hash_algorithm: u8,
+        flags: u8,
+        iterations: u16,
+        salt: Vec<u8>,
+        next_hashed_owner_name: Vec<u8>,
+        type_bit_maps: Vec<u8>,
+    },
     Unknown(Vec<u8>),
 }
 
@@ -392,6 +400,13 @@ impl fmt::Display for RecordData {
             RecordData::NSEC { next_domain_name, type_bit_maps } => {
                 write!(f, "{} <{} bytes>", next_domain_name, type_bit_maps.len())
             }
+            RecordData::NSEC3 { hash_algorithm, flags, iterations, salt, next_hashed_owner_name, type_bit_maps } => {
+                write!(
+                    f,
+                    "{} {} {} <{}-byte salt> <{}-byte hash> <{} bytes>",
+                    hash_algorithm, flags, iterations, salt.len(), next_hashed_owner_name.len(), type_bit_maps.len()
+                )
+            }
             RecordData::Unknown(data) => {
                 write!(f, "<{} bytes>", data.len())
             }
@@ -504,6 +519,7 @@ fn record_data_kind(data: &RecordData) -> &'static str {
         RecordData::DNSKEY { .. } => "DNSKEY",
         RecordData::DS { .. } => "DS",
         RecordData::NSEC { .. } => "NSEC",
+        RecordData::NSEC3 { .. } => "NSEC3",
         RecordData::Unknown(_) => "UNKNOWN",
     }
 }
@@ -592,6 +608,18 @@ fn encode_record_data(data: &RecordData) -> Vec<u8> {
             out.extend_from_slice(type_bit_maps);
             out
         }
+        RecordData::NSEC3 {hash_algorithm, flags, iterations, salt, next_hashed_owner_name, type_bit_maps} => {
+            let mut out = Vec::new();
+            out.push(*hash_algorithm);
+            out.push(*flags);
+            out.extend_from_slice(&iterations.to_be_bytes());
+            out.extend_from_slice(&(salt.len() as u16).to_be_bytes());
+            out.extend_from_slice(salt);
+            out.extend_from_slice(&(next_hashed_owner_name.len() as u16).to_be_bytes());
+            out.extend_from_slice(next_hashed_owner_name);
+            out.extend_from_slice(type_bit_maps);
+            out
+        }
         RecordData::Unknown(data) => data.clone(),
     }
 }
@@ -632,6 +660,7 @@ fn decode_record_data(kind: &str, payload: &[u8]) -> io::Result<RecordData> {
         "DNSKEY" => decode_dnskey(payload),
         "DS" => decode_ds(payload),
         "NSEC" => decode_nsec(payload),
+        "NSEC3" => decode_nsec3(payload),
         "UNKNOWN" => Ok(RecordData::Unknown(payload.to_vec())),
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -885,6 +914,47 @@ fn decode_nsec(payload: &[u8]) -> io::Result<RecordData> {
 
     Ok(RecordData::NSEC {
         next_domain_name,
+        type_bit_maps,
+    })
+}
+
+fn decode_nsec3(payload: &[u8]) -> io::Result<RecordData> {
+    if payload.len() < 6 {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid NSEC3 payload"));
+    }
+
+    let hash_algorithm = payload[0];
+    let flags = payload[1];
+    let iterations = u16::from_be_bytes([payload[2], payload[3]]);
+    let salt_len = u16::from_be_bytes([payload[4], payload[5]]) as usize;
+    let mut idx = 6usize;
+    if idx + salt_len > payload.len() {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid NSEC3 salt"));
+    }
+
+    let salt = payload[idx..idx + salt_len].to_vec();
+    idx += salt_len;
+
+    if idx + 2 > payload.len() {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid NSEC3 hash length"));
+    }
+
+    let hash_len = u16::from_be_bytes([payload[idx], payload[idx + 1]]) as usize;
+    idx += 2;
+    if idx + hash_len > payload.len() {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid NSEC3 next hashed owner name"));
+    }
+
+    let next_hashed_owner_name = payload[idx..idx + hash_len].to_vec();
+    idx += hash_len;
+    let type_bit_maps = payload[idx..].to_vec();
+
+    Ok(RecordData::NSEC3 {
+        hash_algorithm,
+        flags,
+        iterations,
+        salt,
+        next_hashed_owner_name,
         type_bit_maps,
     })
 }

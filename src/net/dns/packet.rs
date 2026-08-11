@@ -650,6 +650,24 @@ fn write_record<W: Write>(writer: &mut W, record: &DnsRecord) -> io::Result<()> 
             write_domain_name(&mut data_buf, next_domain_name)?;
             data_buf.extend_from_slice(type_bit_maps);
         }
+        RecordData::NSEC3 {hash_algorithm, flags, iterations, salt, next_hashed_owner_name, type_bit_maps} => {
+            if salt.len() > u8::MAX as usize {
+                return Err(io::Error::new(io::ErrorKind::InvalidInput, "NSEC3 salt too long"));
+            }
+
+            if next_hashed_owner_name.len() > u8::MAX as usize {
+                return Err(io::Error::new(io::ErrorKind::InvalidInput, "NSEC3 hashed owner name too long"));
+            }
+
+            data_buf.push(*hash_algorithm);
+            data_buf.push(*flags);
+            data_buf.extend_from_slice(&iterations.to_be_bytes());
+            data_buf.push(salt.len() as u8);
+            data_buf.extend_from_slice(salt);
+            data_buf.push(next_hashed_owner_name.len() as u8);
+            data_buf.extend_from_slice(next_hashed_owner_name);
+            data_buf.extend_from_slice(type_bit_maps);
+        }
         RecordData::Unknown(data) => data_buf.extend_from_slice(data),
     }
 
@@ -851,6 +869,39 @@ fn read_record(reader: &mut Cursor<&[u8]>, packet: &[u8]) -> io::Result<DnsRecor
 
             let type_bit_maps = data_buf[pos..].to_vec();
             RecordData::NSEC {next_domain_name, type_bit_maps}
+        }
+        RecordType::NSEC3 => {
+            if data_len < 5 {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid NSEC3 record"));
+            }
+
+            let hash_algorithm = data_buf[0];
+            let flags = data_buf[1];
+            let iterations = u16::from_be_bytes([data_buf[2], data_buf[3]]);
+            let salt_len = data_buf[4] as usize;
+            let mut pos = 5usize;
+            if pos + salt_len > data_len {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid NSEC3 salt"));
+            }
+
+            let salt = data_buf[pos..pos + salt_len].to_vec();
+            pos += salt_len;
+
+            if pos >= data_len {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid NSEC3 hash length"));
+            }
+
+            let hash_len = data_buf[pos] as usize;
+            pos += 1;
+            if pos + hash_len > data_len {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid NSEC3 next hashed owner name"));
+            }
+
+            let next_hashed_owner_name = data_buf[pos..pos + hash_len].to_vec();
+            pos += hash_len;
+            let type_bit_maps = data_buf[pos..].to_vec();
+
+            RecordData::NSEC3 {hash_algorithm, flags, iterations, salt, next_hashed_owner_name, type_bit_maps}
         }
         _ => RecordData::Unknown(data_buf),
     };

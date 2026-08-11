@@ -1,4 +1,5 @@
 use super::cache::{CacheStats, DnsCache};
+use super::dnssec::{self, DnssecError};
 use super::query::DnsQuery;
 use super::record::{DnsRecord, RecordType};
 use super::response::DnsResponse;
@@ -18,6 +19,13 @@ const RESOLVER_PROFILE_MAGIC: &str = "SINGULARITY_DNS_RESOLVER_PROFILE_V1";
 
 const DEFAULT_NEGATIVE_TTL: u32 = 300;
 const MAX_NEGATIVE_TTL: u32 = 3600;
+
+const MAX_CNAME_CHAIN_DEPTH: usize = 8;
+
+enum ChainStep {
+    Answer(Vec<DnsRecord>, Vec<DnsRecord>),
+    Cname(DnsRecord, Vec<DnsRecord>),
+}
 
 fn interleave_address_families(primary: Vec<IpAddr>, secondary: Vec<IpAddr>) -> Vec<IpAddr> {
     let mut result = Vec::with_capacity(primary.len() + secondary.len());
@@ -75,6 +83,38 @@ pub fn well_known_dot_servers() -> Vec<(SocketAddr, &'static str)> {
         (SocketAddr::new(IpAddr::V4(Ipv4Addr::new(94, 140, 14, 14)), 853), "dns.adguard-dns.com"), // AdGuardDNS
         (SocketAddr::new(IpAddr::V4(Ipv4Addr::new(94, 140, 15, 15)), 853), "dns.adguard-dns.com"), // AdGuardDNS
     ]
+}
+
+#[derive(Debug, Clone)]
+pub struct TrustAnchor {
+    pub zone: String,
+    pub ds: Vec<DnsRecord>,
+}
+
+#[derive(Debug, Clone)]
+pub enum DnssecOutcome {
+    Exists(Vec<DnsRecord>),
+    NameError,
+    NoData,
+}
+
+pub fn well_known_root_trust_anchor() -> TrustAnchor {
+    let digest = vec![
+        0xE0, 0x6D, 0x44, 0x48, 0x0B, 0x8F, 0x1D, 0x39, 0xA9, 0x5C, 0x0B, 0x0D, 0x7C, 0x65,
+        0xD0, 0x84, 0x58, 0xE8, 0x80, 0x40, 0x9B, 0xBC, 0x68, 0x34, 0x57, 0x10, 0x42, 0x37,
+        0xC7, 0xF8, 0xEC, 0x8D,
+    ];
+
+    TrustAnchor {
+        zone: ".".to_string(),
+        ds: vec![DnsRecord::new(
+            ".".to_string(),
+            RecordType::DS,
+            super::record::RecordClass::IN,
+            0,
+            super::record::RecordData::DS { key_tag: 20326, algorithm: 8, digest_type: 2, digest },
+        )],
+    }
 }
 
 pub struct DnsResolver {
@@ -332,6 +372,348 @@ impl DnsResolver {
         }
 
         Ok(records)
+    }
+
+    pub fn resolve_dnssec_validated(&self, name: &str, record_type: RecordType, trust_anchor: &TrustAnchor) -> io::Result<Vec<DnsRecord>> {
+        let servers = self.get_servers();
+        if servers.is_empty() {
+            return Err(io::Error::new(io::ErrorKind::NotFound, "No DNS servers configured"));
+        }
+
+        let dnskeys = self.validate_zone_dnskeys(&trust_anchor.zone, &trust_anchor.ds, &servers)?;
+        self.fetch_and_validate_records(name, record_type, &dnskeys, &servers)
+    }
+
+    pub fn resolve_dnssec_validated_chain(&self, name: &str, record_type: RecordType, root_anchor: &TrustAnchor) -> io::Result<Vec<DnsRecord>> {
+        let servers = self.get_servers();
+        if servers.is_empty() {
+            return Err(io::Error::new(io::ErrorKind::NotFound, "No DNS servers configured"));
+        }
+
+        let mut current_name = name.to_string();
+        for _ in 0..MAX_CNAME_CHAIN_DEPTH {
+            match self.fetch_chain_step(&current_name, record_type, &servers)? {
+                ChainStep::Answer(records, rrsigs) => {
+                    let signer_name = Self::signer_name_of(&rrsigs)?;
+                    let dnskeys = self.walk_chain_to_zone(&signer_name, root_anchor, &servers)?;
+                    dnssec::validate_rrset(&records, &rrsigs, &dnskeys)?;
+                    if self.enable_cache {
+                        self.cache.insert_many(&current_name, records.clone());
+                    }
+
+                    return Ok(records);
+                }
+                ChainStep::Cname(cname_record, rrsigs) => {
+                    let signer_name = Self::signer_name_of(&rrsigs)?;
+                    let dnskeys = self.walk_chain_to_zone(&signer_name, root_anchor, &servers)?;
+                    dnssec::validate_rrset(std::slice::from_ref(&cname_record), &rrsigs, &dnskeys)?;
+                    if self.enable_cache {
+                        self.cache.insert_many(&current_name, vec![cname_record.clone()]);
+                    }
+
+                    current_name = match &cname_record.data {
+                        super::record::RecordData::CNAME(target) => target.clone(),
+                        _ => return Err(DnssecError::Malformed("expected CNAME record data".to_string()).into()),
+                    };
+                }
+            }
+        }
+
+        Err(DnssecError::Malformed(format!("CNAME chain for {} exceeded maximum depth of {}", name, MAX_CNAME_CHAIN_DEPTH)).into())
+    }
+
+    fn walk_chain_to_zone(&self, signer_name: &str, root_anchor: &TrustAnchor, servers: &[SocketAddr]) -> io::Result<Vec<DnsRecord>> {
+        let mut current_dnskeys = self.validate_zone_dnskeys(&root_anchor.zone, &root_anchor.ds, servers)?;
+        let anchor_trimmed = root_anchor.zone.trim_end_matches('.').to_ascii_lowercase();
+        let signer_trimmed = signer_name.trim_end_matches('.').to_ascii_lowercase();
+        if signer_trimmed.eq_ignore_ascii_case(&anchor_trimmed) {
+            return Ok(current_dnskeys);
+        }
+
+        let relative = signer_trimmed.strip_suffix(&anchor_trimmed).unwrap_or(&signer_trimmed).trim_end_matches('.');
+        let labels: Vec<&str> = relative.split('.').filter(|l| !l.is_empty()).collect();
+        for i in (0..labels.len()).rev() {
+            let mut zone_labels = labels[i..].to_vec();
+            if !anchor_trimmed.is_empty() {
+                zone_labels.push(&anchor_trimmed);
+            }
+
+            let zone = zone_labels.join(".");
+            let ds_records = self.fetch_validated_ds(&zone, &current_dnskeys, servers)?;
+            current_dnskeys = self.validate_zone_dnskeys(&zone, &ds_records, servers)?;
+        }
+
+        Ok(current_dnskeys)
+    }
+
+    fn signer_name_of(rrsigs: &[DnsRecord]) -> io::Result<String> {
+        rrsigs
+            .iter()
+            .find_map(|r| match &r.data {
+                super::record::RecordData::RRSIG { signer_name, .. } => Some(signer_name.clone()),
+                _ => None,
+            })
+            .ok_or_else(|| DnssecError::Malformed("no RRSIG found to determine signer name".to_string()).into())
+    }
+
+    fn fetch_chain_step(&self, name: &str, record_type: RecordType, servers: &[SocketAddr]) -> io::Result<ChainStep> {
+        let response = self.query_dnssec_with_fallback(name, record_type, servers)?;
+        if !response.is_successful() {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                format!("DNS query for {} failed: {:?}", name, response.response_code()),
+            ));
+        }
+
+        let trimmed_name = name.trim_end_matches('.').to_ascii_lowercase();
+        let direct: Vec<DnsRecord> = response
+            .answers()
+            .iter()
+            .filter(|r| r.record_type == record_type && r.name.trim_end_matches('.').eq_ignore_ascii_case(&trimmed_name))
+            .cloned()
+            .collect();
+
+        if !direct.is_empty() {
+            let rrsigs: Vec<DnsRecord> = response
+                .answers()
+                .iter()
+                .filter(|r| r.record_type == RecordType::RRSIG && r.name.trim_end_matches('.').eq_ignore_ascii_case(&trimmed_name))
+                .cloned()
+                .collect();
+            return Ok(ChainStep::Answer(direct, rrsigs));
+        }
+
+        let cname = response
+            .answers()
+            .iter()
+            .find(|r| r.record_type == RecordType::CNAME && r.name.trim_end_matches('.').eq_ignore_ascii_case(&trimmed_name))
+            .cloned();
+
+        if let Some(cname) = cname {
+            let rrsigs: Vec<DnsRecord> = response
+                .answers()
+                .iter()
+                .filter(|r| r.record_type == RecordType::RRSIG && r.name.trim_end_matches('.').eq_ignore_ascii_case(&trimmed_name))
+                .cloned()
+                .collect();
+            return Ok(ChainStep::Cname(cname, rrsigs));
+        }
+
+        Err(DnssecError::Malformed(format!("no {:?} or CNAME records returned for {}", record_type, name)).into())
+    }
+
+    pub fn resolve_dnssec_validated_with_denial(&self, name: &str, record_type: RecordType, trust_anchor: &TrustAnchor) -> io::Result<DnssecOutcome> {
+        let servers = self.get_servers();
+        if servers.is_empty() {
+            return Err(io::Error::new(io::ErrorKind::NotFound, "No DNS servers configured"));
+        }
+
+        let dnskeys = self.validate_zone_dnskeys(&trust_anchor.zone, &trust_anchor.ds, &servers)?;
+
+        let response = self.query_dnssec_with_fallback(name, record_type, &servers)?;
+        let records: Vec<DnsRecord> = response.answers().iter().filter(|r| r.record_type == record_type).cloned().collect();
+        let rrsigs: Vec<DnsRecord> = response.answers().iter().filter(|r| r.record_type == RecordType::RRSIG).cloned().collect();
+
+        if !records.is_empty() {
+            dnssec::validate_rrset(&records, &rrsigs, &dnskeys)?;
+
+            let wildcard_used = rrsigs.iter().any(|r| dnssec::rrsig_indicates_wildcard(r, name).unwrap_or(false));
+            if wildcard_used {
+                let authority_nsec: Vec<DnsRecord> = response.authority().iter().filter(|r| r.record_type == RecordType::NSEC).cloned().collect();
+                let authority_nsec3: Vec<DnsRecord> = response.authority().iter().filter(|r| r.record_type == RecordType::NSEC3).cloned().collect();
+                let authority_rrsigs: Vec<DnsRecord> = response.authority().iter().filter(|r| r.record_type == RecordType::RRSIG).cloned().collect();
+                self.validate_denial_records(&authority_nsec, &authority_nsec3, &authority_rrsigs, &dnskeys)?;
+
+                let no_closer_match = if !authority_nsec3.is_empty() {
+                    dnssec::nsec3_covers_name(name, &authority_nsec3)
+                } else {
+                    dnssec::nsec_covers_name(name, &authority_nsec)
+                };
+
+                if !no_closer_match {
+                    return Err(DnssecError::Malformed(format!(
+                        "{} was answered via wildcard synthesis but no NSEC/NSEC3 proves no closer match exists",
+                        name
+                    ))
+                    .into());
+                }
+            }
+
+            if self.enable_cache {
+                self.cache.insert_many(name, records.clone());
+            }
+
+            return Ok(DnssecOutcome::Exists(records));
+        }
+
+        let nsec_records: Vec<DnsRecord> = response.authority().iter().filter(|r| r.record_type == RecordType::NSEC).cloned().collect();
+        let nsec3_records: Vec<DnsRecord> = response.authority().iter().filter(|r| r.record_type == RecordType::NSEC3).cloned().collect();
+        let denial_rrsigs: Vec<DnsRecord> = response.authority().iter().filter(|r| r.record_type == RecordType::RRSIG).cloned().collect();
+        if nsec_records.is_empty() && nsec3_records.is_empty() {
+            return Err(DnssecError::Malformed(format!(
+                "no {:?} records and no NSEC/NSEC3 proof for {} -- cannot authenticate this as genuine non-existence",
+                record_type, name
+            ))
+            .into());
+        }
+
+        self.validate_denial_records(&nsec_records, &nsec3_records, &denial_rrsigs, &dnskeys)?;
+
+        if response.response_code() == super::packet::ResponseCode::NameError {
+            if !nsec3_records.is_empty() {
+                dnssec::verify_nsec3_name_error(name, &nsec3_records)?;
+            } else {
+                dnssec::verify_nsec_name_error(name, &nsec_records)?;
+            }
+
+            if self.enable_cache {
+                let ttl = negative_ttl_from_response(&response);
+                self.cache.insert_negative(name, record_type, response.response_code(), ttl);
+            }
+
+            return Ok(DnssecOutcome::NameError);
+        }
+
+        if !nsec3_records.is_empty() {
+            let proof_holds = nsec3_records.iter().any(|r| dnssec::verify_nsec3_nodata(name, record_type, r).is_ok());
+            if !proof_holds {
+                return Err(DnssecError::Malformed(format!("no NSEC3 record provides a valid NODATA proof for {}", name)).into());
+            }
+        } else {
+            let exact_nsec = nsec_records
+                .iter()
+                .find(|r| r.name.trim_end_matches('.').eq_ignore_ascii_case(name.trim_end_matches('.')))
+                .ok_or_else(|| DnssecError::Malformed(format!("no NSEC record with owner name {} for a NODATA proof", name)))?;
+            dnssec::verify_nsec_nodata(name, record_type, exact_nsec)?;
+        }
+
+        if self.enable_cache {
+            let ttl = negative_ttl_from_response(&response);
+            self.cache.insert_negative(name, record_type, response.response_code(), ttl);
+        }
+
+        Ok(DnssecOutcome::NoData)
+    }
+
+    fn validate_denial_records(&self, nsec_records: &[DnsRecord], nsec3_records: &[DnsRecord], rrsigs: &[DnsRecord], dnskeys: &[DnsRecord]) -> io::Result<()> {
+        for record in nsec_records.iter().chain(nsec3_records.iter()) {
+            let matching_rrsigs: Vec<DnsRecord> = rrsigs.iter().filter(|r| r.name.eq_ignore_ascii_case(&record.name)).cloned().collect();
+            dnssec::validate_rrset(std::slice::from_ref(record), &matching_rrsigs, dnskeys)?;
+        }
+
+        Ok(())
+    }
+
+    fn query_dnssec_with_fallback(&self, name: &str, record_type: RecordType, servers: &[SocketAddr]) -> io::Result<DnsResponse> {
+        let mut query = self.build_query();
+        let mut last_err = None;
+        for &server in servers {
+            match query.query_dnssec_ok(name, record_type, server) {
+                Ok(packet) => return Ok(DnsResponse::new(packet)),
+                Err(e) => last_err = Some(e),
+            }
+        }
+
+        Err(last_err.unwrap_or_else(|| io::Error::new(io::ErrorKind::Other, "No DNS servers available")))
+    }
+
+    fn fetch_records_with_rrsigs(&self, name: &str, record_type: RecordType, servers: &[SocketAddr]) -> io::Result<(Vec<DnsRecord>, Vec<DnsRecord>)> {
+        let response = self.query_dnssec_with_fallback(name, record_type, servers)?;
+        if !response.is_successful() {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                format!("DNS query for {} failed: {:?}", name, response.response_code()),
+            ));
+        }
+
+        let records: Vec<DnsRecord> = response.answers().iter().filter(|r| r.record_type == record_type).cloned().collect();
+        let rrsigs: Vec<DnsRecord> = response.answers().iter().filter(|r| r.record_type == RecordType::RRSIG).cloned().collect();
+        if records.is_empty() {
+            return Err(DnssecError::Malformed(format!("no {:?} records returned for {}", record_type, name)).into());
+        }
+
+        Ok((records, rrsigs))
+    }
+
+    fn fetch_and_validate_records(&self, name: &str, record_type: RecordType, trusted_dnskeys: &[DnsRecord], servers: &[SocketAddr]) -> io::Result<Vec<DnsRecord>> {
+        let (records, rrsigs) = self.fetch_records_with_rrsigs(name, record_type, servers)?;
+        dnssec::validate_rrset(&records, &rrsigs, trusted_dnskeys)?;
+        if self.enable_cache {
+            self.cache.insert_many(name, records.clone());
+        }
+
+        Ok(records)
+    }
+
+    fn validate_zone_dnskeys(&self, zone: &str, trusted_ds: &[DnsRecord], servers: &[SocketAddr]) -> io::Result<Vec<DnsRecord>> {
+        if self.enable_cache {
+            if let Some(cached) = self.cache.get(zone, RecordType::DNSKEY) {
+                return Ok(cached);
+            }
+        }
+
+        let response = self.query_dnssec_with_fallback(zone, RecordType::DNSKEY, servers)?;
+        if !response.is_successful() {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                format!("DNSKEY query for {} failed: {:?}", zone, response.response_code()),
+            ));
+        }
+
+        let dnskeys: Vec<DnsRecord> = response.answers().iter().filter(|r| r.record_type == RecordType::DNSKEY).cloned().collect();
+        let rrsigs: Vec<DnsRecord> = response.answers().iter().filter(|r| r.record_type == RecordType::RRSIG).cloned().collect();
+        if dnskeys.is_empty() {
+            return Err(DnssecError::Malformed(format!("no DNSKEY records returned for {}", zone)).into());
+        }
+
+        let trusted_keys: Vec<DnsRecord> = dnskeys
+            .iter()
+            .filter(|dnskey| trusted_ds.iter().any(|ds| dnssec::verify_ds(dnskey, ds).unwrap_or(false)))
+            .cloned()
+            .collect();
+        if trusted_keys.is_empty() {
+            return Err(DnssecError::KeyTagMismatch.into());
+        }
+
+        dnssec::validate_rrset(&dnskeys, &rrsigs, &trusted_keys)?;
+        if self.enable_cache {
+            self.cache.insert_many(zone, dnskeys.clone());
+        }
+
+        Ok(dnskeys)
+    }
+
+    fn fetch_validated_ds(&self, child_zone: &str, parent_dnskeys: &[DnsRecord], servers: &[SocketAddr]) -> io::Result<Vec<DnsRecord>> {
+        if self.enable_cache {
+            if let Some(cached) = self.cache.get(child_zone, RecordType::DS) {
+                return Ok(cached);
+            }
+        }
+
+        let response = self.query_dnssec_with_fallback(child_zone, RecordType::DS, servers)?;
+        if !response.is_successful() {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                format!("DS query for {} failed: {:?}", child_zone, response.response_code()),
+            ));
+        }
+
+        let ds_records: Vec<DnsRecord> = response.answers().iter().filter(|r| r.record_type == RecordType::DS).cloned().collect();
+        let rrsigs: Vec<DnsRecord> = response.answers().iter().filter(|r| r.record_type == RecordType::RRSIG).cloned().collect();
+        if ds_records.is_empty() {
+            return Err(DnssecError::Malformed(format!(
+                "no DS records for {} -- unsigned delegation, or DNSSEC not deployed at this zone cut",
+                child_zone
+            ))
+            .into());
+        }
+
+        dnssec::validate_rrset(&ds_records, &rrsigs, parent_dnskeys)?;
+        if self.enable_cache {
+            self.cache.insert_many(child_zone, ds_records.clone());
+        }
+
+        Ok(ds_records)
     }
 
     pub fn resolve_ipv4(&self, name: &str) -> io::Result<Vec<Ipv4Addr>> {
@@ -812,6 +1194,22 @@ mod tests {
 
         let result = interleave_address_families(Vec::new(), vec![v4a, v4b]);
         assert_eq!(result, vec![v4a, v4b]);
+    }
+
+    #[test]
+    fn test_well_known_root_trust_anchor_shape() {
+        let anchor = well_known_root_trust_anchor();
+        assert_eq!(anchor.zone, ".");
+        assert_eq!(anchor.ds.len(), 1);
+        match &anchor.ds[0].data {
+            super::super::record::RecordData::DS { key_tag, algorithm, digest_type, digest } => {
+                assert_eq!(*key_tag, 20326);
+                assert_eq!(*algorithm, 8);
+                assert_eq!(*digest_type, 2);
+                assert_eq!(digest.len(), 32); // SHA-256 digest length
+            }
+            other => panic!("expected DS record data, got {:?}", other),
+        }
     }
 
     #[test]

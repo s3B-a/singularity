@@ -322,6 +322,10 @@ impl TcpStream {
         self.socket.set_nodelay(nodelay)
     }
 
+    pub fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
+        self.socket.set_nonblocking(nonblocking)
+    }
+
     pub fn peer_addr(&self) -> io::Result<SocketAddr> {
         self.socket.peer_addr()
     }

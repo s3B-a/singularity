@@ -1,5 +1,5 @@
 use super::packet::DnsPacket;
-use super::record::RecordType;
+use super::record::{DnsRecord, RecordClass, RecordData, RecordType};
 use crate::crypto::constant_time_eq;
 use crate::crypto::encoding::pem;
 use crate::crypto::hash::sha2::sha256;
@@ -122,6 +122,7 @@ impl DnsQuery {
         }
     }
 
+    #[deprecated(note = "This function is not secure against eavesdropping, use query_dot for confidentiality.")]
     pub fn query_secure_auto(&mut self, name: &str, record_type: RecordType, server: SocketAddr) -> io::Result<DnsPacket> {
         let algorithm = super::select_algorithm_from_accept_encoding(&self.accept_encoding);
         match self.query_secure(name, record_type, server, algorithm) {
@@ -163,6 +164,24 @@ impl DnsQuery {
         tls_stream.read_exact(&mut buffer)?;
 
         let parsed = DnsPacket::read(&buffer)?;
+        self.verify_and_advance_id(parsed)
+    }
+    
+    pub fn query_dnssec_ok(&mut self, name: &str, record_type: RecordType, server: SocketAddr) -> io::Result<DnsPacket> {
+        let mut packet = DnsPacket::new_query(self.id, name.to_string(), record_type);
+        packet.additional.push(edns0_do_pseudo_record());
+        packet.header.additional_count = 1;
+
+        let data = packet.write()?;
+        let response = self.send_and_receive(server, &data)?;
+        let parsed = DnsPacket::read(&response)?;
+
+        if parsed.header.truncated {
+            let tcp_response = self.send_and_receive_tcp(server, &data)?;
+            let tcp_parsed = DnsPacket::read(&tcp_response)?;
+            return self.verify_and_advance_id(tcp_parsed);
+        }
+
         self.verify_and_advance_id(parsed)
     }
 
@@ -568,6 +587,16 @@ fn parse_query_blob_meta(header: &str, body_len: usize) -> io::Result<(u16, Secu
             encoded_size,
         },
     ))
+}
+
+fn edns0_do_pseudo_record() -> DnsRecord {
+    DnsRecord::new(
+        String::new(),
+        RecordType::OPT,
+        RecordClass::from_u16(4096),
+        0x0000_8000,
+        RecordData::Unknown(Vec::new()),
+    )
 }
 
 fn ipv6_ptr(ipv6: std::net::Ipv6Addr) -> String {
