@@ -349,6 +349,39 @@ pub fn decompress(data: &[u8]) -> io::Result<Vec<u8>> {
     decompressor.decompress(data)
 }
 
+pub fn decompress_bounded(data: &[u8], max_output_size: usize) -> io::Result<Vec<u8>> {
+    let (header_size, _flags) = GzipDecompressor::read_header(data)?;
+    if data.len() < header_size + 8 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "GZIP data too short",
+        ));
+    }
+
+    let deflate_data_end = data.len() - 8;
+    let deflate_data = &data[header_size..deflate_data_end];
+    let output = deflate::decompress_bounded(deflate_data, max_output_size)?;
+
+    let (crc, size) = GzipDecompressor::read_trailer(&data[deflate_data_end..])?;
+    let calculated_crc = crc32(&output);
+    if calculated_crc != crc {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("CRC32 mismatch: expected {}, got {}", crc, calculated_crc),
+        ));
+    }
+
+    let calculated_size = output.len() as u32;
+    if calculated_size != size {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("Size mismatch: expected {}, got {}", size, calculated_size),
+        ));
+    }
+
+    Ok(output)
+}
+
 impl Compressor for GzipCompressor {
     fn compress(&mut self, input: &[u8]) -> io::Result<Vec<u8>> {
         let mut output = self.write_header();

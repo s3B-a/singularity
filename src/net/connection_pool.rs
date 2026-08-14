@@ -15,6 +15,21 @@ const CONNECTION_POOL_SNAPSHOT_MAGIC_V2: &str = "SINGULARITY_CONNECTION_POOL_SNA
 const CONNECTION_POOL_SNAPSHOT_MAGIC_LEGACY: &str = "SINGULARITY_CONNECTION_POOL_SNAPSHOT";
 const CONNECTION_POOL_SNAPSHOT_CONTEXT: &str = "SINGULARITY_CONNECTION_POOL_SNAPSHOT_BINDING_V1";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PooledProtocol {
+    Http1,
+    Http2,
+}
+
+impl PooledProtocol {
+    fn tag(&self) -> &'static str {
+        match self {
+            PooledProtocol::Http1 => "http1",
+            PooledProtocol::Http2 => "http2",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct PoolStats {
     pub total_connections: usize,
@@ -62,6 +77,7 @@ pub struct PoolCompressionCfg {
 
 struct PooledConnection {
     stream: TcpStream,
+    protocol: PooledProtocol,
     last_used: Instant,
     request_count: usize,
     created_at: Instant,
@@ -128,9 +144,9 @@ impl ConnectionPool {
         self
     }
 
-    pub fn get_or_connect(&self, host: &str, port: u16) -> io::Result<TcpStream> {
+    pub fn get_or_connect(&self, host: &str, port: u16, protocol: PooledProtocol) -> io::Result<TcpStream> {
         let key = Self::derive_pool_key(host, port);
-        if let Some(stream) = self.try_get(&key) {
+        if let Some(stream) = self.try_get(&key, protocol) {
             return Ok(stream);
         }
 
@@ -138,26 +154,30 @@ impl ConnectionPool {
         TcpStream::connect(addr)
     }
 
-    fn try_get(&self, key: &str) -> Option<TcpStream> {
+    fn try_get(&self, key: &str, protocol: PooledProtocol) -> Option<TcpStream> {
         let mut pool = self.connections.lock().unwrap();
         if let Some(connections) = pool.get_mut(key) {
-            while let Some(mut conn) = connections.pop() {
-                if conn.last_used.elapsed() >= self.idle_timeout {
+            let mut idx = 0;
+            while idx < connections.len() {
+                let expired = {
+                    let conn = &connections[idx];
+                    conn.last_used.elapsed() >= self.idle_timeout
+                        || conn.age() >= self.max_connection_age
+                        || conn.request_count >= self.max_requests_per_connection
+                        || !conn.verify_integrity(key, &self.security_cfg)
+                };
+
+                if expired {
+                    connections.remove(idx);
                     continue;
                 }
 
-                if conn.age() >= self.max_connection_age {
+                if connections[idx].protocol != protocol {
+                    idx += 1;
                     continue;
                 }
 
-                if conn.request_count >= self.max_requests_per_connection {
-                    continue;
-                }
-
-                if !conn.verify_integrity(key, &self.security_cfg) {
-                    continue;
-                }
-
+                let mut conn = connections.remove(idx);
                 conn.mark_used(key, &self.security_cfg);
                 return Some(conn.stream);
             }
@@ -166,12 +186,12 @@ impl ConnectionPool {
         None
     }
 
-    pub fn return_connection(&self, host: &str, port: u16, stream: TcpStream) {
+    pub fn return_connection(&self, host: &str, port: u16, protocol: PooledProtocol, stream: TcpStream) {
         let key = Self::derive_pool_key(host, port);
         let mut pool = self.connections.lock().unwrap();
         let connections = pool.entry(key.clone()).or_insert_with(Vec::new);
         if connections.len() < self.max_idle_per_host {
-            connections.push(PooledConnection::new(stream, &key, &self.security_cfg));
+            connections.push(PooledConnection::new(stream, protocol, &key, &self.security_cfg));
         }
     }
 
@@ -445,7 +465,7 @@ impl ConnectionPool {
 }
 
 impl PooledConnection {
-    fn new(stream: TcpStream, host_key: &str, security_cfg: &PoolSecurityCfg) -> Self {
+    fn new(stream: TcpStream, protocol: PooledProtocol, host_key: &str, security_cfg: &PoolSecurityCfg) -> Self {
         let now = Instant::now();
         let peer_fingerprint = stream.peer_addr().ok().map(|addr| pem::encode(&sha256(addr.to_string().as_bytes())))
             .unwrap_or_else(|| "unknown-peer".to_string());
@@ -460,6 +480,7 @@ impl PooledConnection {
         let request_count = 0usize;
         let integrity_tag = Self::compute_integrity_tag(
             host_key,
+            protocol,
             request_count,
             lifecycle_tick,
             &peer_fingerprint,
@@ -469,6 +490,7 @@ impl PooledConnection {
 
         Self {
             stream,
+            protocol,
             last_used: now,
             request_count,
             created_at: now,
@@ -489,6 +511,7 @@ impl PooledConnection {
         self.lifecycle_tick = self.lifecycle_tick.saturating_add(1);
         self.integrity_tag = Self::compute_integrity_tag(
             host_key,
+            self.protocol,
             self.request_count,
             self.lifecycle_tick,
             &self.peer_fingerprint,
@@ -504,6 +527,7 @@ impl PooledConnection {
 
         let expected = Self::compute_integrity_tag(
             host_key,
+            self.protocol,
             self.request_count,
             self.lifecycle_tick,
             &self.peer_fingerprint,
@@ -514,13 +538,15 @@ impl PooledConnection {
         constant_time_eq(expected.as_bytes(), self.integrity_tag.as_bytes())
     }
 
-    fn compute_integrity_tag(host_key: &str, request_count: usize, lifecycle_tick: u64, peer_fingerprint: &str, nonce: &[u8], security_cfg: &PoolSecurityCfg) -> String {
+    fn compute_integrity_tag(host_key: &str, protocol: PooledProtocol, request_count: usize, lifecycle_tick: u64, peer_fingerprint: &str, nonce: &[u8], security_cfg: &PoolSecurityCfg) -> String {
         if !security_cfg.enable_integrity {
             return String::new();
         }
 
         let mut blob = Vec::new();
         blob.extend_from_slice(host_key.as_bytes());
+        blob.extend_from_slice(b"|");
+        blob.extend_from_slice(protocol.tag().as_bytes());
         blob.extend_from_slice(b"|");
         blob.extend_from_slice(request_count.to_string().as_bytes());
         blob.extend_from_slice(b"|");
@@ -776,6 +802,24 @@ mod tests {
 
         let imported = ConnectionPool::import_snapshot(&blob);
         assert!(imported.is_err());
+    }
+
+    #[test]
+    fn test_pool_is_protocol_aware() {
+        use crate::net::tcp::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind must succeed");
+        let addr = listener.local_addr().expect("local_addr must succeed");
+
+        let pool = ConnectionPool::new();
+        let stream = TcpStream::connect(addr).expect("connect must succeed");
+        let _server_side = listener.accept().expect("accept must succeed");
+
+        pool.return_connection(&addr.ip().to_string(), addr.port(), PooledProtocol::Http2, stream);
+
+        let key = ConnectionPool::derive_pool_key(&addr.ip().to_string(), addr.port());
+        assert!(pool.try_get(&key, PooledProtocol::Http1).is_none());
+        assert!(pool.try_get(&key, PooledProtocol::Http2).is_some());
     }
 
     #[test]

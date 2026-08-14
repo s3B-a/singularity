@@ -1,13 +1,15 @@
 use super::packet::DnsPacket;
-use super::record::RecordType;
+use super::record::{DnsRecord, RecordClass, RecordData, RecordType};
 use crate::crypto::constant_time_eq;
 use crate::crypto::encoding::pem;
 use crate::crypto::hash::sha2::sha256;
 use crate::crypto::random;
 use crate::net::http::compression::{self, CompressionAlgorithm, CompressionLevel};
+use crate::net::https::tls::{TlsCfg, TlsStream};
+use crate::net::tcp::TcpStream as DotTcpStream;
 use std::fmt::Write;
-use std::io;
-use std::net::{SocketAddr, UdpSocket};
+use std::io::{self, Read as _, Write as _};
+use std::net::{SocketAddr, TcpStream, UdpSocket};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const QUERY_BLOB_MAGIC: &str = "SINGULARITY_DNS_QUERY_BLOB_V1";
@@ -92,9 +94,16 @@ impl DnsQuery {
         let response = self.send_and_receive(server, &data)?;
         let parsed = DnsPacket::read(&response)?;
 
+        if parsed.header.truncated {
+            let tcp_response = self.send_and_receive_tcp(server, &data)?;
+            let tcp_parsed = DnsPacket::read(&tcp_response)?;
+            return self.verify_and_advance_id(tcp_parsed);
+        }
+
         self.verify_and_advance_id(parsed)
     }
 
+    #[deprecated(note = "This function is not secure against eavesdropping; use query_dot for confidentiality.")]
     pub fn query_secure(&mut self, name: &str, record_type: RecordType, server: SocketAddr, algorithm: CompressionAlgorithm) -> io::Result<DnsPacket> {
         let packet = DnsPacket::new_query(self.id, name.to_string(), record_type);
         let secure_wire = super::encode_secure_dns_packet(&packet, algorithm)?;
@@ -113,6 +122,7 @@ impl DnsQuery {
         }
     }
 
+    #[deprecated(note = "This function is not secure against eavesdropping, use query_dot for confidentiality.")]
     pub fn query_secure_auto(&mut self, name: &str, record_type: RecordType, server: SocketAddr) -> io::Result<DnsPacket> {
         let algorithm = super::select_algorithm_from_accept_encoding(&self.accept_encoding);
         match self.query_secure(name, record_type, server, algorithm) {
@@ -120,6 +130,59 @@ impl DnsQuery {
             Err(e) if self.secure_fallback_to_plain => self.query_plain(name, record_type, server),
             Err(e) => Err(e),
         }
+    }
+
+    pub fn query_dot(&mut self, name: &str, record_type: RecordType, server_addr: SocketAddr, server_name: &str, tls_cfg: &TlsCfg) -> io::Result<DnsPacket> {
+        let packet = DnsPacket::new_query(self.id, name.to_string(), record_type);
+        let wire = packet.write()?;
+        if wire.len() > u16::MAX as usize {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "DNS message too large for DoT framing",
+            ));
+        }
+
+        let tcp_stream = DotTcpStream::connect_timeout(server_addr, self.timeout).map_err(|e| {
+            io::Error::new(e.kind(), format!("DoT TCP connect to {} failed: {}", server_addr, e))
+        })?;
+
+        tcp_stream.set_read_timeout(Some(self.timeout))?;
+        tcp_stream.set_write_timeout(Some(self.timeout))?;
+
+        let mut tls_stream = TlsStream::new_client_with_sni(tcp_stream, tls_cfg.clone(), server_name.to_string())
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("DoT TLS handshake with {} failed: {:?}", server_name, e)))?;
+
+        let len_prefix = (wire.len() as u16).to_be_bytes();
+        tls_stream.write_all(&len_prefix)?;
+        tls_stream.write_all(&wire)?;
+
+        let mut resp_len_buf = [0u8; 2];
+        tls_stream.read_exact(&mut resp_len_buf)?;
+        let resp_len = u16::from_be_bytes(resp_len_buf) as usize;
+
+        let mut buffer = vec![0u8; resp_len];
+        tls_stream.read_exact(&mut buffer)?;
+
+        let parsed = DnsPacket::read(&buffer)?;
+        self.verify_and_advance_id(parsed)
+    }
+    
+    pub fn query_dnssec_ok(&mut self, name: &str, record_type: RecordType, server: SocketAddr) -> io::Result<DnsPacket> {
+        let mut packet = DnsPacket::new_query(self.id, name.to_string(), record_type);
+        packet.additional.push(edns0_do_pseudo_record());
+        packet.header.additional_count = 1;
+
+        let data = packet.write()?;
+        let response = self.send_and_receive(server, &data)?;
+        let parsed = DnsPacket::read(&response)?;
+
+        if parsed.header.truncated {
+            let tcp_response = self.send_and_receive_tcp(server, &data)?;
+            let tcp_parsed = DnsPacket::read(&tcp_response)?;
+            return self.verify_and_advance_id(tcp_parsed);
+        }
+
+        self.verify_and_advance_id(parsed)
     }
 
     pub fn query_with_retries(&mut self, name: &str, record_type: RecordType, servers: &[SocketAddr], retries: usize) -> io::Result<DnsPacket> {
@@ -354,6 +417,32 @@ impl DnsQuery {
         Ok(buffer)
     }
 
+    fn send_and_receive_tcp(&self, server: SocketAddr, wire: &[u8]) -> io::Result<Vec<u8>> {
+        if wire.len() > u16::MAX as usize {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "DNS message too large for TCP framing",
+            ));
+        }
+
+        let mut stream = TcpStream::connect_timeout(&server, self.timeout)?;
+        stream.set_read_timeout(Some(self.timeout))?;
+        stream.set_write_timeout(Some(self.timeout))?;
+
+        let len_prefix = (wire.len() as u16).to_be_bytes();
+        stream.write_all(&len_prefix)?;
+        stream.write_all(wire)?;
+
+        let mut resp_len_buf = [0u8; 2];
+        stream.read_exact(&mut resp_len_buf)?;
+        let resp_len = u16::from_be_bytes(resp_len_buf) as usize;
+
+        let mut buffer = vec![0u8; resp_len];
+        stream.read_exact(&mut buffer)?;
+
+        Ok(buffer)
+    }
+
     fn verify_and_advance_id(&mut self, response: DnsPacket) -> io::Result<DnsPacket> {
         if response.header.id != self.id {
             return Err(io::Error::new(
@@ -498,6 +587,16 @@ fn parse_query_blob_meta(header: &str, body_len: usize) -> io::Result<(u16, Secu
             encoded_size,
         },
     ))
+}
+
+fn edns0_do_pseudo_record() -> DnsRecord {
+    DnsRecord::new(
+        String::new(),
+        RecordType::OPT,
+        RecordClass::from_u16(4096),
+        0x0000_8000,
+        RecordData::Unknown(Vec::new()),
+    )
 }
 
 fn ipv6_ptr(ipv6: std::net::Ipv6Addr) -> String {

@@ -623,6 +623,51 @@ fn write_record<W: Write>(writer: &mut W, record: &DnsRecord) -> io::Result<()> 
             data_buf.extend_from_slice(&port.to_be_bytes());
             write_domain_name(&mut data_buf, target)?;
         }
+        RecordData::RRSIG {type_covered, algorithm, labels, original_ttl, signature_expiration, signature_inception, key_tag, signer_name, signature} => {
+            data_buf.extend_from_slice(&type_covered.to_be_bytes());
+            data_buf.push(*algorithm);
+            data_buf.push(*labels);
+            data_buf.extend_from_slice(&original_ttl.to_be_bytes());
+            data_buf.extend_from_slice(&signature_expiration.to_be_bytes());
+            data_buf.extend_from_slice(&signature_inception.to_be_bytes());
+            data_buf.extend_from_slice(&key_tag.to_be_bytes());
+            write_domain_name(&mut data_buf, signer_name)?;
+            data_buf.extend_from_slice(signature);
+        }
+        RecordData::DNSKEY {flags, protocol, algorithm, public_key} => {
+            data_buf.extend_from_slice(&flags.to_be_bytes());
+            data_buf.push(*protocol);
+            data_buf.push(*algorithm);
+            data_buf.extend_from_slice(public_key);
+        }
+        RecordData::DS {key_tag, algorithm, digest_type, digest} => {
+            data_buf.extend_from_slice(&key_tag.to_be_bytes());
+            data_buf.push(*algorithm);
+            data_buf.push(*digest_type);
+            data_buf.extend_from_slice(digest);
+        }
+        RecordData::NSEC {next_domain_name, type_bit_maps} => {
+            write_domain_name(&mut data_buf, next_domain_name)?;
+            data_buf.extend_from_slice(type_bit_maps);
+        }
+        RecordData::NSEC3 {hash_algorithm, flags, iterations, salt, next_hashed_owner_name, type_bit_maps} => {
+            if salt.len() > u8::MAX as usize {
+                return Err(io::Error::new(io::ErrorKind::InvalidInput, "NSEC3 salt too long"));
+            }
+
+            if next_hashed_owner_name.len() > u8::MAX as usize {
+                return Err(io::Error::new(io::ErrorKind::InvalidInput, "NSEC3 hashed owner name too long"));
+            }
+
+            data_buf.push(*hash_algorithm);
+            data_buf.push(*flags);
+            data_buf.extend_from_slice(&iterations.to_be_bytes());
+            data_buf.push(salt.len() as u8);
+            data_buf.extend_from_slice(salt);
+            data_buf.push(next_hashed_owner_name.len() as u8);
+            data_buf.extend_from_slice(next_hashed_owner_name);
+            data_buf.extend_from_slice(type_bit_maps);
+        }
         RecordData::Unknown(data) => data_buf.extend_from_slice(data),
     }
 
@@ -760,6 +805,103 @@ fn read_record(reader: &mut Cursor<&[u8]>, packet: &[u8]) -> io::Result<DnsRecor
             data_cursor.set_position(6);
             let target = read_domain_name(&mut data_cursor, packet)?;
             RecordData::SRV {priority, weight, port, target}
+        }
+        RecordType::RRSIG => {
+            if data_len < 18 {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid RRSIG record"));
+            }
+
+            let type_covered = u16::from_be_bytes([data_buf[0], data_buf[1]]);
+            let algorithm = data_buf[2];
+            let labels = data_buf[3];
+            let original_ttl = u32::from_be_bytes([data_buf[4], data_buf[5], data_buf[6], data_buf[7]]);
+            let signature_expiration = u32::from_be_bytes([data_buf[8], data_buf[9], data_buf[10], data_buf[11]]);
+            let signature_inception = u32::from_be_bytes([data_buf[12], data_buf[13], data_buf[14], data_buf[15]]);
+            let key_tag = u16::from_be_bytes([data_buf[16], data_buf[17]]);
+            data_cursor.set_position(18);
+            let signer_name = read_domain_name(&mut data_cursor, packet)?;
+            let sig_start = data_cursor.position() as usize;
+            if sig_start > data_len {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid RRSIG signer name"));
+            }
+
+            let signature = data_buf[sig_start..].to_vec();
+            RecordData::RRSIG {
+                type_covered,
+                algorithm,
+                labels,
+                original_ttl,
+                signature_expiration,
+                signature_inception,
+                key_tag,
+                signer_name,
+                signature,
+            }
+        }
+        RecordType::DNSKEY => {
+            if data_len < 4 {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid DNSKEY record"));
+            }
+
+            let flags = u16::from_be_bytes([data_buf[0], data_buf[1]]);
+            let protocol = data_buf[2];
+            let algorithm = data_buf[3];
+            let public_key = data_buf[4..].to_vec();
+            RecordData::DNSKEY {flags, protocol, algorithm, public_key}
+        }
+        RecordType::DS => {
+            if data_len < 4 {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid DS record"));
+            }
+
+            let key_tag = u16::from_be_bytes([data_buf[0], data_buf[1]]);
+            let algorithm = data_buf[2];
+            let digest_type = data_buf[3];
+            let digest = data_buf[4..].to_vec();
+            RecordData::DS {key_tag, algorithm, digest_type, digest}
+        }
+        RecordType::NSEC => {
+            let next_domain_name = read_domain_name(&mut data_cursor, packet)?;
+            let pos = data_cursor.position() as usize;
+            if pos > data_len {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid NSEC next domain name"));
+            }
+
+            let type_bit_maps = data_buf[pos..].to_vec();
+            RecordData::NSEC {next_domain_name, type_bit_maps}
+        }
+        RecordType::NSEC3 => {
+            if data_len < 5 {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid NSEC3 record"));
+            }
+
+            let hash_algorithm = data_buf[0];
+            let flags = data_buf[1];
+            let iterations = u16::from_be_bytes([data_buf[2], data_buf[3]]);
+            let salt_len = data_buf[4] as usize;
+            let mut pos = 5usize;
+            if pos + salt_len > data_len {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid NSEC3 salt"));
+            }
+
+            let salt = data_buf[pos..pos + salt_len].to_vec();
+            pos += salt_len;
+
+            if pos >= data_len {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid NSEC3 hash length"));
+            }
+
+            let hash_len = data_buf[pos] as usize;
+            pos += 1;
+            if pos + hash_len > data_len {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid NSEC3 next hashed owner name"));
+            }
+
+            let next_hashed_owner_name = data_buf[pos..pos + hash_len].to_vec();
+            pos += hash_len;
+            let type_bit_maps = data_buf[pos..].to_vec();
+
+            RecordData::NSEC3 {hash_algorithm, flags, iterations, salt, next_hashed_owner_name, type_bit_maps}
         }
         _ => RecordData::Unknown(data_buf),
     };

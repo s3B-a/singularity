@@ -369,13 +369,31 @@ pub fn compress(algorithm: CompressionAlgorithm, data: &[u8], level: Compression
     }
 }
 
+pub const MAX_DECOMPRESSED_SIZE: usize = 64 * 1024 * 1024;
+
 pub fn decompress(algorithm: CompressionAlgorithm, data: &[u8]) -> io::Result<Vec<u8>> {
+    decompress_bounded(algorithm, data, MAX_DECOMPRESSED_SIZE)
+}
+
+pub fn decompress_bounded(algorithm: CompressionAlgorithm, data: &[u8], max_output_size: usize) -> io::Result<Vec<u8>> {
     match algorithm {
-        CompressionAlgorithm::Gzip => gzip::decompress(data),
-        CompressionAlgorithm::Deflate => deflate::decompress(data),
-        CompressionAlgorithm::Brotli => brotli::decompress(data),
-        CompressionAlgorithm::Zstd => zstd::decompress(data),
-        CompressionAlgorithm::Identity => Ok(data.to_vec()),
+        CompressionAlgorithm::Gzip => gzip::decompress_bounded(data, max_output_size),
+        CompressionAlgorithm::Deflate => deflate::decompress_bounded(data, max_output_size),
+        CompressionAlgorithm::Brotli => brotli::decompress_bounded(data, max_output_size),
+        CompressionAlgorithm::Zstd => zstd::decompress_bounded(data, max_output_size),
+        CompressionAlgorithm::Identity => {
+            if data.len() > max_output_size {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "payload exceeds maximum allowed size of {} bytes",
+                        max_output_size
+                    ),
+                ));
+            }
+
+            Ok(data.to_vec())
+        }
     }
 }
 

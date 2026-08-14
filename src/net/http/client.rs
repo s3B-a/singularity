@@ -11,7 +11,7 @@ use crate::crypto::encoding::pem;
 use crate::crypto::hash::hmac::hmac_sha256;
 use crate::crypto::hash::sha2::sha256;
 use crate::crypto::random;
-use crate::net::connection_pool::ConnectionPool;
+use crate::net::connection_pool::{ConnectionPool, PooledProtocol};
 use crate::net::cookie::{parse_set_cookie, Cookie, CookieJar};
 use crate::net::dns::DnsResolver;
 use crate::net::http::compression::{self, CompressionAlgorithm, CompressionLevel};
@@ -23,6 +23,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const HTTP_CLIENT_PROFILE_BLOB_MAGIC: &str = "SINGULARITY_HTTP_CLIENT_PROFILE_BLOB_V1";
 const HTTP_CLIENT_PROFILE_BLOB_CONTEXT: &str = "SINGULARITY_HTTP_CLIENT_PROFILE_BLOB_BINDING_V1";
+
+const HAPPY_EYEBALLS_ATTEMPT_DELAY: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SecureHttpClientProfileMeta {
@@ -389,8 +391,15 @@ impl Http1ConnectionEntry {
     }
 
     fn is_healthy(&mut self) -> bool {
+        if self.stream.set_nonblocking(true).is_err() {
+            return true;
+        }
+
         let mut buf = [0u8; 1];
-        match self.stream.peek(&mut buf) {
+        let result = self.stream.peek(&mut buf);
+        let _ = self.stream.set_nonblocking(false);
+
+        match result {
             Ok(0) => false,
             Ok(_) => true,
             Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => true,
@@ -1400,16 +1409,32 @@ impl HttpClient {
         self.send_http1_request(request, &host, port, &path)
     }
 
+    fn take_reusable_http1_connection(&mut self, connection_key: &str, host: &str, port: u16, staleness_timeout: Duration) -> Option<Http1ConnectionEntry> {
+        let mut existing = self.http1_connections.remove(connection_key)?;
+        if !existing.is_stale(staleness_timeout) && !existing.should_close() && existing.is_healthy() {
+            return Some(existing);
+        }
+
+        if !existing.is_stale(staleness_timeout) && existing.is_healthy() {
+            self.connection_pool.return_connection(host, port, PooledProtocol::Http1, existing.stream);
+        }
+
+        None
+    }
+
+    fn store_or_release_http1_connection(&mut self, connection_key: String, conn: Http1ConnectionEntry, keep_alive: bool, host: &str, port: u16) {
+        if keep_alive && !conn.should_close() {
+            self.http1_connections.insert(connection_key, conn);
+        } else if keep_alive {
+            self.connection_pool.return_connection(host, port, PooledProtocol::Http1, conn.stream);
+        }
+    }
+
     fn send_http1_request(&mut self, request: &HttpRequest, host: &str, port: u16, path: &str) -> io::Result<HttpResponse> {
         let connection_key = format!("{}:{}", host, port);
-        let mut conn = if let Some(existing) = self.http1_connections.remove(&connection_key) {
-            if existing.is_stale(self.idle_timeout) || existing.should_close() {
-                self.create_http1_connection(host, port)?
-            } else {
-                existing
-            }
-        } else {
-            self.create_http1_connection(host, port)?
+        let mut conn = match self.take_reusable_http1_connection(&connection_key, host, port, self.idle_timeout) {
+            Some(existing) => existing,
+            None => self.create_http1_connection(host, port)?,
         };
 
         let mut modified_request = if request.path() != path {
@@ -1443,9 +1468,7 @@ impl HttpClient {
         conn.stream.flush()?;
         let response = self.read_http1_response(&mut conn.stream)?;
         conn.mark_used();
-        if response.wants_keep_alive() && !conn.should_close() {
-            self.http1_connections.insert(connection_key, conn);
-        }
+        self.store_or_release_http1_connection(connection_key, conn, response.wants_keep_alive(), host, port);
 
         Ok(response)
     }
@@ -1455,7 +1478,8 @@ impl HttpClient {
         let conn = if let Some(existing) = self.http2_connections.get_mut(&connection_key) {
             existing
         } else {
-            let tcp_stream = self.connection_pool.get_or_connect(host, port)?;
+            self.connection_pool.clean_expired();
+            let tcp_stream = self.connection_pool.get_or_connect(host, port, PooledProtocol::Http2)?;
             let http2_conn = Http2Connection::new(tcp_stream)
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
 
@@ -1512,7 +1536,8 @@ impl HttpClient {
     }
 
     fn create_http1_connection(&self, host: &str, port: u16) -> io::Result<Http1ConnectionEntry> {
-        let tcp_stream = self.connection_pool.get_or_connect(host, port)?;
+        self.connection_pool.clean_expired();
+        let tcp_stream = self.connection_pool.get_or_connect(host, port, PooledProtocol::Http1)?;
         tcp_stream.set_read_timeout(self.timeout)?;
         tcp_stream.set_write_timeout(self.timeout)?;
 
@@ -1553,17 +1578,9 @@ impl HttpClient {
 
     fn connect_to_host(&self, host: &str, port: u16) -> io::Result<TcpStream> {
         let ip_addresses = self.resolve_host(host)?;
-        let mut last_error = None;
-        for ip in ip_addresses {
-            match TcpStream::connect(SocketAddr::new(ip, port)) {
-                Ok(stream) => return Ok(stream),
-                Err(e) => last_error = Some(e),
-            }
-        }
-
-        Err(last_error.unwrap_or_else(|| {
-            io::Error::new(io::ErrorKind::Other, format!("Failed to connect to {}:{}", host, port))
-        }))
+        let per_attempt_timeout = self.timeout.unwrap_or(Duration::from_secs(30));
+        race_connect(&ip_addresses, port, per_attempt_timeout)
+            .map_err(|e| io::Error::new(e.kind(), format!("Failed to connect to {}:{}: {}", host, port, e)))
     }
 
     fn build_redirect_request(&self, original: &HttpRequest, location: &str) -> Result<HttpRequest, io::Error> {
@@ -1730,55 +1747,45 @@ impl HttpClient {
         }
 
         let use_keep_alive = request.headers().get("Connection").map(|s| s.to_lowercase() != "close").unwrap_or(true);
-        let mut stream_option: Option<TcpStream> = None;
-        let mut _reused_connection = false;
-        if use_keep_alive {
+        let mut conn = if use_keep_alive {
             self.cleanup_idle_connections();
-            if let Some(entry) = self.http1_connections.get_mut(&connection_key) {
-                if !entry.is_stale(self.connection_timeout) && !entry.should_close() && entry.is_healthy() {
-                    let mut entry = self.http1_connections.remove(&connection_key).unwrap();
-                    entry.mark_used();
-                    stream_option = Some(entry.stream);
-                    _reused_connection = true;
-                }
+            match self.take_reusable_http1_connection(&connection_key, &host, port, self.connection_timeout) {
+                Some(existing) => existing,
+                None => self.create_http1_connection(&host, port)?,
             }
-        }
-
-        let mut stream = if let Some(s) = stream_option {
-            s
         } else {
-            self.connect_to_host(&host, port)?
+            self.create_http1_connection(&host, port)?
         };
 
         if let Some(timeout) = self.timeout {
-            stream.set_read_timeout(Some(timeout))?;
-            stream.set_write_timeout(Some(timeout))?;
+            conn.stream.set_read_timeout(Some(timeout))?;
+            conn.stream.set_write_timeout(Some(timeout))?;
         }
 
-        stream.set_nodelay(true)?;
+        conn.stream.set_nodelay(true)?;
         let request_line = format!("{} {} HTTP/1.1\r\n", request.method().as_str(), path);
-        stream.write_all(request_line.as_bytes())?;
+        conn.stream.write_all(request_line.as_bytes())?;
         let host_header = format!("Host: {}:{}\r\n", host, port);
-        stream.write_all(host_header.as_bytes())?;
+        conn.stream.write_all(host_header.as_bytes())?;
         for (key, values) in request.headers().iter() {
             if key.to_lowercase() != "host" {
                 let header = format!("{}: {}\r\n", key, values.join(", "));
-                stream.write_all(header.as_bytes())?;
+                conn.stream.write_all(header.as_bytes())?;
             }
         }
 
         if request.headers().get("Connection").is_none() {
             if use_keep_alive {
-                stream.write_all(b"Connection: keep-alive\r\n")?;
+                conn.stream.write_all(b"Connection: keep-alive\r\n")?;
             } else {
-                stream.write_all(b"Connection: close\r\n")?;
+                conn.stream.write_all(b"Connection: close\r\n")?;
             }
         }
 
         if use_expect_continue {
-            stream.write_all(b"\r\n")?;
-            stream.flush()?;
-            let mut reader = BufReader::new(&stream);
+            conn.stream.write_all(b"\r\n")?;
+            conn.stream.flush()?;
+            let mut reader = BufReader::new(&conn.stream);
             let mut status_line = String::new();
             reader.read_line(&mut status_line)?;
             let parts: Vec<&str> = status_line.trim().split_whitespace().collect();
@@ -1787,24 +1794,30 @@ impl HttpClient {
                 if status == 100 {
                     let mut line = String::new();
                     reader.read_line(&mut line)?;
-                    stream.write_all(request.body_bytes())?;
-                    stream.flush()?;
+                    conn.stream.write_all(request.body_bytes())?;
+                    conn.stream.flush()?;
                 } else if status >= 400 {
                     drop(reader);
-                    return self.read_http1_response(&mut stream);
+                    let response = self.read_http1_response(&mut conn.stream)?;
+                    conn.mark_used();
+                    self.store_or_release_http1_connection(connection_key, conn, use_keep_alive && response.wants_keep_alive(), &host, port);
+                    return Ok(response);
                 }
             }
         } else {
-            stream.write_all(b"\r\n")?;
+            conn.stream.write_all(b"\r\n")?;
             let body = request.body_bytes();
             if !body.is_empty() {
-                stream.write_all(body)?;
+                conn.stream.write_all(body)?;
             }
 
-            stream.flush()?;
+            conn.stream.flush()?;
         }
 
-        self.read_http1_response(&mut stream)
+        let response = self.read_http1_response(&mut conn.stream)?;
+        conn.mark_used();
+        self.store_or_release_http1_connection(connection_key, conn, use_keep_alive && response.wants_keep_alive(), &host, port);
+        Ok(response)
     }
 
     fn read_http1_response(&self, stream: &mut TcpStream) -> io::Result<HttpResponse> {
@@ -2667,6 +2680,44 @@ fn parse_bool(v: &str) -> io::Result<bool> {
     }
 }
 
+fn race_connect(addresses: &[IpAddr], port: u16, per_attempt_timeout: Duration) -> io::Result<TcpStream> {
+    if addresses.is_empty() {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "no addresses to connect to"));
+    }
+
+    if addresses.len() == 1 {
+        return TcpStream::connect_timeout(SocketAddr::new(addresses[0], port), per_attempt_timeout);
+    }
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let attempts = addresses.len();
+    for (index, &ip) in addresses.iter().enumerate() {
+        let tx = tx.clone();
+        let delay = HAPPY_EYEBALLS_ATTEMPT_DELAY.saturating_mul(index as u32);
+        std::thread::spawn(move || {
+            if !delay.is_zero() {
+                std::thread::sleep(delay);
+            }
+
+            let result = TcpStream::connect_timeout(SocketAddr::new(ip, port), per_attempt_timeout);
+            let _ = tx.send((index, result));
+        });
+    }
+
+    drop(tx);
+
+    let mut last_error = None;
+    for _ in 0..attempts {
+        match rx.recv() {
+            Ok((_, Ok(stream))) => return Ok(stream),
+            Ok((_, Err(e))) => last_error = Some(e),
+            Err(_) => break,
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| io::Error::new(io::ErrorKind::Other, "all connection attempts failed")))
+}
+
 fn parse_url(url: &str) -> Result<(String, String, u16, String), io::Error> {
     let url_lower = url.to_lowercase();
     let (scheme, rest) = if url_lower.starts_with("http://") {
@@ -2780,5 +2831,166 @@ mod tests {
 
         let relative = "relative";
         assert_eq!(resolve_url(base, relative), "http://example.com/a/b/relative");
+    }
+
+    #[test]
+    fn test_race_connect_succeeds_despite_unreachable_address() {
+        use crate::net::tcp::TcpListener;
+        use std::net::Ipv4Addr;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind must succeed");
+        let addr = listener.local_addr().expect("local_addr must succeed");
+
+        // 192.0.2.0/24 is TEST-NET-1, which is reserved for documentation and guaranteed to never be routable
+        let unreachable = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
+        let addresses = vec![unreachable, addr.ip()];
+
+        let result = race_connect(&addresses, addr.port(), Duration::from_millis(500));
+        assert!(result.is_ok(), "expected the reachable address to win the race: {:?}", result.err());
+    }
+
+    #[test]
+    fn test_execute_http1_reuses_connection_across_get_calls() {
+        use crate::net::tcp::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind must succeed");
+        let addr = listener.local_addr().expect("local_addr must succeed");
+
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept must succeed");
+            let mut reader = BufReader::new(stream.try_clone().expect("clone must succeed"));
+            for _ in 0..3 {
+                loop {
+                    let mut line = String::new();
+                    let n = reader.read_line(&mut line).expect("read_line must succeed");
+                    if n == 0 || line == "\r\n" || line == "\n" {
+                        break;
+                    }
+                }
+
+                let body = b"ok";
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).expect("write_all must succeed");
+                stream.write_all(body).expect("write_all must succeed");
+            }
+        });
+
+        let mut client = HttpClient::new();
+        let url = format!("http://{}/", addr);
+        for _ in 0..3 {
+            let response = client.get(&url).expect("request must succeed");
+            assert_eq!(response.status_code(), 200);
+        }
+
+        server.join().expect("server thread must not panic");
+    }
+
+    #[test]
+    fn test_execute_http1_pool_wiring_reuses_capped_connection() {
+        use crate::net::tcp::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind must succeed");
+        let addr = listener.local_addr().expect("local_addr must succeed");
+
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept must succeed");
+            let mut reader = BufReader::new(stream.try_clone().expect("clone must succeed"));
+            for _ in 0..101 {
+                loop {
+                    let mut line = String::new();
+                    let n = reader.read_line(&mut line).expect("read_line must succeed");
+                    if n == 0 || line == "\r\n" || line == "\n" {
+                        break;
+                    }
+                }
+
+                let body = b"ok";
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).expect("write_all must succeed");
+                stream.write_all(body).expect("write_all must succeed");
+            }
+        });
+
+        let mut client = HttpClient::new();
+        let url = format!("http://{}/", addr);
+        for _ in 0..100 {
+            let response = client.get(&url).expect("request must succeed");
+            assert_eq!(response.status_code(), 200);
+        }
+
+        assert_eq!(client.connection_pool.connection_count(), 1);
+
+        let response = client.get(&url).expect("101st request must succeed");
+        assert_eq!(response.status_code(), 200);
+        assert_eq!(client.connection_pool.connection_count(), 0);
+
+        server.join().expect("server thread must not panic");
+    }
+
+    #[test]
+    fn test_http1_pool_wiring_reuses_capped_connection() {
+        use crate::net::tcp::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind must succeed");
+        let addr = listener.local_addr().expect("local_addr must succeed");
+
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept must succeed");
+            let mut reader = BufReader::new(stream.try_clone().expect("clone must succeed"));
+            for _ in 0..101 {
+                loop {
+                    let mut line = String::new();
+                    let n = reader.read_line(&mut line).expect("read_line must succeed");
+                    if n == 0 || line == "\r\n" || line == "\n" {
+                        break;
+                    }
+                }
+
+                let body = b"ok";
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).expect("write_all must succeed");
+                stream.write_all(body).expect("write_all must succeed");
+            }
+        });
+
+        let mut client = HttpClient::new();
+        let url = format!("http://{}/", addr);
+
+        for _ in 0..100 {
+            let request = HttpRequest::new(HttpMethod::GET, &url);
+            let response = client.send_request(&request, &url).expect("request must succeed");
+            assert_eq!(response.status_code(), 200);
+        }
+
+        assert_eq!(client.connection_pool.connection_count(), 1);
+
+        let request = HttpRequest::new(HttpMethod::GET, &url);
+        let response = client.send_request(&request, &url).expect("101st request must succeed");
+        assert_eq!(response.status_code(), 200);
+        assert_eq!(client.connection_pool.connection_count(), 0);
+
+        server.join().expect("server thread must not panic");
+    }
+
+    #[test]
+    fn test_race_connect_fails_when_all_addresses_unreachable() {
+        use std::net::Ipv4Addr;
+
+        let addresses = vec![
+            IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
+            IpAddr::V4(Ipv4Addr::new(192, 0, 2, 2)),
+        ];
+
+        let result = race_connect(&addresses, 65000, Duration::from_millis(500));
+        assert!(result.is_err());
     }
 }

@@ -4,6 +4,7 @@ mod cache;
 mod query;
 mod response;
 mod resolver;
+pub mod dnssec;
 
 use crate::crypto::constant_time_eq;
 use crate::crypto::encoding::pem;
@@ -19,7 +20,8 @@ pub use packet::{DnsPacket, DnsHeader, DnsQuestion, OpCode, ResponseCode};
 pub use cache::{DnsCache, CacheStats};
 pub use query::DnsQuery;
 pub use response::{DnsResponse, ValidationError};
-pub use resolver::DnsResolver;
+pub use resolver::{DnsResolver, TrustAnchor, DnssecOutcome, well_known_dot_servers, well_known_root_trust_anchor};
+pub use dnssec::DnssecError;
 
 const DNS_SECURE_ENVELOPE_MAGIC: &str = "SINGULARITY_DNS_SECURE_V1";
 const DNS_SECURE_ENVELOPE_CONTEXT: &str = "SINGULARITY_DNS_SECURE_BINDING_V1";
