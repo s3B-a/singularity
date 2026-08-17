@@ -1,9 +1,10 @@
 use super::connection::Http3Connection;
+use super::crypto::compute_retry_integrity_tag;
 use super::error::{Error, ErrorCode, Result};
-use super::packet::{Packet, PacketType};
+use super::packet::{Packet, PacketHeader, PacketType};
 use super::quic_tls::{CryptoAction, QuicTlsState};
 use super::stream::StreamId;
-use super::{Config, ConnectionId, Role};
+use super::{Config, ConnectionId, Role, HTTP3_VERSION};
 use crate::crypto::constant_time_eq;
 use crate::crypto::encoding::pem;
 use crate::crypto::hash::hmac::hmac_sha256;
@@ -44,6 +45,11 @@ pub struct QuicClient {
     tls_states: HashMap<SocketAddr, QuicTlsState>,
 }
 
+enum ConnectAttemptResult {
+    Connected,
+    Retry { token: Vec<u8> },
+}
+
 impl QuicClient {
     pub fn new(config: Config) -> Self {
         Self {
@@ -64,13 +70,37 @@ impl QuicClient {
     }
 
     pub fn connect_with_sni(&mut self, server_addr: SocketAddr, server_name: String) -> Result<&mut Http3Connection> {
+        let mut token = None;
+        for attempt in 0..2 {
+            match self.connect_attempt(server_addr, &server_name, token.take())? {
+                ConnectAttemptResult::Connected => {
+                    return Ok(self.connections.get_mut(&server_addr).unwrap());
+                }
+                ConnectAttemptResult::Retry { token: retry_token } => {
+                    if attempt == 1 {
+                        return Err(Error::Tls("Server issued more than one Retry".to_string()));
+                    }
+
+                    token = Some(retry_token);
+                }
+            }
+        }
+
+        unreachable!("the loop above always returns or errors within its 2 iterations")
+    }
+
+    fn connect_attempt(&mut self, server_addr: SocketAddr, server_name: &str, token: Option<Vec<u8>>) -> Result<ConnectAttemptResult> {
         let socket = UdpSocket::bind("0.0.0.0:0")?;
         socket.connect(server_addr)?;
         socket.set_read_timeout(Some(self.default_timeout))?;
         socket.set_write_timeout(Some(self.default_timeout))?;
 
         let mut connection = Http3Connection::new_client(socket, server_addr, self.config.clone())?;
-        let mut tls_state = QuicTlsState::new_client(Some(server_name));
+        if let Some(token) = token {
+            connection.set_initial_token(token);
+        }
+
+        let mut tls_state = QuicTlsState::new_client(Some(server_name.to_string()));
         tls_state.set_alpn_protocols(vec!["h3".to_string()]);
         tls_state.set_transport_params(self.build_transport_params());
         tls_state.start_handshake(connection.crypto_mut())?;
@@ -85,7 +115,14 @@ impl QuicClient {
                 return Err(Error::Tls("Handshake timed out".to_string()));
             }
 
+            connection.check_timeout().ok();
+            connection.send()?;
             connection.recv()?;
+
+            if let Some((retry_token, _new_dcid)) = connection.take_pending_retry() {
+                return Ok(ConnectAttemptResult::Retry { token: retry_token });
+            }
+
             let pending = connection.get_pending_crypto();
             for (offset, data) in pending {
                 let actions = tls_state.process_crypto_data(offset, data, connection.crypto_mut())?;
@@ -105,8 +142,8 @@ impl QuicClient {
                             connection.send()?;
                             self.tls_states.insert(server_addr, tls_state);
                             self.connections.insert(server_addr, connection);
-                            
-                            return Ok(self.connections.get_mut(&server_addr).unwrap());
+
+                            return Ok(ConnectAttemptResult::Connected);
                         }
                         CryptoAction::SendCryptoData => {
                             while let Some((pn_space, crypto_data)) = tls_state.next_crypto_data() {
@@ -133,7 +170,7 @@ impl QuicClient {
 
         self.tls_states.insert(server_addr, tls_state);
         self.connections.insert(server_addr, connection);
-        Ok(self.connections.get_mut(&server_addr).unwrap())
+        Ok(ConnectAttemptResult::Connected)
     }
 
     fn build_transport_params(&self) -> Vec<u8> {
@@ -263,6 +300,8 @@ impl QuicClient {
                 return Err(Error::Timeout);
             }
 
+            conn.check_timeout().ok();
+            conn.send().ok();
             conn.recv()?;
             match conn.stream_recv(stream_id, &mut buffer) {
                 Ok(0) => break,
@@ -283,6 +322,76 @@ impl QuicClient {
     }
 }
 
+const RETRY_TOKEN_VALIDITY_SECS: u64 = 10;
+
+fn encode_socket_addr(addr: SocketAddr) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    match addr {
+        SocketAddr::V4(v4) => {
+            bytes.push(4);
+            bytes.extend_from_slice(&v4.ip().octets());
+        }
+        SocketAddr::V6(v6) => {
+            bytes.push(6);
+            bytes.extend_from_slice(&v6.ip().octets());
+        }
+    }
+
+    bytes.extend_from_slice(&addr.port().to_be_bytes());
+    bytes
+}
+
+fn generate_retry_token(server_secret: &[u8], peer_addr: SocketAddr, odcid: &ConnectionId) -> Vec<u8> {
+    let issued_at = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+
+    let mut payload = encode_socket_addr(peer_addr);
+    payload.push(odcid.len() as u8);
+    payload.extend_from_slice(odcid.as_bytes());
+    payload.extend_from_slice(&issued_at.to_be_bytes());
+
+    let mac = hmac_sha256(server_secret, &payload);
+    let mut token = payload;
+    token.extend_from_slice(&mac);
+    token
+}
+
+fn validate_retry_token(server_secret: &[u8], token: &[u8], peer_addr: SocketAddr) -> Option<ConnectionId> {
+    if token.len() <= 32 {
+        return None;
+    }
+
+    let (payload, mac) = token.split_at(token.len() - 32);
+    let expected_mac = hmac_sha256(server_secret, payload);
+    if !constant_time_eq(&expected_mac, mac) {
+        return None;
+    }
+
+    let expected_addr = encode_socket_addr(peer_addr);
+    if payload.len() < expected_addr.len() + 1 {
+        return None;
+    }
+
+    let (addr_bytes, rest) = payload.split_at(expected_addr.len());
+    if addr_bytes != expected_addr.as_slice() {
+        return None;
+    }
+
+    let odcid_len = rest[0] as usize;
+    if rest.len() < 1 + odcid_len + 8 {
+        return None;
+    }
+
+    let odcid_bytes = &rest[1..1 + odcid_len];
+    let issued_at = u64::from_be_bytes(rest[1 + odcid_len..1 + odcid_len + 8].try_into().ok()?);
+
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    if now.saturating_sub(issued_at) > RETRY_TOKEN_VALIDITY_SECS {
+        return None;
+    }
+
+    Some(ConnectionId::new(odcid_bytes.to_vec()))
+}
+
 pub struct QuicServer {
     config: Config,
     socket: UdpSocket,
@@ -290,6 +399,7 @@ pub struct QuicServer {
     tls_states: HashMap<ConnectionId, QuicTlsState>,
     pending_connections: HashMap<SocketAddr, PendingConnection>,
     bind_addr: SocketAddr,
+    retry_secret: Vec<u8>,
 }
 
 struct PendingConnection {
@@ -316,6 +426,7 @@ impl QuicServer {
     pub fn bind(addr: SocketAddr, config: Config) -> Result<Self> {
         let socket = UdpSocket::bind(addr)?;
         socket.set_read_timeout(Some(Duration::from_millis(100)))?;
+        let retry_secret = random::generate_random(32).map_err(|_| Error::CryptoError)?;
 
         Ok(Self {
             config,
@@ -324,6 +435,7 @@ impl QuicServer {
             tls_states: HashMap::new(),
             pending_connections: HashMap::new(),
             bind_addr: addr,
+            retry_secret,
         })
     }
 
@@ -353,6 +465,20 @@ impl QuicServer {
     }
 
     fn handle_initial_packet(&mut self, packet: Packet, peer_addr: SocketAddr) -> Result<Option<(ConnectionId, SocketAddr)>> {
+        let odcid = if self.config.enable_retry_validation {
+            let validated = packet.header.token.as_ref().and_then(|token| validate_retry_token(&self.retry_secret, token, peer_addr));
+
+            match validated {
+                Some(odcid) => Some(odcid),
+                None => {
+                    self.send_retry(peer_addr, &packet.header.dcid, &packet.header.scid)?;
+                    return Ok(None);
+                }
+            }
+        } else {
+            None
+        };
+
         let scid = ConnectionId::generate()?;
         let dcid = packet.header.scid.clone();
 
@@ -361,13 +487,18 @@ impl QuicServer {
         client_socket.set_read_timeout(Some(Duration::from_secs(5)))?;
         client_socket.set_write_timeout(Some(Duration::from_secs(5)))?;
 
-        let connection = Http3Connection::new_server(
+        let mut connection = Http3Connection::new_server(
             client_socket,
             peer_addr,
             scid.clone(),
             dcid.clone(),
             self.config.clone(),
         )?;
+
+        if let Some(odcid) = odcid {
+            connection.mark_address_validated();
+            connection.set_odcid(odcid);
+        }
 
         let mut tls_state = QuicTlsState::new_server();
         tls_state.set_alpn_protocols(vec!["h3".to_string()]);
@@ -378,6 +509,24 @@ impl QuicServer {
         self.tls_states.insert(scid.clone(), tls_state);
 
         Ok(Some((scid, peer_addr)))
+    }
+
+    fn send_retry(&self, peer_addr: SocketAddr, odcid: &ConnectionId, client_scid: &ConnectionId) -> Result<()> {
+        let new_scid = ConnectionId::generate()?;
+        let token = generate_retry_token(&self.retry_secret, peer_addr, odcid);
+
+        let header = PacketHeader::new(PacketType::Retry, HTTP3_VERSION, client_scid.clone(), new_scid, 0);
+        let mut header_and_token = Vec::new();
+        header.encode(&mut header_and_token, 0)?;
+        header_and_token.extend_from_slice(&token);
+
+        let tag = compute_retry_integrity_tag(odcid.as_bytes(), &header_and_token)?;
+
+        let mut datagram = header_and_token;
+        datagram.extend_from_slice(&tag);
+
+        self.socket.send_to(&datagram, peer_addr)?;
+        Ok(())
     }
 
     fn handle_packet_for_connection(&mut self, conn_id: &ConnectionId, _data: &[u8]) -> Result<()> {
@@ -485,6 +634,8 @@ impl QuicServer {
         for id in ids {
             if let Some(conn) = self.connections.get_mut(&id) {
                 conn.recv().ok();
+                conn.check_timeout().ok();
+                conn.send().ok();
             }
 
             let stream_events = self.collect_stream_events_for(&id)?;
@@ -730,10 +881,14 @@ impl QuicConnectionManager {
     pub fn process_all(&mut self) -> Result<()> {
         for conn in self.client_connections.values_mut() {
             conn.recv().ok();
+            conn.check_timeout().ok();
+            conn.send().ok();
         }
 
         for conn in self.server_connections.values_mut() {
             conn.recv().ok();
+            conn.check_timeout().ok();
+            conn.send().ok();
         }
 
         Ok(())
@@ -1193,6 +1348,82 @@ fn parse_secure_quic_stats_meta(header: &str, body_len: usize) -> io::Result<Sec
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_retry_token_roundtrip_and_rejections() {
+        let secret = vec![7u8; 32];
+        let peer_addr: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+        let odcid = ConnectionId::generate().unwrap();
+
+        let token = generate_retry_token(&secret, peer_addr, &odcid);
+        let validated = validate_retry_token(&secret, &token, peer_addr).unwrap();
+        assert_eq!(validated.as_bytes(), odcid.as_bytes());
+
+        let other_addr: SocketAddr = "127.0.0.1:5001".parse().unwrap();
+        assert!(validate_retry_token(&secret, &token, other_addr).is_none(), "a token must not validate for a different address");
+
+        let wrong_secret = vec![8u8; 32];
+        assert!(validate_retry_token(&wrong_secret, &token, peer_addr).is_none(), "a token must not validate under a different server secret");
+
+        let mut tampered = token.clone();
+        let last = tampered.len() - 1;
+        tampered[last] ^= 0x01;
+        assert!(validate_retry_token(&secret, &tampered, peer_addr).is_none(), "a tampered token must be rejected");
+    }
+
+    #[test]
+    fn test_handle_initial_packet_issues_retry_then_accepts_valid_token() {
+        let mut config = Config::default();
+        config.enable_retry_validation = true;
+
+        let mut server = QuicServer::bind("127.0.0.1:0".parse().unwrap(), config).unwrap();
+
+        let peer_socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let peer_addr = peer_socket.local_addr().unwrap();
+        peer_socket.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+
+        let client_dcid = ConnectionId::generate().unwrap();
+        let client_scid = ConnectionId::generate().unwrap();
+
+        let initial_no_token = Packet::init(HTTP3_VERSION, client_dcid.clone(), client_scid.clone(), 0, None, vec![1, 2, 3, 4]);
+        let result = server.handle_initial_packet(initial_no_token, peer_addr).unwrap();
+        assert!(result.is_none(), "without a token the server should send a Retry, not accept the connection");
+        assert_eq!(server.connection_count(), 0);
+
+        let mut retry_buf = vec![0u8; 2048];
+        let (size, _) = peer_socket.recv_from(&mut retry_buf).unwrap();
+        retry_buf.truncate(size);
+
+        let retry_packet = Packet::parse(&retry_buf).unwrap();
+        assert_eq!(retry_packet.header.packet_type, PacketType::Retry);
+        assert!(retry_packet.payload.len() > 16);
+
+        let (token, _tag) = retry_packet.payload.split_at(retry_packet.payload.len() - 16);
+        let validated_odcid = validate_retry_token(&server.retry_secret, token, peer_addr).unwrap();
+        assert_eq!(validated_odcid.as_bytes(), client_dcid.as_bytes());
+
+        let initial_with_token = Packet::init(HTTP3_VERSION, client_dcid.clone(), client_scid.clone(), 1, Some(token.to_vec()), vec![1, 2, 3, 4]);
+        let result = server.handle_initial_packet(initial_with_token, peer_addr).unwrap();
+        let (scid, addr) = result.expect("a valid token should let the connection through");
+        assert_eq!(addr, peer_addr);
+
+        let conn = server.connections.get(&scid).unwrap();
+        assert!(conn.is_address_validated());
+        assert_eq!(conn.odcid().map(|id| id.as_bytes().to_vec()), Some(client_dcid.as_bytes().to_vec()));
+    }
+
+    #[test]
+    fn test_handle_initial_packet_ignores_token_when_retry_disabled() {
+        let config = Config::default();
+        assert!(!config.enable_retry_validation);
+
+        let mut server = QuicServer::bind("127.0.0.1:0".parse().unwrap(), config).unwrap();
+        let peer_addr: SocketAddr = "127.0.0.1:6000".parse().unwrap();
+
+        let initial = Packet::init(HTTP3_VERSION, ConnectionId::generate().unwrap(), ConnectionId::generate().unwrap(), 0, None, vec![1, 2, 3, 4]);
+        let result = server.handle_initial_packet(initial, peer_addr).unwrap();
+        assert!(result.is_some(), "with Retry validation disabled, the connection should be accepted immediately as before");
+    }
 
     #[test]
     fn test_secure_quic_stats_roundtrip_identity() {

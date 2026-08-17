@@ -458,7 +458,6 @@ impl RecoveryManager {
         }
 
         if self.has_ack_eliciting_in_flight() {
-            self.probe_timeout_count += 1;
             self.on_probe_timeout(now);
         }
 
@@ -501,6 +500,10 @@ impl RecoveryManager {
         self.latest_rtt
     }
 
+    pub fn largest_acked(&self, space: PacketNumberSpace) -> u64 {
+        *self.largest_acked.get(&space).unwrap_or(&0)
+    }
+
     pub fn rttvar(&self) -> Duration {
         self.rttvar
     }
@@ -538,6 +541,35 @@ impl RecoveryManager {
         let rtt = self.smoothed_rtt.unwrap_or(self.initial_rtt);
         let pto = rtt + (self.rttvar * 4);
         pto.max(Duration::from_millis(1))
+    }
+
+    fn ack_eliciting_in_flight(&self, space: PacketNumberSpace) -> bool {
+        self.sent_packets
+            .get(&space)
+            .map(|packets| packets.values().any(|p| p.ack_eliciting && !p.acknowledged && !p.declared_lost))
+            .unwrap_or(false)
+    }
+
+    pub fn ack_eliciting_in_flight_spaces(&self) -> Vec<PacketNumberSpace> {
+        [PacketNumberSpace::Initial, PacketNumberSpace::Handshake, PacketNumberSpace::ApplicationData]
+            .into_iter()
+            .filter(|&space| self.ack_eliciting_in_flight(space))
+            .collect()
+    }
+
+    pub fn pto_deadline(&self) -> Option<Instant> {
+        let backoff = 1u32 << self.probe_timeout_count.min(16);
+        let pto = self.probe_timeout();
+        let backed_off_pto = pto.checked_mul(backoff).unwrap_or(pto);
+
+        [PacketNumberSpace::Initial, PacketNumberSpace::Handshake, PacketNumberSpace::ApplicationData]
+            .into_iter()
+            .filter(|&space| self.ack_eliciting_in_flight(space))
+            .filter_map(|space| {
+                let last = self.time_of_last_ack_eliciting.get(&space).copied().flatten()?;
+                last.checked_add(backed_off_pto)
+            })
+            .min()
     }
 }
 
@@ -864,6 +896,35 @@ mod tests {
         assert_eq!(rm.bytes_acked, 0);
         assert_eq!(rm.bytes_lost, 0);
         assert_eq!(rm.probe_timeout_count, 0);
+    }
+
+    #[test]
+    fn test_pto_deadline_fires_after_real_elapsed_time() {
+        let mut rm = RecoveryManager::new(1200);
+        assert!(rm.pto_deadline().is_none());
+
+        rm.on_packet_sent(PacketNumberSpace::ApplicationData, 0, 100, true);
+
+        let deadline = rm.pto_deadline().expect("deadline should be set while ack-eliciting data is in flight");
+        assert!(deadline > Instant::now());
+
+        std::thread::sleep(Duration::from_millis(110));
+
+        assert!(Instant::now() >= rm.pto_deadline().unwrap());
+
+        assert_eq!(rm.probe_timeout_count, 0);
+        rm.loss_detection_timeout(Instant::now()).unwrap();
+        assert_eq!(rm.probe_timeout_count, 1);
+
+        let probe_spaces = rm.ack_eliciting_in_flight_spaces();
+        assert!(probe_spaces.contains(&PacketNumberSpace::ApplicationData));
+    }
+
+    #[test]
+    fn test_pto_deadline_none_without_in_flight_data() {
+        let rm = RecoveryManager::new(1200);
+        assert!(rm.pto_deadline().is_none());
+        assert!(rm.ack_eliciting_in_flight_spaces().is_empty());
     }
 
     #[test]

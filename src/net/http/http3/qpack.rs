@@ -121,6 +121,7 @@ struct DynamicTableEntry {
     name: String,
     value: String,
     size: usize,
+    abs_index: u64,
 }
 
 #[derive(Debug)]
@@ -129,6 +130,8 @@ pub struct QpackEncoder {
     max_table_capacity: usize,
     current_table_size: usize,
     insert_count: u64,
+    pending_instructions: Vec<u8>,
+    known_received_count: u64,
 }
 
 #[derive(Debug)]
@@ -137,12 +140,13 @@ pub struct QpackDecoder {
     max_table_capacity: usize,
     current_table_size: usize,
     insert_count: u64,
+    pending_instructions: Vec<u8>,
 }
 
 impl DynamicTableEntry {
-    fn new(name: String, value: String) -> Self {
+    fn new(name: String, value: String, abs_index: u64) -> Self {
         let size = 32 + name.len() + value.len();
-        Self { name, value, size }
+        Self { name, value, size, abs_index }
     }
 
     fn size(&self) -> usize {
@@ -157,34 +161,147 @@ impl QpackEncoder {
             max_table_capacity,
             current_table_size: 0,
             insert_count: 0,
+            pending_instructions: Vec::new(),
+            known_received_count: 0,
         }
     }
 
     pub fn encode(&mut self, headers: &[(String, String)]) -> Result<Vec<u8>> {
-        let mut encoded = Vec::new();
-        let required_insert_count = 0u64;
-        let base = 0u64;
-        
-        Self::encode_prefix_int(&mut encoded, required_insert_count, 8);
-        if required_insert_count > 0 {
-            let delta = required_insert_count.saturating_sub(base);
-            let negative = false;
-            
-            let sign_bit = if negative { 1 } else { 0 };
-            Self::encode_prefix_int(&mut encoded, (delta << 1) | sign_bit, 7);
+        enum FieldOp {
+            Indexed { abs_index: u64, dynamic: bool },
+            LiteralWithNameRef { name_index: usize, dynamic: bool, value: String },
+            Literal { name: String, value: String },
         }
-        
+
+        let mut ops = Vec::with_capacity(headers.len());
+        let mut used_dynamic = false;
+
         for (name, value) in headers {
             if let Some(static_idx) = self.find_in_static_table(name, value) {
-                Self::encode_indexed_field_line(&mut encoded, static_idx, false);
+                ops.push(FieldOp::Indexed { abs_index: static_idx as u64, dynamic: false });
+            } else if let Some(dyn_abs) = self.find_in_dynamic_table(name, value) {
+                ops.push(FieldOp::Indexed { abs_index: dyn_abs, dynamic: true });
+                used_dynamic = true;
             } else if let Some(static_name_idx) = self.find_name_in_static_table(name) {
-                Self::encode_literal_with_name_ref(&mut encoded, static_name_idx, value, false, false);
+                if self.try_insert(name.clone(), value.clone()) {
+                    Self::encode_insert_with_name_ref(&mut self.pending_instructions, static_name_idx as u64, true, value);
+                    ops.push(FieldOp::Indexed { abs_index: self.insert_count - 1, dynamic: true });
+                    used_dynamic = true;
+                } else {
+                    ops.push(FieldOp::LiteralWithNameRef { name_index: static_name_idx, dynamic: false, value: value.clone() });
+                }
+            } else if let Some(dyn_name_abs) = self.find_name_in_dynamic_table(name) {
+                ops.push(FieldOp::LiteralWithNameRef { name_index: dyn_name_abs as usize, dynamic: true, value: value.clone() });
+                used_dynamic = true;
+            } else if self.try_insert(name.clone(), value.clone()) {
+                Self::encode_insert_with_literal_name(&mut self.pending_instructions, name, value);
+                ops.push(FieldOp::Indexed { abs_index: self.insert_count - 1, dynamic: true });
+                used_dynamic = true;
             } else {
-                Self::encode_literal_field_line(&mut encoded, name, value, false);
+                ops.push(FieldOp::Literal { name: name.clone(), value: value.clone() });
             }
         }
-        
+
+        let base = self.insert_count;
+        let required_insert_count = if used_dynamic { base } else { 0 };
+
+        let mut encoded = Vec::new();
+        Self::encode_prefix_int(&mut encoded, required_insert_count, 8);
+        if required_insert_count > 0 {
+            Self::encode_prefix_int(&mut encoded, 0, 7);
+        }
+
+        for op in ops {
+            match op {
+                FieldOp::Indexed { abs_index, dynamic } => {
+                    let index = if dynamic { (base - 1 - abs_index) as usize } else { abs_index as usize };
+                    Self::encode_indexed_field_line(&mut encoded, index, dynamic);
+                }
+                FieldOp::LiteralWithNameRef { name_index, dynamic, value } => {
+                    let index = if dynamic { (base - 1 - name_index as u64) as usize } else { name_index };
+                    Self::encode_literal_with_name_ref(&mut encoded, index, &value, dynamic, false);
+                }
+                FieldOp::Literal { name, value } => {
+                    Self::encode_literal_field_line(&mut encoded, &name, &value, false);
+                }
+            }
+        }
+
         Ok(encoded)
+    }
+
+    pub fn drain_instructions(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.pending_instructions)
+    }
+
+    pub fn set_capacity_and_announce(&mut self, capacity: usize) -> Result<()> {
+        self.set_capacity(capacity)?;
+        Self::encode_set_capacity(&mut self.pending_instructions, capacity as u64);
+        Ok(())
+    }
+
+    pub fn process_decoder_instructions(&mut self, data: &[u8]) -> Result<usize> {
+        let mut cursor = 0;
+        while cursor < data.len() {
+            let first_byte = data[cursor];
+            if first_byte & 0x80 == 0x80 {
+                let (_stream_id, consumed) = QpackDecoder::decode_int(data, cursor, 7)?;
+                cursor += consumed;
+            } else if first_byte & 0x40 == 0x40 {
+                let (_stream_id, consumed) = QpackDecoder::decode_int(data, cursor, 6)?;
+                cursor += consumed;
+            } else {
+                let (increment, consumed) = QpackDecoder::decode_int(data, cursor, 6)?;
+                cursor += consumed;
+                self.known_received_count = self.known_received_count.saturating_add(increment as u64);
+            }
+        }
+
+        Ok(cursor)
+    }
+
+    pub fn known_received_count(&self) -> u64 {
+        self.known_received_count
+    }
+
+    fn encode_insert_with_name_ref(buffer: &mut Vec<u8>, name_index: u64, static_table: bool, value: &str) {
+        let prefix = 0x80 | if static_table { 0x40 } else { 0x00 };
+        let prefix_bits = 6u64;
+        let max = (1u64 << prefix_bits) - 1;
+        if name_index < max {
+            buffer.push(prefix | name_index as u8);
+        } else {
+            buffer.push(prefix | max as u8);
+            Self::encode_int(buffer, (name_index - max) as usize);
+        }
+
+        Self::encode_string(buffer, value, false);
+    }
+
+    fn encode_insert_with_literal_name(buffer: &mut Vec<u8>, name: &str, value: &str) {
+        let bytes = name.as_bytes();
+        let length = bytes.len();
+        let prefix = 0x40;
+        if length < 31 {
+            buffer.push(prefix | length as u8);
+        } else {
+            buffer.push(prefix | 0x1F);
+            Self::encode_int(buffer, length - 31);
+        }
+
+        buffer.extend_from_slice(bytes);
+        Self::encode_string(buffer, value, false);
+    }
+
+    fn encode_set_capacity(buffer: &mut Vec<u8>, capacity: u64) {
+        let prefix_bits = 5u64;
+        let max = (1u64 << prefix_bits) - 1;
+        if capacity < max {
+            buffer.push(0x20 | capacity as u8);
+        } else {
+            buffer.push(0x20 | max as u8);
+            Self::encode_int(buffer, (capacity - max) as usize);
+        }
     }
 
     fn encode_indexed_field_line(buffer: &mut Vec<u8>, index: usize, dynamic: bool) {
@@ -279,15 +396,33 @@ impl QpackEncoder {
         STATIC_TABLE.iter().position(|(n, _)| *n == name)
     }
 
+    fn find_in_dynamic_table(&self, name: &str, value: &str) -> Option<u64> {
+        self.dynamic_table.iter().find(|e| e.name == name && e.value == value).map(|e| e.abs_index)
+    }
+
+    fn find_name_in_dynamic_table(&self, name: &str) -> Option<u64> {
+        self.dynamic_table.iter().find(|e| e.name == name).map(|e| e.abs_index)
+    }
+
+    fn try_insert(&mut self, name: String, value: String) -> bool {
+        let entry_size = 32 + name.len() + value.len();
+        if entry_size > self.max_table_capacity {
+            return false;
+        }
+
+        self.insert(name, value).is_ok()
+    }
+
     pub fn insert(&mut self, name: String, value: String) -> Result<()> {
-        let entry = DynamicTableEntry::new(name, value);
+        let abs_index = self.insert_count;
+        let entry = DynamicTableEntry::new(name, value, abs_index);
         let entry_size = entry.size();
         if entry_size > self.max_table_capacity {
             return Err(Error::InvalidOperation(
                 "Entry too large for table".to_string(),
             ));
         }
-        
+
         while self.current_table_size + entry_size > self.max_table_capacity {
             if let Some(evicted) = self.dynamic_table.pop_back() {
                 self.current_table_size -= evicted.size();
@@ -295,11 +430,11 @@ impl QpackEncoder {
                 break;
             }
         }
-        
+
         self.dynamic_table.push_front(entry);
         self.current_table_size += entry_size;
         self.insert_count += 1;
-        
+
         Ok(())
     }
 
@@ -312,7 +447,7 @@ impl QpackEncoder {
                 break;
             }
         }
-        
+
         Ok(())
     }
 }
@@ -324,7 +459,107 @@ impl QpackDecoder {
             max_table_capacity,
             current_table_size: 0,
             insert_count: 0,
+            pending_instructions: Vec::new(),
         }
+    }
+
+    pub fn process_encoder_instructions(&mut self, data: &[u8]) -> Result<usize> {
+        let mut cursor = 0;
+        let mut inserted = 0u64;
+
+        while cursor < data.len() {
+            let first_byte = data[cursor];
+            if first_byte & 0x80 == 0x80 {
+                let static_table = (first_byte & 0x40) != 0;
+                let (name_index, consumed) = Self::decode_int(data, cursor, 6)?;
+                cursor += consumed;
+
+                let name = if static_table {
+                    self.get_static_entry(name_index)?.0.to_string()
+                } else {
+                    self.get_dynamic_entry(name_index)?.0
+                };
+
+                let (value, consumed) = Self::decode_string(data, cursor)?;
+                cursor += consumed;
+
+                self.insert(name, value)?;
+                inserted += 1;
+            } else if first_byte & 0x40 == 0x40 {
+                let (name, consumed) = Self::decode_literal_name_string(data, cursor)?;
+                cursor += consumed;
+
+                let (value, consumed) = Self::decode_string(data, cursor)?;
+                cursor += consumed;
+
+                self.insert(name, value)?;
+                inserted += 1;
+            } else if first_byte & 0x20 == 0x20 {
+                let (capacity, consumed) = Self::decode_int(data, cursor, 5)?;
+                cursor += consumed;
+                self.set_capacity(capacity)?;
+            } else {
+                return Err(Error::InvalidFrame);
+            }
+        }
+
+        if inserted > 0 {
+            Self::encode_insert_count_increment(&mut self.pending_instructions, inserted);
+        }
+
+        Ok(cursor)
+    }
+
+    pub fn acknowledge_section(&mut self, stream_id: u64) {
+        let prefix_bits = 7u64;
+        let max = (1u64 << prefix_bits) - 1;
+        if stream_id < max {
+            self.pending_instructions.push(0x80 | stream_id as u8);
+        } else {
+            self.pending_instructions.push(0x80 | max as u8);
+            QpackEncoder::encode_int(&mut self.pending_instructions, (stream_id - max) as usize);
+        }
+    }
+
+    pub fn drain_instructions(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.pending_instructions)
+    }
+
+    fn encode_insert_count_increment(buffer: &mut Vec<u8>, increment: u64) {
+        let prefix_bits = 6u64;
+        let max = (1u64 << prefix_bits) - 1;
+        if increment < max {
+            buffer.push(increment as u8);
+        } else {
+            buffer.push(max as u8);
+            QpackEncoder::encode_int(buffer, (increment - max) as usize);
+        }
+    }
+
+    fn decode_literal_name_string(data: &[u8], offset: usize) -> Result<(String, usize)> {
+        if offset >= data.len() {
+            return Err(Error::BufferTooShort);
+        }
+
+        let first_byte = data[offset];
+        let huffman = (first_byte & 0x20) != 0;
+
+        let (length, mut consumed) = Self::decode_int(data, offset, 5)?;
+        if offset + consumed + length > data.len() {
+            return Err(Error::BufferTooShort);
+        }
+
+        let name_data = &data[offset + consumed..offset + consumed + length];
+        consumed += length;
+
+        if huffman {
+            return Err(Error::InvalidOperation(
+                "Huffman encoding not yet supported".to_string(),
+            ));
+        }
+
+        let name = String::from_utf8(name_data.to_vec()).map_err(|_| Error::InvalidFrame)?;
+        Ok((name, consumed))
     }
 
     pub fn decode(&mut self, data: &[u8]) -> Result<Vec<(String, String)>> {
@@ -501,14 +736,15 @@ impl QpackDecoder {
     }
 
     pub fn insert(&mut self, name: String, value: String) -> Result<()> {
-        let entry = DynamicTableEntry::new(name, value);
+        let abs_index = self.insert_count;
+        let entry = DynamicTableEntry::new(name, value, abs_index);
         let entry_size = entry.size();
         if entry_size > self.max_table_capacity {
             return Err(Error::InvalidOperation(
                 "Entry too large for table".to_string(),
             ));
         }
-        
+
         while self.current_table_size + entry_size > self.max_table_capacity {
             if let Some(evicted) = self.dynamic_table.pop_back() {
                 self.current_table_size -= evicted.size();
@@ -516,11 +752,11 @@ impl QpackDecoder {
                 break;
             }
         }
-        
+
         self.dynamic_table.push_front(entry);
         self.current_table_size += entry_size;
         self.insert_count += 1;
-        
+
         Ok(())
     }
 
@@ -533,7 +769,7 @@ impl QpackDecoder {
                 break;
             }
         }
-        
+
         Ok(())
     }
 }
@@ -555,7 +791,7 @@ pub fn encode_secure_qpack_headers(headers: &[(String, String)], algorithm: Comp
         selected_algorithm = CompressionAlgorithm::Identity;
     }
 
-    let mut encoder = QpackEncoder::new(4096);
+    let mut encoder = QpackEncoder::new(0);
     let raw_payload = encoder.encode(headers).map_err(|e| io::Error::new(io::ErrorKind::Other, format!("qpack encode failed: {}", e)))?;
     let encoded_payload = if selected_algorithm == CompressionAlgorithm::Identity {
         raw_payload.clone()
@@ -891,18 +1127,71 @@ mod tests {
     fn test_encode_decode_roundtrip() {
         let mut encoder = QpackEncoder::new(4096);
         let mut decoder = QpackDecoder::new(4096);
-        
+
         let headers = vec![
             (":method".to_string(), "GET".to_string()),
             (":path".to_string(), "/test".to_string()),
             (":scheme".to_string(), "https".to_string()),
             (":authority".to_string(), "example.com".to_string()),
         ];
-        
+
         let encoded = encoder.encode(&headers).unwrap();
+
+        let instructions = encoder.drain_instructions();
+        assert!(!instructions.is_empty(), "some headers should have been added to the dynamic table");
+        decoder.process_encoder_instructions(&instructions).unwrap();
+
         let decoded = decoder.decode(&encoded).unwrap();
-        
+
         assert_eq!(headers.len(), decoded.len());
+        assert_eq!(decoded, headers);
+    }
+
+    #[test]
+    fn test_encode_reuses_dynamic_table_on_repeat_header() {
+        let mut encoder = QpackEncoder::new(4096);
+        let mut decoder = QpackDecoder::new(4096);
+
+        let headers = vec![(":authority".to_string(), "example.com".to_string())];
+
+        let first_encoded = encoder.encode(&headers).unwrap();
+        decoder.process_encoder_instructions(&encoder.drain_instructions()).unwrap();
+        assert_eq!(decoder.decode(&first_encoded).unwrap(), headers);
+
+        let second_encoded = encoder.encode(&headers).unwrap();
+        assert!(encoder.drain_instructions().is_empty());
+        assert_eq!(decoder.decode(&second_encoded).unwrap(), headers);
+    }
+
+    #[test]
+    fn test_decoder_generates_insert_count_increment() {
+        let mut encoder = QpackEncoder::new(4096);
+        let mut decoder = QpackDecoder::new(4096);
+
+        let headers = vec![("x-custom".to_string(), "value".to_string())];
+        encoder.encode(&headers).unwrap();
+        let instructions = encoder.drain_instructions();
+        assert!(!instructions.is_empty());
+
+        decoder.process_encoder_instructions(&instructions).unwrap();
+        let decoder_instructions = decoder.drain_instructions();
+        assert!(!decoder_instructions.is_empty(), "an Insert Count Increment should have been queued");
+
+        encoder.process_decoder_instructions(&decoder_instructions).unwrap();
+        assert_eq!(encoder.known_received_count(), 1);
+    }
+
+    #[test]
+    fn test_set_capacity_and_announce_roundtrips_through_decoder() {
+        let mut encoder = QpackEncoder::new(4096);
+        let mut decoder = QpackDecoder::new(4096);
+
+        encoder.set_capacity_and_announce(8192).unwrap();
+        let instructions = encoder.drain_instructions();
+        assert!(!instructions.is_empty());
+
+        decoder.process_encoder_instructions(&instructions).unwrap();
+        assert_eq!(decoder.max_table_capacity, 8192);
     }
 
     #[test]

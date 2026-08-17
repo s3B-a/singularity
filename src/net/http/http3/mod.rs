@@ -2,6 +2,7 @@ pub mod quic;
 pub mod qpack;
 pub mod connection;
 pub mod frame;
+pub mod h3_frame;
 pub mod stream;
 pub mod congestion;
 pub mod recovery;
@@ -81,6 +82,7 @@ pub struct Config {
     pub max_send_burst: usize,
     pub qpack_max_table_capacity: u64,
     pub qpack_blocked_streams: u64,
+    pub enable_retry_validation: bool,
 }
 
 impl Default for Config {
@@ -104,6 +106,7 @@ impl Default for Config {
             max_send_burst: 10,
             qpack_max_table_capacity: 4096,
             qpack_blocked_streams: 100,
+            enable_retry_validation: false,
         }
     }
 }
@@ -376,7 +379,7 @@ pub fn decode_secure_http3_config(data: &[u8]) -> io::Result<(SecureHttp3ConfigB
 
 fn serialize_http3_config(config: &Config) -> Vec<u8> {
     format!(
-        "max-idle-timeout-ms={max_idle}\nmax-udp-payload-size={udp_payload}\ninitial-max-data={max_data}\ninitial-max-stream-data-bidi-local={bidi_local}\ninitial-max-stream-data-bidi-remote={bidi_remote}\ninitial-max-stream-data-uni={uni}\ninitial-max-streams-bidi={streams_bidi}\ninitial-max-streams-uni={streams_uni}\nack-delay-exponent={ack_exp}\nmax-ack-delay-ms={max_ack_delay}\nactive-connection-id-limit={active_cid_limit}\nenable-early-data={early_data}\nenable-migration={migration}\ncongestion-control-algorithm={congestion}\nenable-ecn={ecn}\nmax-send-burst={send_burst}\nqpack-max-table-capacity={qpack_cap}\nqpack-blocked-streams={qpack_blocked}\n",
+        "max-idle-timeout-ms={max_idle}\nmax-udp-payload-size={udp_payload}\ninitial-max-data={max_data}\ninitial-max-stream-data-bidi-local={bidi_local}\ninitial-max-stream-data-bidi-remote={bidi_remote}\ninitial-max-stream-data-uni={uni}\ninitial-max-streams-bidi={streams_bidi}\ninitial-max-streams-uni={streams_uni}\nack-delay-exponent={ack_exp}\nmax-ack-delay-ms={max_ack_delay}\nactive-connection-id-limit={active_cid_limit}\nenable-early-data={early_data}\nenable-migration={migration}\ncongestion-control-algorithm={congestion}\nenable-ecn={ecn}\nmax-send-burst={send_burst}\nqpack-max-table-capacity={qpack_cap}\nqpack-blocked-streams={qpack_blocked}\nenable-retry-validation={retry_validation}\n",
         max_idle = config.max_idle_timeout.as_millis(),
         udp_payload = config.max_udp_payload_size,
         max_data = config.initial_max_data,
@@ -395,6 +398,7 @@ fn serialize_http3_config(config: &Config) -> Vec<u8> {
         send_burst = config.max_send_burst,
         qpack_cap = config.qpack_max_table_capacity,
         qpack_blocked = config.qpack_blocked_streams,
+        retry_validation = if config.enable_retry_validation { "1" } else { "0" },
     )
     .into_bytes()
 }
@@ -494,6 +498,7 @@ fn deserialize_http3_config(raw_payload: &[u8]) -> io::Result<Config> {
             .map_err(|_| {
                 io::Error::new(io::ErrorKind::InvalidData, "invalid qpack-blocked-streams")
             })?,
+        enable_retry_validation: parse_bool(map.get("enable-retry-validation").map(String::as_str).unwrap_or("0"))?,
     };
 
     Ok(config)
