@@ -326,7 +326,7 @@ impl CryptoState {
         Ok(plaintext)
     }
 
-    pub fn protect_header(&self, level: EncryptionLevel, header: &mut [u8], sample: &[u8]) -> Result<()> {
+    pub fn protect_header(&self, level: EncryptionLevel, header: &mut [u8], pn_offset: usize, sample: &[u8]) -> Result<()> {
         let keys = if self.is_client {
             self.client_keys.get(&level)
         } else {
@@ -335,14 +335,15 @@ impl CryptoState {
 
         let aes = Aes::new(&keys.header_key).map_err(|_| Error::CryptoError)?;
         let mask = aes.encrypt_block(&sample[..16]);
+
+        let pn_length = ((header[0] & 0x03) + 1) as usize;
+
         if header[0] & 0x80 == 0x80 {
             header[0] ^= mask[0] & 0x0f;
         } else {
             header[0] ^= mask[0] & 0x1f;
         }
 
-        let pn_length = ((header[0] & 0x03) + 1) as usize;
-        let pn_offset = header.len() - pn_length;
         for i in 0..pn_length {
             header[pn_offset + i] ^= mask[1 + i];
         }
@@ -350,7 +351,7 @@ impl CryptoState {
         Ok(())
     }
 
-    pub fn unprotect_header(&self, level: EncryptionLevel, header: &mut [u8], sample: &[u8]) -> Result<()> {
+    pub fn unprotect_header(&self, level: EncryptionLevel, header: &mut [u8], pn_offset: usize, sample: &[u8]) -> Result<usize> {
         let keys = if self.is_client {
             self.server_keys.get(&level)
         } else {
@@ -359,6 +360,7 @@ impl CryptoState {
 
         let aes = Aes::new(&keys.header_key).map_err(|_| Error::CryptoError)?;
         let mask = aes.encrypt_block(&sample[..16]);
+
         if header[0] & 0x80 == 0x80 {
             header[0] ^= mask[0] & 0x0f;
         } else {
@@ -366,12 +368,12 @@ impl CryptoState {
         }
 
         let pn_length = ((header[0] & 0x03) + 1) as usize;
-        let pn_offset = header.len() - pn_length;
+
         for i in 0..pn_length {
             header[pn_offset + i] ^= mask[1 + i];
         }
 
-        Ok(())
+        Ok(pn_length)
     }
 
     fn construct_nonce(&self, iv: &[u8], packet_number: u64) -> Vec<u8> {
@@ -567,6 +569,30 @@ impl CryptoState {
 
         None
     }
+}
+
+const RETRY_INTEGRITY_KEY: [u8; 16] = [
+    0xbe, 0x0c, 0x69, 0x0b, 0x9f, 0x66, 0x57, 0x5a, 0x1d, 0x76, 0x6b, 0x54, 0xe3, 0x68, 0xc8, 0x4e,
+];
+const RETRY_INTEGRITY_NONCE: [u8; 12] = [
+    0x46, 0x15, 0x99, 0xd3, 0x5d, 0x63, 0x2b, 0xf2, 0x23, 0x98, 0x25, 0xbb,
+];
+
+pub fn compute_retry_integrity_tag(odcid: &[u8], header_and_token: &[u8]) -> Result<[u8; 16]> {
+    let mut pseudo_packet = Vec::with_capacity(1 + odcid.len() + header_and_token.len());
+    pseudo_packet.push(odcid.len() as u8);
+    pseudo_packet.extend_from_slice(odcid);
+    pseudo_packet.extend_from_slice(header_and_token);
+
+    let gcm = Gcm::new(&RETRY_INTEGRITY_KEY).map_err(|_| Error::CryptoError)?;
+    let tag_only = gcm.encrypt(&RETRY_INTEGRITY_NONCE, &[], &pseudo_packet).map_err(|_| Error::CryptoError)?;
+
+    let mut tag = [0u8; 16];
+    if tag_only.len() != 16 {
+        return Err(Error::CryptoError);
+    }
+    tag.copy_from_slice(&tag_only);
+    Ok(tag)
 }
 
 pub fn select_secure_crypto_state_algorithm(accept_encoding: &str) -> CompressionAlgorithm {
@@ -1191,6 +1217,84 @@ mod tests {
         assert_eq!(state.receive_level, EncryptionLevel::Initial);
         assert!(state.is_client);
         assert!(!state.handshake_complete);
+    }
+
+    #[test]
+    fn test_header_protection_masks_bytes_and_roundtrips() {
+        let mut state = CryptoState::new(true);
+        let keys = CryptoKeys::new(vec![1u8; 16], vec![2u8; 16], vec![3u8; 12]);
+        state.client_keys.insert(EncryptionLevel::Application, keys.clone());
+        state.server_keys.insert(EncryptionLevel::Application, keys);
+
+        let pn_offset = 9;
+        let mut header = vec![0x40u8; pn_offset + 4];
+
+        header[pn_offset] = 0x2a;
+
+        let sample: Vec<u8> = (0..16u8).collect();
+        let original = header.clone();
+
+        state.protect_header(EncryptionLevel::Application, &mut header, pn_offset, &sample).unwrap();
+        assert_ne!(header, original, "header protection should have changed the wire bytes");
+
+        let mut roundtrip = header.clone();
+        let pn_len = state
+            .unprotect_header(EncryptionLevel::Application, &mut roundtrip, pn_offset, &sample)
+            .unwrap();
+
+        assert_eq!(pn_len, 1);
+        assert_eq!(roundtrip, original);
+    }
+
+    #[test]
+    fn test_header_protection_roundtrips_for_every_pn_length() {
+        let mut state = CryptoState::new(false);
+        let keys = CryptoKeys::new(vec![9u8; 16], vec![8u8; 16], vec![7u8; 12]);
+        state.client_keys.insert(EncryptionLevel::Initial, keys.clone());
+        state.server_keys.insert(EncryptionLevel::Initial, keys);
+
+        let pn_offset = 18;
+        let sample: Vec<u8> = (100..116u8).collect();
+
+        for pn_len in 1u8..=4 {
+            let mut header = vec![0x80u8; pn_offset + 4];
+            header[0] = 0x80 | (pn_len - 1);
+            for i in 0..pn_len as usize {
+                header[pn_offset + i] = 0x10 + i as u8;
+            }
+
+            let original = header.clone();
+
+            state.protect_header(EncryptionLevel::Initial, &mut header, pn_offset, &sample).unwrap();
+            assert_ne!(header, original, "pn_len={} should be masked", pn_len);
+
+            let mut roundtrip = header.clone();
+            let recovered_len = state
+                .unprotect_header(EncryptionLevel::Initial, &mut roundtrip, pn_offset, &sample)
+                .unwrap();
+
+            assert_eq!(recovered_len, pn_len as usize);
+            assert_eq!(roundtrip, original, "pn_len={} should roundtrip exactly", pn_len);
+        }
+    }
+
+    #[test]
+    fn test_retry_integrity_tag_deterministic_and_bound_to_odcid() {
+        let odcid = vec![1, 2, 3, 4, 5, 6, 7, 8];
+        let header_and_token = vec![0xffu8; 40];
+
+        let tag_a = compute_retry_integrity_tag(&odcid, &header_and_token).unwrap();
+        let tag_b = compute_retry_integrity_tag(&odcid, &header_and_token).unwrap();
+        assert_eq!(tag_a, tag_b, "the tag must be deterministic for the same inputs");
+
+        let different_odcid = vec![9, 9, 9, 9, 9, 9, 9, 9];
+        let tag_c = compute_retry_integrity_tag(&different_odcid, &header_and_token).unwrap();
+        assert_ne!(tag_a, tag_c, "a different ODCID must change the tag");
+
+        let mut tampered = header_and_token.clone();
+        tampered[0] ^= 0x01;
+        let tag_d = compute_retry_integrity_tag(&odcid, &tampered).unwrap();
+        assert_ne!(tag_a, tag_d, "tampering with the packet must change the tag");
     }
 
     #[test]

@@ -88,6 +88,21 @@ pub struct PacketHeader {
     pub token: Option<Vec<u8>>,
     pub packet_number: u64,
     pub key_phase: bool,
+    pub largest_acked: u64,
+}
+
+pub struct ProtectedLongHeaderPrefix {
+    pub packet_type: PacketType,
+    pub version: u32,
+    pub dcid: ConnectionId,
+    pub scid: ConnectionId,
+    pub token: Option<Vec<u8>>,
+    pub pn_offset: usize,
+}
+
+pub struct ProtectedShortHeaderPrefix {
+    pub dcid: ConnectionId,
+    pub pn_offset: usize,
 }
 
 impl PacketHeader {
@@ -100,7 +115,93 @@ impl PacketHeader {
             packet_number,
             token: None,
             key_phase: false,
+            largest_acked: 0,
         }
+    }
+
+    pub fn parse_protected_long_prefix(data: &[u8]) -> Result<ProtectedLongHeaderPrefix> {
+        if data.len() < 5 {
+            return Err(Error::BufferTooShort);
+        }
+
+        let mut offset = 0;
+        let first = data[offset];
+        offset += 1;
+        let version = u32::from_be_bytes([data[1], data[2], data[3], data[4]]);
+        offset += 4;
+        if version == 0 {
+            return Err(Error::InvalidPacket);
+        }
+
+        if offset >= data.len() {
+            return Err(Error::BufferTooShort);
+        }
+
+        let dcid_len = data[offset] as usize;
+        offset += 1;
+        if offset + dcid_len > data.len() {
+            return Err(Error::BufferTooShort);
+        }
+
+        let dcid = ConnectionId::new(data[offset..offset + dcid_len].to_vec());
+        offset += dcid_len;
+        if offset >= data.len() {
+            return Err(Error::BufferTooShort);
+        }
+
+        let scid_len = data[offset] as usize;
+        offset += 1;
+        if offset + scid_len > data.len() {
+            return Err(Error::BufferTooShort);
+        }
+
+        let scid = ConnectionId::new(data[offset..offset + scid_len].to_vec());
+        offset += scid_len;
+
+        let type_bits = (first & 0x30) >> 4;
+        let packet_type = PacketType::from_long_header_type(type_bits)?;
+        if packet_type == PacketType::Retry {
+            return Err(Error::InvalidPacket);
+        }
+
+        let mut token = None;
+        if packet_type == PacketType::Initial {
+            let (token_len, token_len_size) = decode_varint(&data[offset..])?;
+            offset += token_len_size;
+            if token_len > 0 {
+                if offset + token_len as usize > data.len() {
+                    return Err(Error::BufferTooShort);
+                }
+
+                token = Some(data[offset..offset + token_len as usize].to_vec());
+                offset += token_len as usize;
+            }
+        }
+
+        let (_length, length_size) = decode_varint(&data[offset..])?;
+        offset += length_size;
+
+        Ok(ProtectedLongHeaderPrefix {
+            packet_type,
+            version,
+            dcid,
+            scid,
+            token,
+            pn_offset: offset,
+        })
+    }
+
+    pub fn parse_protected_short_prefix(data: &[u8]) -> Result<ProtectedShortHeaderPrefix> {
+        const DCID_LEN: usize = 8;
+        if data.len() < 1 + DCID_LEN {
+            return Err(Error::BufferTooShort);
+        }
+
+        let dcid = ConnectionId::new(data[1..1 + DCID_LEN].to_vec());
+        Ok(ProtectedShortHeaderPrefix {
+            dcid,
+            pn_offset: 1 + DCID_LEN,
+        })
     }
 
     pub fn parse(data: &[u8]) -> Result<(Self, usize)> {
@@ -188,6 +289,7 @@ impl PacketHeader {
                         packet_number: 0,
                         token,
                         key_phase: false,
+                        largest_acked: 0,
                     },
                     offset,
                 ));
@@ -220,6 +322,7 @@ impl PacketHeader {
                 packet_number,
                 token,
                 key_phase: false,
+                largest_acked: 0,
             },
             offset,
         ))
@@ -242,7 +345,19 @@ impl PacketHeader {
 
         let dcid = ConnectionId::new(data[offset..offset + dcid_len].to_vec());
         offset += dcid_len;
-        let packet_number = 0;
+
+        let pn_len = ((first & 0x03) + 1) as usize;
+        if offset + pn_len > data.len() {
+            return Err(Error::BufferTooShort);
+        }
+
+        let mut truncated_pn = 0u64;
+        for i in 0..pn_len {
+            truncated_pn = (truncated_pn << 8) | (data[offset + i] as u64);
+        }
+
+        offset += pn_len;
+        let packet_number = PacketNumber::decode(truncated_pn, pn_len, 0);
 
         Ok((
             PacketHeader {
@@ -253,6 +368,7 @@ impl PacketHeader {
                 packet_number,
                 token: None,
                 key_phase,
+                largest_acked: 0,
             },
             offset,
         ))
@@ -295,24 +411,36 @@ impl PacketHeader {
                 packet_number: 0,
                 token: None,
                 key_phase: false,
+                largest_acked: 0,
             },
             offset,
         ))
     }
 
-    pub fn encode(&self, buffer: &mut Vec<u8>) -> Result<()> {
+    pub fn encode(&self, buffer: &mut Vec<u8>, payload_len: usize) -> Result<(usize, usize)> {
         match self.packet_type {
             PacketType::Initial | PacketType::ZeroRtt | PacketType::Handshake | PacketType::Retry => {
-                self.encode_long_header(buffer)
+                self.encode_long_header(buffer, payload_len)
             }
             PacketType::Short => self.encode_short_header(buffer),
-            PacketType::VersionNegotiation => self.encode_version_negotiation(buffer),
+            PacketType::VersionNegotiation => {
+                self.encode_version_negotiation(buffer)?;
+                Ok((0, 0))
+            }
         }
     }
 
-    fn encode_long_header(&self, buffer: &mut Vec<u8>) -> Result<()> {
+    fn encode_long_header(&self, buffer: &mut Vec<u8>, payload_len: usize) -> Result<(usize, usize)> {
         let type_bits = self.packet_type.to_long_header_type().ok_or(Error::InvalidPacket)?;
-        let first = 0x80 | (type_bits << 4) | 0x03;
+        let is_retry = self.packet_type == PacketType::Retry;
+        let (pn_bytes, pn_len) = if is_retry {
+            (Vec::new(), 0)
+        } else {
+            PacketNumber::encode(self.packet_number, self.largest_acked)
+        };
+
+        let pn_len_bits = if pn_len > 0 { (pn_len - 1) as u8 } else { 0x03 };
+        let first = 0x80 | (type_bits << 4) | pn_len_bits;
         buffer.push(first);
 
         buffer.extend_from_slice(&self.version.to_be_bytes());
@@ -331,27 +459,35 @@ impl PacketHeader {
             }
         }
 
-        if self.packet_type != PacketType::Retry {
-            buffer.extend_from_slice(&encode_varint(0));
-            buffer.extend_from_slice(&self.packet_number.to_be_bytes());
+        if is_retry {
+            return Ok((0, 0));
         }
 
-        Ok(())
+        buffer.extend_from_slice(&encode_varint((pn_len + payload_len) as u64));
+
+        let pn_offset = buffer.len();
+        buffer.extend_from_slice(&pn_bytes);
+
+        Ok((pn_offset, pn_len))
     }
 
-    fn encode_short_header(&self, buffer: &mut Vec<u8>) -> Result<()> {
+    fn encode_short_header(&self, buffer: &mut Vec<u8>) -> Result<(usize, usize)> {
+        let (pn_bytes, pn_len) = PacketNumber::encode(self.packet_number, self.largest_acked);
+
         let mut first = 0x40;
         if self.key_phase {
             first |= 0x04;
         }
 
-        first |= 0x03;
+        first |= (pn_len - 1) as u8;
         buffer.push(first);
 
         buffer.extend_from_slice(self.dcid.as_bytes());
-        buffer.extend_from_slice(&self.packet_number.to_be_bytes());
 
-        Ok(())
+        let pn_offset = buffer.len();
+        buffer.extend_from_slice(&pn_bytes);
+
+        Ok((pn_offset, pn_len))
     }
 
     fn encode_version_negotiation(&self, buffer: &mut Vec<u8>) -> Result<()> {
@@ -432,9 +568,16 @@ impl Packet {
 
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut buffer = Vec::new();
-        self.header.encode(&mut buffer)?;
+        self.header.encode(&mut buffer, self.payload.len())?;
         buffer.extend_from_slice(&self.payload);
         Ok(buffer)
+    }
+
+    pub fn encode_with_pn_info(&self) -> Result<(Vec<u8>, usize, usize)> {
+        let mut buffer = Vec::new();
+        let (pn_offset, pn_len) = self.header.encode(&mut buffer, self.payload.len())?;
+        buffer.extend_from_slice(&self.payload);
+        Ok((buffer, pn_offset, pn_len))
     }
 
     pub fn packet_number_space(&self) -> PacketNumberSpace {

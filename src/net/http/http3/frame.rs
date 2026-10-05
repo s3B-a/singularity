@@ -30,7 +30,6 @@ pub enum FrameType {
     Ping = 0x01,
     Ack = 0x02,
     AckEcn = 0x03,
-    Settings = 0x20,
     ResetStream = 0x04,
     StopSending = 0x05,
     Crypto = 0x06,
@@ -189,10 +188,6 @@ pub enum Frame {
     ConnectionCloseApp {
         error_code: u64,
         reason: Vec<u8>,
-    },
-
-    Settings {
-        settings: Vec<(u64, u64)>,
     },
 
     HandshakeDone,
@@ -531,20 +526,6 @@ impl Frame {
 
                 Ok((Frame::ConnectionCloseApp { error_code, reason }, offset))
             }
-            FrameType::Settings => {
-                let mut settings = Vec::new();
-                while offset < data.len() {
-                    let (id, len) = decode_varint(&data[offset..])?;
-                    offset += len;
-
-                    let (value, len) = decode_varint(&data[offset..])?;
-                    offset += len;
-
-                    settings.push((id, value));
-                }
-
-                Ok((Frame::Settings { settings }, offset))
-            }
             FrameType::HandshakeDone => Ok((Frame::HandshakeDone, offset)),
         }
     }
@@ -703,13 +684,6 @@ impl Frame {
                 buffer.extend_from_slice(&encode_varint(reason.len() as u64));
                 buffer.extend_from_slice(reason);
             }
-            Frame::Settings { settings } => {
-                buffer.push(0x20);
-                for (id, value) in settings {
-                    buffer.extend_from_slice(&encode_varint(*id));
-                    buffer.extend_from_slice(&encode_varint(*value));
-                }
-            }
             Frame::HandshakeDone => {
                 buffer.push(0x1e);
             }
@@ -746,7 +720,6 @@ impl Frame {
             Frame::PathResponse { .. } => FrameType::PathResponse,
             Frame::ConnectionClose { .. } => FrameType::ConnectionClose,
             Frame::ConnectionCloseApp { .. } => FrameType::ConnectionCloseApp,
-            Frame::Settings { .. } => FrameType::Settings,
             Frame::HandshakeDone => FrameType::HandshakeDone,
         }
     }
@@ -1129,7 +1102,6 @@ impl fmt::Display for FrameType {
             FrameType::PathResponse => write!(f, "PATH_RESPONSE"),
             FrameType::ConnectionClose => write!(f, "CONNECTION_CLOSE"),
             FrameType::ConnectionCloseApp => write!(f, "CONNECTION_CLOSE_APP"),
-            FrameType::Settings => write!(f, "SETTINGS"),
             FrameType::HandshakeDone => write!(f, "HANDSHAKE_DONE"),
         }
     }
