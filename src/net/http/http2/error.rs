@@ -74,6 +74,7 @@ impl ErrorCode {
 #[derive(Debug)]
 pub enum Http2Error {
     Protocol(ErrorCode, String),
+    Stream(u32, ErrorCode, String),
     Io(io::Error),
     ConnectionClosed,
     StreamNotFound(u32),
@@ -81,6 +82,39 @@ pub enum Http2Error {
     InvalidFrameSize,
     CompressionFailed,
     DecompressionFailed,
+    StreamLimitReached(u32),
+    NotPermitted(String),
+}
+
+impl Http2Error {
+    pub fn is_stream_error(&self) -> bool {
+        matches!(self, Self::Stream(_, _, _) | Self::StreamNotFound(_))
+    }
+
+    pub fn is_connection_error(&self) -> bool {
+        matches!(self, Self::Protocol(_, _))
+    }
+
+    pub fn stream_id(&self) -> Option<u32> {
+        match self {
+            Self::Stream(id, _, _) | Self::StreamNotFound(id) | Self::InvalidStreamId(id) => Some(*id),
+            _ => None,
+        }
+    }
+
+    pub fn error_code(&self) -> Option<ErrorCode> {
+        match self {
+            Self::Protocol(code, _) | Self::Stream(_, code, _) => Some(*code),
+            _ => None,
+        }
+    }
+
+    pub fn into_stream_error(self, stream_id: u32) -> Self {
+        match self {
+            Self::Protocol(code, msg) => Self::Stream(stream_id, code, msg),
+            other => other,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -98,6 +132,7 @@ impl fmt::Display for Http2Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Http2Error::Protocol(code, msg) => write!(f, "{}: {}", code.as_str(), msg),
+            Http2Error::Stream(id, code, msg) => write!(f, "stream {} {}: {}", id, code.as_str(), msg),
             Http2Error::Io(e) => write!(f, "IO error: {}", e),
             Http2Error::ConnectionClosed => write!(f, "Connection closed"),
             Http2Error::StreamNotFound(id) => write!(f, "Stream {} not found", id),
@@ -105,6 +140,8 @@ impl fmt::Display for Http2Error {
             Http2Error::InvalidFrameSize => write!(f, "Invalid frame size"),
             Http2Error::CompressionFailed => write!(f, "Header compression failed"),
             Http2Error::DecompressionFailed => write!(f, "Header decompression failed"),
+            Http2Error::StreamLimitReached(limit) => write!(f, "Peer MAX_CONCURRENT_STREAMS limit ({}) reached", limit),
+            Http2Error::NotPermitted(msg) => write!(f, "Not permitted: {}", msg),
         }
     }
 }
@@ -269,6 +306,12 @@ fn serialize_http2_error(err: &Http2Error) -> Vec<u8> {
             lines.push(format!("code={}", *code as u32));
             lines.push(format!("msg={}", pem::encode(msg.as_bytes())));
         }
+        Http2Error::Stream(stream_id, code, msg) => {
+            lines.push("kind=stream".to_string());
+            lines.push(format!("stream-id={}", stream_id));
+            lines.push(format!("code={}", *code as u32));
+            lines.push(format!("msg={}", pem::encode(msg.as_bytes())));
+        }
         Http2Error::Io(e) => {
             lines.push("kind=io".to_string());
             lines.push(format!("msg={}", pem::encode(e.to_string().as_bytes())));
@@ -292,6 +335,14 @@ fn serialize_http2_error(err: &Http2Error) -> Vec<u8> {
         }
         Http2Error::DecompressionFailed => {
             lines.push("kind=decompression-failed".to_string());
+        }
+        Http2Error::StreamLimitReached(limit) => {
+            lines.push("kind=stream-limit-reached".to_string());
+            lines.push(format!("code={}", limit));
+        }
+        Http2Error::NotPermitted(msg) => {
+            lines.push("kind=not-permitted".to_string());
+            lines.push(format!("msg={}", pem::encode(msg.as_bytes())));
         }
     }
 
@@ -356,6 +407,15 @@ fn deserialize_http2_error(raw_payload: &[u8]) -> io::Result<Http2Error> {
                 parsed_msg,
             ))
         }
+        "stream" => {
+            let parsed_code = code.unwrap_or(ErrorCode::InternalError as u32);
+            let parsed_msg = msg.unwrap_or_else(|| "stream error".to_string());
+            Ok(Http2Error::Stream(
+                stream_id.unwrap_or(0),
+                ErrorCode::from_u32(parsed_code),
+                parsed_msg,
+            ))
+        }
         "io" => {
             let parsed_msg = msg.unwrap_or_else(|| "io error".to_string());
             Ok(Http2Error::Io(io::Error::new(io::ErrorKind::Other, parsed_msg)))
@@ -366,6 +426,8 @@ fn deserialize_http2_error(raw_payload: &[u8]) -> io::Result<Http2Error> {
         "invalid-frame-size" => Ok(Http2Error::InvalidFrameSize),
         "compression-failed" => Ok(Http2Error::CompressionFailed),
         "decompression-failed" => Ok(Http2Error::DecompressionFailed),
+        "stream-limit-reached" => Ok(Http2Error::StreamLimitReached(code.unwrap_or(0))),
+        "not-permitted" => Ok(Http2Error::NotPermitted(msg.unwrap_or_default())),
         other => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("unsupported error kind '{}'", other),
@@ -538,3 +600,37 @@ fn parse_secure_http2_error_meta(header: &str, body_len: usize) -> io::Result<Se
 }
 
 pub type Result<T> = std::result::Result<T, Http2Error>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_stream_and_connection_error_classification() {
+        let stream_err = Http2Error::Stream(3, ErrorCode::FlowControlError, "window".to_string());
+        assert!(stream_err.is_stream_error());
+        assert!(!stream_err.is_connection_error());
+        assert_eq!(stream_err.stream_id(), Some(3));
+        assert_eq!(stream_err.error_code(), Some(ErrorCode::FlowControlError));
+
+        let conn_err = Http2Error::Protocol(ErrorCode::ProtocolError, "bad".to_string());
+        assert!(conn_err.is_connection_error());
+        assert!(!conn_err.is_stream_error());
+        assert_eq!(conn_err.stream_id(), None);
+    }
+
+    #[test]
+    fn test_into_stream_error_narrows_protocol_errors() {
+        let narrowed = Http2Error::Protocol(ErrorCode::Cancel, "push".to_string()).into_stream_error(7);
+        assert!(matches!(narrowed, Http2Error::Stream(7, ErrorCode::Cancel, _)));
+        assert!(matches!(Http2Error::ConnectionClosed.into_stream_error(7), Http2Error::ConnectionClosed));
+    }
+
+    #[test]
+    fn test_secure_stream_error_roundtrip() {
+        let err = Http2Error::Stream(9, ErrorCode::RefusedStream, "limit".to_string());
+        let (_, blob) = encode_secure_http2_error(&err, CompressionAlgorithm::Identity).unwrap();
+        let (_, decoded) = decode_secure_http2_error(&blob).unwrap();
+        assert!(matches!(decoded, Http2Error::Stream(9, ErrorCode::RefusedStream, ref msg) if msg == "limit"));
+    }
+}

@@ -371,6 +371,71 @@ impl Default for PriorityTree {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExtensiblePriority {
+    pub urgency: u8,
+    pub incremental: bool,
+}
+
+pub const DEFAULT_URGENCY: u8 = 3;
+pub const MAX_URGENCY: u8 = 7;
+
+impl Default for ExtensiblePriority {
+    fn default() -> Self {
+        Self { urgency: DEFAULT_URGENCY, incremental: false }
+    }
+}
+
+impl ExtensiblePriority {
+    pub fn new(urgency: u8, incremental: bool) -> Self {
+        Self { urgency: urgency.min(MAX_URGENCY), incremental }
+    }
+
+    pub fn parse(value: &str) -> Self {
+        let mut priority = Self::default();
+        for member in value.split(',') {
+            let member = member.split(';').next().unwrap_or_default().trim();
+            let (key, raw) = match member.split_once('=') {
+                Some((key, raw)) => (key.trim(), Some(raw.trim())),
+                None => (member, None),
+            };
+
+            match (key, raw) {
+                ("u", Some(raw)) => {
+                    if let Ok(urgency) = raw.parse::<u8>() {
+                        if urgency <= MAX_URGENCY && raw.bytes().all(|b| b.is_ascii_digit()) {
+                            priority.urgency = urgency;
+                        }
+                    }
+                }
+                ("i", None) | ("i", Some("?1")) => priority.incremental = true,
+                ("i", Some("?0")) => priority.incremental = false,
+                _ => {}
+            }
+        }
+        priority
+    }
+
+    pub fn to_header_value(&self) -> String {
+        let mut members = Vec::new();
+        if self.urgency != DEFAULT_URGENCY {
+            members.push(format!("u={}", self.urgency));
+        }
+        if self.incremental {
+            members.push("i".to_string());
+        }
+        members.join(", ")
+    }
+
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+pub fn parse_priority_header(value: &str) -> ExtensiblePriority {
+    ExtensiblePriority::parse(value)
+}
+
 pub fn select_secure_priority_algorithm(accept_encoding: &str) -> CompressionAlgorithm {
     compression::parse_accept_encoding(accept_encoding).into_iter().find_map(|(algorithm, quality)| {
         if quality > 0.0 && algorithm.is_implemented() {
@@ -1049,6 +1114,41 @@ fn parse_bool(value: &str, field: &str) -> io::Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_extensible_priority_parse() {
+        assert_eq!(parse_priority_header(""), ExtensiblePriority::default());
+        assert_eq!(parse_priority_header("u=0"), ExtensiblePriority::new(0, false));
+        assert_eq!(parse_priority_header("u=5, i"), ExtensiblePriority::new(5, true));
+        assert_eq!(parse_priority_header("i=?1,u=1"), ExtensiblePriority::new(1, true));
+        assert_eq!(parse_priority_header("u=2, i=?0"), ExtensiblePriority::new(2, false));
+    }
+
+    #[test]
+    fn test_extensible_priority_parse_ignores_invalid_members() {
+        assert_eq!(parse_priority_header("u=8"), ExtensiblePriority::default());
+        assert_eq!(parse_priority_header("u=-1"), ExtensiblePriority::default());
+        assert_eq!(parse_priority_header("u=+2"), ExtensiblePriority::default());
+        assert_eq!(parse_priority_header("u=a, i=yes"), ExtensiblePriority::default());
+        assert_eq!(parse_priority_header("incremental, x=1"), ExtensiblePriority::default());
+        assert_eq!(parse_priority_header("u=1;foo=bar, i;x"), ExtensiblePriority::new(1, true));
+        assert_eq!(parse_priority_header("u=1, u=6"), ExtensiblePriority::new(6, false));
+    }
+
+    #[test]
+    fn test_extensible_priority_header_value_roundtrip() {
+        assert_eq!(ExtensiblePriority::default().to_header_value(), "");
+        assert!(ExtensiblePriority::default().is_default());
+        for urgency in 0..=MAX_URGENCY {
+            for incremental in [false, true] {
+                let priority = ExtensiblePriority::new(urgency, incremental);
+                assert_eq!(parse_priority_header(&priority.to_header_value()), priority);
+            }
+        }
+        
+        assert_eq!(ExtensiblePriority::new(1, true).to_header_value(), "u=1, i");
+        assert_eq!(ExtensiblePriority::new(200, false).urgency, MAX_URGENCY);
+    }
 
     #[test]
     fn test_priority_parse() {

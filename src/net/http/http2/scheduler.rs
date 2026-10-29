@@ -1,4 +1,4 @@
-use super::priority::Priority;
+use super::priority::{ExtensiblePriority, Priority, DEFAULT_URGENCY};
 use crate::crypto::constant_time_eq;
 use crate::crypto::encoding::pem;
 use crate::crypto::hash::hmac::hmac_sha256;
@@ -11,6 +11,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const PRIORITY_SCHEDULER_BLOB_MAGIC: &str = "SINGULARITY_HTTP2_PRIORITY_SCHEDULER_BLOB_V1";
 const PRIORITY_SCHEDULER_BLOB_CONTEXT: &str = "SINGULARITY_HTTP2_PRIORITY_SCHEDULER_BLOB_BINDING_V1";
+
+pub const DEFAULT_MAX_CLOSED_RETAINED: usize = 32;
+pub const MAX_BUFFERED_PRIORITY_UPDATES: usize = 128;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SecurePrioritySchedulerBlobMeta {
@@ -90,6 +93,10 @@ pub struct PriorityScheduler {
     active_queue: VecDeque<u32>,
     blocked_streams: Vec<u32>,
     total_pending: usize,
+    extensible_priorities: HashMap<u32, ExtensiblePriority>,
+    closed_streams: VecDeque<u32>,
+    max_closed_retained: usize,
+    extensible_mode: bool,
 }
 
 impl PriorityScheduler {
@@ -108,10 +115,25 @@ impl PriorityScheduler {
             active_queue: VecDeque::new(),
             blocked_streams: Vec::new(),
             total_pending: 0,
+            extensible_priorities: HashMap::new(),
+            closed_streams: VecDeque::new(),
+            max_closed_retained: DEFAULT_MAX_CLOSED_RETAINED,
+            extensible_mode: false,
         }
     }
 
+    pub fn set_extensible_mode(&mut self, enabled: bool) {
+        self.extensible_mode = enabled;
+    }
+
+    pub fn extensible_mode(&self) -> bool {
+        self.extensible_mode
+    }
+
     pub fn add_stream(&mut self, stream_id: u32, priority: Priority) {
+        let priority = self.extensible_priorities.get(&stream_id).copied()
+            .map(|extensible| Self::apply_extensible_priority(priority.clone(), extensible))
+            .unwrap_or(priority);
         let parent_id = priority.stream_dependency;
         let exclusive = priority.exclusive;
         let stream = ScheduleStream::new(stream_id, priority);
@@ -157,9 +179,11 @@ impl PriorityScheduler {
         }
         
         self.remove_dependency(stream_id);
+        self.extensible_priorities.remove(&stream_id);
         
         self.active_queue.retain(|&id| id != stream_id);
         self.blocked_streams.retain(|&id| id != stream_id);
+        self.closed_streams.retain(|&id| id != stream_id);
     }
 
     pub fn update_priority(&mut self, stream_id: u32, priority: Priority) {
@@ -175,6 +199,35 @@ impl PriorityScheduler {
                 self.add_dependency(stream_id, new_parent, exclusive);
             }
         }
+    }
+
+    pub fn update_extensible_priority(&mut self, stream_id: u32, priority: ExtensiblePriority) -> bool {
+        if let Some(stream) = self.streams.get_mut(&stream_id) {
+            stream.priority = Self::apply_extensible_priority(stream.priority.clone(), priority);
+            stream.update_quantum();
+        } else if !self.extensible_priorities.contains_key(&stream_id) && self.buffered_priority_update_count() >= MAX_BUFFERED_PRIORITY_UPDATES {
+            return false;
+        }
+
+        self.extensible_priorities.insert(stream_id, priority);
+        true
+    }
+
+    pub fn buffered_priority_update_count(&self) -> usize {
+        self.extensible_priorities.keys().filter(|id| !self.streams.contains_key(id)).count()
+    }
+
+    pub fn explicit_extensible_priority(&self, stream_id: u32) -> Option<ExtensiblePriority> {
+        self.extensible_priorities.get(&stream_id).copied()
+    }
+
+    fn apply_extensible_priority(mut priority: Priority, extensible: ExtensiblePriority) -> Priority {
+        priority.weight = 255u16.saturating_sub(extensible.urgency as u16 * 32).max(1) as u8;
+        priority
+    }
+
+    pub fn get_extensible_priority(&self, stream_id: u32) -> ExtensiblePriority {
+        self.extensible_priorities.get(&stream_id).copied().unwrap_or_default()
     }
 
     pub fn mark_ready(&mut self, stream_id: u32, pending_bytes: usize) {
@@ -212,6 +265,10 @@ impl PriorityScheduler {
 
     pub fn mark_closed(&mut self, stream_id: u32) {
         if let Some(stream) = self.streams.get_mut(&stream_id) {
+            if stream.state != StreamScheduleState::Closed {
+                self.closed_streams.push_back(stream_id);
+            }
+
             stream.state = StreamScheduleState::Closed;
             self.total_pending = self.total_pending.saturating_sub(stream.pending_bytes);
             stream.pending_bytes = 0;
@@ -219,6 +276,24 @@ impl PriorityScheduler {
         
         self.active_queue.retain(|&id| id != stream_id);
         self.blocked_streams.retain(|&id| id != stream_id);
+        self.prune_closed_streams();
+    }
+
+    pub fn set_max_closed_retained(&mut self, max: usize) {
+        self.max_closed_retained = max;
+        self.prune_closed_streams();
+    }
+
+    pub fn closed_retained_count(&self) -> usize {
+        self.closed_streams.len()
+    }
+
+    fn prune_closed_streams(&mut self) {
+        while self.closed_streams.len() > self.max_closed_retained {
+            if let Some(oldest) = self.closed_streams.pop_front() {
+                self.remove_stream(oldest);
+            }
+        }
     }
 
     pub fn schedule_next(&mut self) -> Option<u32> {
@@ -240,11 +315,12 @@ impl PriorityScheduler {
             return None;
         }
 
-        let mut weighted_children: Vec<(u32, usize, i64)> = Vec::new();
+        let mut weighted_children: Vec<(u32, usize, i64, u8, bool)> = Vec::new();
         for &child_id in &children {
             if let Some(stream) = self.streams.get(&child_id) {
                 if stream.state == StreamScheduleState::Ready && stream.pending_bytes > 0 {
-                    weighted_children.push((child_id, stream.quantum, stream.deficit));
+                    let extensible = self.extensible_priorities.get(&child_id).copied().unwrap_or_default();
+                    weighted_children.push((child_id, stream.quantum, stream.deficit, extensible.urgency, extensible.incremental));
                 }
             }
         }
@@ -258,8 +334,25 @@ impl PriorityScheduler {
             return None;
         }
 
-        weighted_children.sort_by(|a, b| b.2.cmp(&a.2));
-        let (selected_id, quantum, _) = weighted_children[0];
+        let use_extensible = self.extensible_mode || weighted_children.iter().any(|entry| {
+            self.extensible_priorities.contains_key(&entry.0)
+        });
+
+        let selected = if use_extensible {
+            let min_urgency = weighted_children.iter().map(|entry| entry.3).min().unwrap_or(DEFAULT_URGENCY);
+            let same_urgency: Vec<_> = weighted_children.into_iter()
+                .filter(|entry| entry.3 == min_urgency)
+                .collect();
+
+            match same_urgency.iter().filter(|entry| !entry.4).min_by_key(|entry| entry.0) {
+                Some(non_incremental) => *non_incremental,
+                None => same_urgency.into_iter().max_by_key(|entry| entry.2).unwrap(),
+            }
+        } else {
+            weighted_children.into_iter().max_by_key(|entry| entry.2).unwrap()
+        };
+
+        let (selected_id, quantum, _, _, _) = selected;
         if let Some(stream) = self.streams.get_mut(&selected_id) {
             stream.deficit -= quantum as i64;
         }
@@ -517,6 +610,17 @@ fn serialize_priority_scheduler(scheduler: &PriorityScheduler) -> io::Result<Vec
     let mut lines = Vec::new();
     lines.push(format!("root-stream-id={}", scheduler.root_stream_id));
     lines.push(format!("total-pending={}", scheduler.total_pending));
+    lines.push(format!("extensible-mode={}", scheduler.extensible_mode));
+    lines.push(format!("extensible-priority-count={}", scheduler.extensible_priorities.len()));
+    let mut extensible_ids: Vec<u32> = scheduler.extensible_priorities.keys().copied().collect();
+    extensible_ids.sort_unstable();
+    for (idx, stream_id) in extensible_ids.iter().enumerate() {
+        let priority = scheduler.extensible_priorities.get(stream_id).expect("priority exists");
+        lines.push(format!("extensible-{}-stream-id={}", idx, stream_id));
+        lines.push(format!("extensible-{}-urgency={}", idx, priority.urgency));
+        lines.push(format!("extensible-{}-incremental={}", idx, priority.incremental));
+    }
+    
     let active_csv = scheduler.active_queue.iter().map(|id| {
         id.to_string()
     }).collect::<Vec<_>>().join(",");
@@ -625,6 +729,16 @@ fn deserialize_priority_scheduler(raw_payload: &[u8]) -> io::Result<PrioritySche
 
     let root_stream_id = parse_u32(required_field(&kv, "root-stream-id")?, "root-stream-id")?;
     let serialized_total_pending = parse_usize(required_field(&kv, "total-pending")?, "total-pending")?;
+    let extensible_mode = kv.get("extensible-mode").map(|v| parse_bool(v)).transpose()?.unwrap_or(false);
+    let extensible_count = kv.get("extensible-priority-count").map(|v| parse_usize(v, "extensible-priority-count")).transpose()?.unwrap_or(0);
+    let mut extensible_priorities = HashMap::new();
+    for idx in 0..extensible_count {
+        let stream_id = parse_u32(required_field(&kv, &format!("extensible-{}-stream-id", idx))?, "extensible stream id")?;
+        let urgency = parse_u8(required_field(&kv, &format!("extensible-{}-urgency", idx))?, "extensible urgency")?;
+        let incremental = parse_bool(required_field(&kv, &format!("extensible-{}-incremental", idx))?)?;
+        extensible_priorities.insert(stream_id, ExtensiblePriority::new(urgency, incremental));
+    }
+
     let active_queue = decode_id_list(required_field(&kv, "active-queue")?, "active-queue")?;
     let blocked_streams = decode_id_list(required_field(&kv, "blocked-streams")?, "blocked-streams")?;
     let stream_count = parse_usize(required_field(&kv, "stream-count")?, "stream-count")?;
@@ -743,14 +857,26 @@ fn deserialize_priority_scheduler(raw_payload: &[u8]) -> io::Result<PrioritySche
         ));
     }
 
-    Ok(PriorityScheduler {
+    let mut closed_streams: Vec<u32> = streams.values().filter(|s| {
+        s.state == StreamScheduleState::Closed
+    }).map(|s| s.stream_id).collect();
+    closed_streams.sort_unstable();
+    
+    let mut scheduler = PriorityScheduler {
         streams,
         dependencies,
         root_stream_id,
         active_queue,
         blocked_streams,
         total_pending: computed_total_pending,
-    })
+        extensible_priorities,
+        closed_streams: closed_streams.into(),
+        max_closed_retained: DEFAULT_MAX_CLOSED_RETAINED,
+        extensible_mode,
+    };
+    scheduler.prune_closed_streams();
+
+    Ok(scheduler)
 }
 
 fn required_field<'a>(kv: &'a HashMap<String, String>, key: &str) -> io::Result<&'a str> {
@@ -1181,6 +1307,140 @@ mod tests {
             decoded.get_tree_stats().tree_depth,
             scheduler.get_tree_stats().tree_depth
         );
+    }
+
+    #[test]
+    fn test_extensible_priority_lower_urgency_value_wins() {
+        let mut scheduler = PriorityScheduler::new();
+        for id in [1, 3, 5] {
+            scheduler.add_stream(id, Priority::default());
+            scheduler.mark_ready(id, 1000);
+        }
+        scheduler.update_extensible_priority(5, ExtensiblePriority::new(0, false));
+        scheduler.update_extensible_priority(1, ExtensiblePriority::new(6, false));
+
+        assert_eq!(scheduler.schedule_next(), Some(5));
+        scheduler.bytes_sent(5, 1000);
+        assert_eq!(scheduler.schedule_next(), Some(3));
+        scheduler.bytes_sent(3, 1000);
+        assert_eq!(scheduler.schedule_next(), Some(1));
+    }
+
+    #[test]
+    fn test_legacy_weights_apply_without_extensible_signals() {
+        let mut scheduler = PriorityScheduler::new();
+        scheduler.add_stream(1, Priority::new(0, 1, false));
+        scheduler.add_stream(3, Priority::new(0, 255, false));
+        scheduler.mark_ready(1, 1000);
+        scheduler.mark_ready(3, 1000);
+
+        let picks: Vec<u32> = (0..20).filter_map(|_| scheduler.schedule_next()).collect();
+        assert!(picks.iter().filter(|&&id| id == 3).count() > picks.iter().filter(|&&id| id == 1).count());
+        assert!(!scheduler.extensible_mode());
+    }
+
+    #[test]
+    fn test_extensible_mode_roundtrips() {
+        let mut scheduler = PriorityScheduler::new();
+        scheduler.set_extensible_mode(true);
+        let (_, blob) = encode_secure_priority_scheduler(&scheduler, CompressionAlgorithm::Identity).unwrap();
+        let (_, decoded) = decode_secure_priority_scheduler(&blob).unwrap();
+        assert!(decoded.extensible_mode());
+    }
+
+    #[test]
+    fn test_extensible_non_incremental_served_in_stream_order() {
+        let mut scheduler = PriorityScheduler::new();
+        scheduler.set_extensible_mode(true);
+        for id in [7, 3, 5] {
+            scheduler.add_stream(id, Priority::default());
+            scheduler.mark_ready(id, 1000);
+        }
+
+        for _ in 0..3 {
+            assert_eq!(scheduler.schedule_next(), Some(3));
+        }
+
+        scheduler.bytes_sent(3, 1000);
+        assert_eq!(scheduler.schedule_next(), Some(5));
+    }
+
+    #[test]
+    fn test_extensible_incremental_streams_share_bandwidth() {
+        let mut scheduler = PriorityScheduler::new();
+        for id in [1, 3] {
+            scheduler.add_stream(id, Priority::default());
+            scheduler.update_extensible_priority(id, ExtensiblePriority::new(3, true));
+            scheduler.mark_ready(id, 100_000);
+        }
+
+        let picks: Vec<u32> = (0..6).filter_map(|_| scheduler.schedule_next()).collect();
+        assert_eq!(picks.iter().filter(|&&id| id == 1).count(), 3);
+        assert_eq!(picks.iter().filter(|&&id| id == 3).count(), 3);
+        assert!(picks.windows(2).all(|pair| pair[0] != pair[1]));
+    }
+
+    #[test]
+    fn test_buffered_priority_update_applies_on_add() {
+        let mut scheduler = PriorityScheduler::new();
+        assert!(scheduler.update_extensible_priority(9, ExtensiblePriority::new(1, true)));
+        assert_eq!(scheduler.buffered_priority_update_count(), 1);
+
+        scheduler.add_stream(9, Priority::default());
+        assert_eq!(scheduler.buffered_priority_update_count(), 0);
+        assert_eq!(scheduler.get_extensible_priority(9), ExtensiblePriority::new(1, true));
+        assert!(scheduler.get_priority(9).unwrap().weight > Priority::default().weight);
+    }
+
+    #[test]
+    fn test_buffered_priority_updates_are_bounded() {
+        let mut scheduler = PriorityScheduler::new();
+        for i in 0..MAX_BUFFERED_PRIORITY_UPDATES as u32 {
+            assert!(scheduler.update_extensible_priority(2 * i + 1, ExtensiblePriority::default()));
+        }
+        
+        assert!(!scheduler.update_extensible_priority(100_001, ExtensiblePriority::default()));
+        assert!(scheduler.update_extensible_priority(1, ExtensiblePriority::new(0, false)));
+        assert_eq!(scheduler.buffered_priority_update_count(), MAX_BUFFERED_PRIORITY_UPDATES);
+    }
+
+    #[test]
+    fn test_remove_stream_drops_extensible_priority() {
+        let mut scheduler = PriorityScheduler::new();
+        scheduler.add_stream(1, Priority::default());
+        scheduler.update_extensible_priority(1, ExtensiblePriority::new(0, false));
+        scheduler.remove_stream(1);
+        assert_eq!(scheduler.explicit_extensible_priority(1), None);
+    }
+
+    #[test]
+    fn test_closed_streams_are_pruned_beyond_limit() {
+        let mut scheduler = PriorityScheduler::new();
+        scheduler.set_max_closed_retained(4);
+        for i in 0..1000u32 {
+            let id = 2 * i + 1;
+            scheduler.add_stream(id, Priority::default());
+            scheduler.mark_ready(id, 10);
+            scheduler.mark_closed(id);
+        }
+
+        assert_eq!(scheduler.closed_retained_count(), 4);
+        assert_eq!(scheduler.get_tree_stats().total_streams, 4);
+        assert_eq!(scheduler.get_state(1), None);
+        assert_eq!(scheduler.get_state(1999), Some(StreamScheduleState::Closed));
+        assert_eq!(scheduler.total_pending_bytes(), 0);
+    }
+
+    #[test]
+    fn test_pruning_closed_parent_reparents_open_children() {
+        let mut scheduler = PriorityScheduler::new();
+        scheduler.set_max_closed_retained(0);
+        scheduler.add_stream(1, Priority::default());
+        scheduler.add_stream(3, Priority::new(1, 16, false));
+        scheduler.mark_closed(1);
+
+        assert_eq!(scheduler.get_state(1), None);
+        assert_eq!(scheduler.dependencies.get(&3).unwrap().parent_id, 0);
     }
 
     #[test]

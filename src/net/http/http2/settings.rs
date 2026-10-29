@@ -11,6 +11,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const SETTINGS_BLOB_MAGIC: &str = "SINGULARITY_HTTP2_SETTINGS_BLOB_V1";
 const SETTINGS_BLOB_CONTEXT: &str = "SINGULARITY_HTTP2_SETTINGS_BLOB_BINDING_V1";
 
+pub const DEFAULT_LOCAL_MAX_CONCURRENT_STREAMS: u32 = 100;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SecureSettingsBlobMeta {
     pub algorithm: CompressionAlgorithm,
@@ -31,6 +33,8 @@ pub enum SettingId {
     InitialWindowSize = 0x4,
     MaxFrameSize = 0x5,
     MaxHeaderListSize = 0x6,
+    EnableConnectProtocol = 0x8,
+    NoRfc7540Priorities = 0x9,
 }
 
 impl SettingId {
@@ -42,6 +46,8 @@ impl SettingId {
             0x4 => Some(SettingId::InitialWindowSize),
             0x5 => Some(SettingId::MaxFrameSize),
             0x6 => Some(SettingId::MaxHeaderListSize),
+            0x8 => Some(SettingId::EnableConnectProtocol),
+            0x9 => Some(SettingId::NoRfc7540Priorities),
             _ => None,
         }
     }
@@ -61,12 +67,20 @@ impl Settings {
         settings.insert(SettingId::InitialWindowSize, 65535);
         settings.insert(SettingId::MaxFrameSize, 16384);
         settings.insert(SettingId::MaxHeaderListSize, u32::MAX);
+        settings.insert(SettingId::EnableConnectProtocol, 0);
+        settings.insert(SettingId::NoRfc7540Priorities, 0);
 
         Self { settings }
     }
 
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn local_defaults() -> Self {
+        let mut settings = Self::default();
+        settings.settings.insert(SettingId::MaxConcurrentStreams, DEFAULT_LOCAL_MAX_CONCURRENT_STREAMS);
+        settings
     }
 
     pub fn get(&self, id: SettingId) -> u32 {
@@ -88,6 +102,16 @@ impl Settings {
             SettingId::MaxFrameSize => {
                 if !(16384..=16777215).contains(&value) {
                     return Err("Max frame size out of range".to_string());
+                }
+            }
+            SettingId::EnableConnectProtocol => {
+                if value > 1 {
+                    return Err("ENABLE_CONNECT_PROTOCOL must be 0 or 1".to_string());
+                }
+            }
+            SettingId::NoRfc7540Priorities => {
+                if value > 1 {
+                    return Err("NO_RFC7540_PRIORITIES must be 0 or 1".to_string());
                 }
             }
             _ => {}
@@ -121,6 +145,49 @@ impl Settings {
         self.get(SettingId::MaxHeaderListSize)
     }
 
+    pub fn enable_connect_protocol(&self) -> bool {
+        self.get(SettingId::EnableConnectProtocol) == 1
+    }
+
+    pub fn no_rfc7540_priorities(&self) -> bool {
+        self.get(SettingId::NoRfc7540Priorities) == 1
+    }
+
+    pub fn allows_new_stream(&self, active_streams: usize) -> bool {
+        active_streams < self.max_concurrent_streams() as usize
+    }
+
+    pub fn apply_update(&mut self, data: &[u8], is_first: bool) -> Result<(), (SettingId, String)> {
+        if data.len() % 6 != 0 {
+            return Err((SettingId::MaxFrameSize, "Invalid settings frame size".to_string()));
+        }
+
+        let mut updated = self.clone();
+        for chunk in data.chunks_exact(6) {
+            let id = u16::from_be_bytes([chunk[0], chunk[1]]);
+            let value = u32::from_be_bytes([chunk[2], chunk[3], chunk[4], chunk[5]]);
+            let Some(setting_id) = SettingId::from_u16(id) else {
+                continue;
+            };
+
+            match setting_id {
+                SettingId::EnableConnectProtocol if updated.enable_connect_protocol() && value == 0 => {
+                    return Err((setting_id, "SETTINGS_ENABLE_CONNECT_PROTOCOL cannot change from 1 to 0".to_string()));
+                }
+                SettingId::NoRfc7540Priorities if !is_first && value != updated.get(setting_id) => {
+                    return Err((setting_id, "SETTINGS_NO_RFC7540_PRIORITIES changed after the first SETTINGS frame".to_string()));
+                }
+                _ => {}
+            }
+
+            updated.set(setting_id, value).map_err(|e| (setting_id, e))?;
+        }
+
+        *self = updated;
+        
+        Ok(())
+    }
+
     pub fn serialize(&self) -> Vec<u8> {
         let mut data = Vec::new();
         let ordered = [
@@ -130,6 +197,8 @@ impl Settings {
             SettingId::InitialWindowSize,
             SettingId::MaxFrameSize,
             SettingId::MaxHeaderListSize,
+            SettingId::EnableConnectProtocol,
+            SettingId::NoRfc7540Priorities,
         ];
 
         for id in ordered {
@@ -512,6 +581,75 @@ mod tests {
 
         assert_eq!(parsed.initial_window_size(), 1_000_000);
         assert_eq!(parsed.max_concurrent_streams(), 128);
+    }
+
+    fn wire(entries: &[(SettingId, u32)]) -> Vec<u8> {
+        let mut data = Vec::new();
+        for (id, value) in entries {
+            data.extend_from_slice(&(*id as u16).to_be_bytes());
+            data.extend_from_slice(&value.to_be_bytes());
+        }
+        data
+    }
+
+    #[test]
+    fn test_apply_update_is_incremental() {
+        let mut settings = Settings::new();
+        settings.apply_update(&wire(&[(SettingId::MaxConcurrentStreams, 10)]), true).unwrap();
+        settings.apply_update(&wire(&[(SettingId::InitialWindowSize, 1_000)]), false).unwrap();
+
+        assert_eq!(settings.max_concurrent_streams(), 10);
+        assert_eq!(settings.initial_window_size(), 1_000);
+    }
+
+    #[test]
+    fn test_apply_update_is_atomic_and_reports_setting() {
+        let mut settings = Settings::new();
+        let err = settings.apply_update(&wire(&[
+            (SettingId::MaxConcurrentStreams, 5),
+            (SettingId::InitialWindowSize, u32::MAX),
+        ]), true).unwrap_err();
+
+        assert_eq!(err.0, SettingId::InitialWindowSize);
+        assert_eq!(settings.max_concurrent_streams(), u32::MAX);
+    }
+
+    #[test]
+    fn test_apply_update_ignores_unknown_settings() {
+        let mut settings = Settings::new();
+        let mut data = vec![0x00, 0xff, 0, 0, 0, 1];
+        data.extend(wire(&[(SettingId::EnableConnectProtocol, 1)]));
+        settings.apply_update(&data, true).unwrap();
+        assert!(settings.enable_connect_protocol());
+    }
+
+    #[test]
+    fn test_enable_connect_protocol_cannot_be_withdrawn() {
+        let mut settings = Settings::new();
+        settings.apply_update(&wire(&[(SettingId::EnableConnectProtocol, 1)]), true).unwrap();
+        assert!(settings.apply_update(&wire(&[(SettingId::EnableConnectProtocol, 1)]), false).is_ok());
+
+        let err = settings.apply_update(&wire(&[(SettingId::EnableConnectProtocol, 0)]), false).unwrap_err();
+        assert_eq!(err.0, SettingId::EnableConnectProtocol);
+        assert!(settings.apply_update(&wire(&[(SettingId::EnableConnectProtocol, 2)]), true).is_err());
+    }
+
+    #[test]
+    fn test_no_rfc7540_priorities_fixed_after_first_settings() {
+        let mut settings = Settings::new();
+        settings.apply_update(&wire(&[(SettingId::NoRfc7540Priorities, 1)]), true).unwrap();
+        assert!(settings.no_rfc7540_priorities());
+        assert!(settings.apply_update(&wire(&[(SettingId::NoRfc7540Priorities, 1)]), false).is_ok());
+        assert!(settings.apply_update(&wire(&[(SettingId::NoRfc7540Priorities, 0)]), false).is_err());
+    }
+
+    #[test]
+    fn test_local_defaults_bound_concurrency() {
+        let local = Settings::local_defaults();
+        assert_eq!(local.max_concurrent_streams(), DEFAULT_LOCAL_MAX_CONCURRENT_STREAMS);
+        assert!(local.allows_new_stream(99));
+        assert!(!local.allows_new_stream(100));
+        assert_eq!(Settings::default().max_concurrent_streams(), u32::MAX);
     }
 
     #[test]
