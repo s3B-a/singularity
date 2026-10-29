@@ -5,10 +5,10 @@ use crate::crypto::hash::sha2::sha256;
 use crate::crypto::random;
 use crate::net::http::compression::{self, CompressionAlgorithm, CompressionLevel};
 use crate::net::http::http2::alpn::AlpnProtocol;
-use crate::net::http::http2::Http2Connection;
+use crate::net::http::http2::{Http2Connection, Http2Error, StreamState};
 use crate::net::http::{HttpMethod, HttpRequest, HttpResponse, HttpVersion};
 use crate::net::tcp::{TcpListener, TcpStream};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -204,10 +204,7 @@ impl HttpsServer {
     }
 
     fn handle_http2_connection(tls_stream: TlsStream, peer_addr: SocketAddr, config: HttpsServerCfg, handler: Option<HttpsHandler>) -> std::io::Result<()> {
-        let tcp_stream = tls_stream.stream_into_inner()
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-
-        let mut http2_conn = Http2Connection::new_with_alpn(tcp_stream, Some(AlpnProtocol::Http2))
+        let mut http2_conn = Http2Connection::new_server_with_alpn(tls_stream, Some(AlpnProtocol::Http2))
             .map_err(|e| {
             std::io::Error::new(
                 std::io::ErrorKind::Other,
@@ -223,44 +220,52 @@ impl HttpsServer {
                 )
         })?;
 
+        let mut responded = HashSet::new();
         loop {
             if http2_conn.goaway_received {
                 break;
             }
 
-            match http2_conn.receive_frames() {
-                Ok(_) => {
-                    Self::process_http2_streams(&mut http2_conn, &handler, peer_addr, &config)?;
+            match http2_conn.receive_frame() {
+                Ok(()) => {}
+                Err(Http2Error::Io(e)) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    let _ = http2_conn.send_pending_data();
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(Http2Error::Io(e)) if matches!(e.kind(), std::io::ErrorKind::TimedOut | std::io::ErrorKind::UnexpectedEof) => {
+                    break;
                 }
                 Err(e) => {
-                    if e.to_string().to_ascii_lowercase().contains("would block") {
-                        let _ = http2_conn.send_pending_data();
-                        thread::sleep(Duration::from_millis(10));
-                        continue;
-                    }
-
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::Other,
                         format!("HTTP/2 receive error: {}", e),
                     ));
                 }
             }
+
+            Self::process_http2_streams(&mut http2_conn, &mut responded, &handler, peer_addr, &config)?;
         }
 
         let _ = http2_conn.close();
         Ok(())
     }
 
-    fn process_http2_streams(http2_conn: &mut Http2Connection, handler: &Option<HttpsHandler>, peer_addr: SocketAddr, config: &HttpsServerCfg) -> std::io::Result<()> {
+    fn process_http2_streams(http2_conn: &mut Http2Connection, responded: &mut HashSet<u32>, handler: &Option<HttpsHandler>, peer_addr: SocketAddr, config: &HttpsServerCfg) -> std::io::Result<()> {
+        responded.retain(|stream_id| http2_conn.get_stream(*stream_id).is_some());
         let stream_ids: Vec<u32> = http2_conn.streams.keys().cloned().collect();
         for stream_id in stream_ids {
+            if responded.contains(&stream_id) {
+                Self::release_finished_http2_stream(http2_conn, stream_id);
+                continue;
+            }
+
             let (method, path, raw_headers) = {
                 let stream = match http2_conn.get_stream(stream_id) {
                     Some(s) => s,
                     None => continue,
                 };
 
-                if !stream.headers_received {
+                if !stream.headers_received || stream.state() != StreamState::HalfClosedRemote {
                     continue;
                 }
 
@@ -318,10 +323,17 @@ impl HttpsServer {
             let accept_encoding = Self::get_header_ci(&header_map, "accept-encoding");
             Self::send_http2_response(http2_conn, stream_id, &response, accept_encoding, config)?;
 
-            let _ = http2_conn.close_stream(stream_id);
+            responded.insert(stream_id);
+            Self::release_finished_http2_stream(http2_conn, stream_id);
         }
 
         Ok(())
+    }
+
+    fn release_finished_http2_stream(http2_conn: &mut Http2Connection, stream_id: u32) {
+        if http2_conn.get_stream(stream_id).is_some_and(|stream| stream.is_closed()) {
+            let _ = http2_conn.close_stream(stream_id);
+        }
     }
 
     fn send_http2_response(http2_conn: &mut Http2Connection, stream_id: u32, response: &HttpResponse, accept_encoding: Option<&str>, config: &HttpsServerCfg) -> std::io::Result<()> {

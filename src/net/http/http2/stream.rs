@@ -283,6 +283,18 @@ impl Http2Stream {
         }
     }
 
+    pub fn reserve_remote(&mut self) -> Result<()> {
+        if self.state != StreamState::Idle {
+            return Err(Http2Error::Protocol(
+                ErrorCode::ProtocolError,
+                "Only idle streams can be reserved".to_string(),
+            ));
+        }
+
+        self.state = StreamState::ReservedRemote;
+        Ok(())
+    }
+
     pub fn reset(&mut self) {
         self.state = StreamState::Closed;
         self.send_buffer.clear();

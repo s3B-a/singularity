@@ -1,3 +1,4 @@
+use super::priority::ExtensiblePriority;
 use crate::crypto::constant_time_eq;
 use crate::crypto::encoding::pem;
 use crate::crypto::hash::hmac::hmac_sha256;
@@ -33,6 +34,8 @@ pub enum FrameType {
     GoAway = 0x7,
     WindowUpdate = 0x8,
     Continuation = 0x9,
+    PriorityUpdate = 0x10,
+    Unknown = 0xff,
 }
 
 impl FrameType {
@@ -48,6 +51,7 @@ impl FrameType {
             0x7 => Some(FrameType::GoAway),
             0x8 => Some(FrameType::WindowUpdate),
             0x9 => Some(FrameType::Continuation),
+            0x10 => Some(FrameType::PriorityUpdate),
             _ => None,
         }
     }
@@ -111,9 +115,7 @@ impl FrameHeader {
 
     pub fn parse(bytes: &[u8; 9]) -> io::Result<Self> {
         let length = u32::from_be_bytes([0, bytes[0], bytes[1], bytes[2]]);
-        let frame_type = FrameType::from_u8(bytes[3]).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidData, "unknown frame type")
-        })?;
+        let frame_type = FrameType::from_u8(bytes[3]).unwrap_or(FrameType::Unknown);
 
         let flags = FrameFlags::new(bytes[4]);
         let stream_id = u32::from_be_bytes([bytes[5], bytes[6], bytes[7], bytes[8]]) & 0x7FFFFFFF;
@@ -160,11 +162,15 @@ impl Frame {
     }
 
     pub fn read<R: Read>(reader: &mut R) -> io::Result<Self> {
+        Self::read_limited(reader, FrameHeader::MAX_PAYLOAD_SIZE)
+    }
+
+    pub fn read_limited<R: Read>(reader: &mut R, max_payload: u32) -> io::Result<Self> {
         let mut header_bytes = [0u8; 9];
         reader.read_exact(&mut header_bytes)?;
         let header = FrameHeader::parse(&header_bytes)?;
 
-        if header.length > FrameHeader::MAX_PAYLOAD_SIZE {
+        if header.length > max_payload.min(FrameHeader::MAX_PAYLOAD_SIZE) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "frame payload too large",
@@ -264,6 +270,12 @@ impl Frame {
     pub fn continuation(stream_id: u32, headers: Vec<u8>, end_headers: bool) -> Self {
         let flags = if end_headers { FrameFlags::END_HEADERS } else { 0 };
         Self::new(FrameType::Continuation, flags, stream_id, headers)
+    }
+
+    pub fn priority_update(prioritized_stream_id: u32, priority: ExtensiblePriority) -> Self {
+        let mut payload = (prioritized_stream_id & 0x7fffffff).to_be_bytes().to_vec();
+        payload.extend_from_slice(priority.to_header_value().as_bytes());
+        Self::new(FrameType::PriorityUpdate, 0, 0, payload)
     }
 
     pub fn to_secure_blob(&self, algorithm: CompressionAlgorithm) -> io::Result<(SecureFrameBlobMeta, Vec<u8>)> {
@@ -652,6 +664,39 @@ mod tests {
         assert_eq!(parsed.header.stream_id, 1);
         assert_eq!(parsed.header.flags.value(), original.header.flags.value());
         assert_eq!(parsed.payload, original.payload);
+    }
+
+    #[test]
+    fn test_unknown_frame_type_is_read_not_rejected() {
+        let mut wire = vec![0, 0, 3, 0x0a, 0, 0, 0, 0, 0, b'a', b'b', b'c'];
+        Frame::ping(*b"pingpong", false).write(&mut wire).unwrap();
+
+        let mut cursor = Cursor::new(wire);
+        let unknown = Frame::read(&mut cursor).unwrap();
+        assert_eq!(unknown.header.frame_type, FrameType::Unknown);
+        assert_eq!(unknown.payload, b"abc");
+
+        let next = Frame::read(&mut cursor).unwrap();
+        assert_eq!(next.header.frame_type, FrameType::Ping);
+    }
+
+    #[test]
+    fn test_read_limited_rejects_oversized_frames() {
+        let mut wire = Vec::new();
+        Frame::data(1, vec![0u8; 100], false).write(&mut wire).unwrap();
+
+        assert!(Frame::read_limited(&mut Cursor::new(wire.clone()), 100).is_ok());
+        let err = Frame::read_limited(&mut Cursor::new(wire), 99).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn test_priority_update_frame_layout() {
+        let frame = Frame::priority_update(0x8000_0005, ExtensiblePriority::new(1, true));
+        assert_eq!(frame.header.frame_type as u8, 0x10);
+        assert_eq!(frame.header.stream_id, 0);
+        assert_eq!(&frame.payload[..4], &[0, 0, 0, 5]);
+        assert_eq!(&frame.payload[4..], b"u=1, i");
     }
 
     #[test]

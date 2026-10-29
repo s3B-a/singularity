@@ -115,6 +115,9 @@ impl HuffmanNode {
 pub struct HpackCodec {
     dynamic_table: Vec<(String, String)>,
     max_dynamic_table_size: usize,
+    max_table_size_limit: usize,
+    pending_table_size_update: Option<usize>,
+    pending_table_size_minimum: Option<usize>,
     huffman_root: HuffmanNode,
     huffman_codes: Vec<(u32, u8)>,
 }
@@ -132,6 +135,9 @@ impl HpackCodec {
         Self {
             dynamic_table: Vec::new(),
             max_dynamic_table_size: max_size,
+            max_table_size_limit: max_size,
+            pending_table_size_update: None,
+            pending_table_size_minimum: None,
             huffman_root,
             huffman_codes,
         }
@@ -147,6 +153,50 @@ impl HpackCodec {
 
     pub fn from_secure_blob(data: &[u8]) -> io::Result<(SecureHpackCodecBlobMeta, Self)> {
         decode_secure_hpack_codec(data)
+    }
+
+    pub fn set_max_dynamic_table_size(&mut self, size: usize) -> Result<(), String> {
+        if size > self.max_table_size_limit {
+            return Err(format!("dynamic table size {} exceeds limit {}", size, self.max_table_size_limit));
+        }
+
+        if size == self.max_dynamic_table_size {
+            return Ok(());
+        }
+
+        self.max_dynamic_table_size = size;
+        self.evict_to_fit();
+        self.pending_table_size_update = Some(size);
+        self.pending_table_size_minimum = Some(self.pending_table_size_minimum.map_or(size, |min| min.min(size)));
+        Ok(())
+    }
+
+    pub fn set_max_dynamic_table_size_limit(&mut self, limit: usize) -> Result<(), String> {
+        self.max_table_size_limit = limit;
+        if self.max_dynamic_table_size > limit {
+            self.set_max_dynamic_table_size(limit)?;
+        }
+        Ok(())
+    }
+
+    pub fn max_dynamic_table_size(&self) -> usize {
+        self.max_dynamic_table_size
+    }
+
+    pub fn max_dynamic_table_size_limit(&self) -> usize {
+        self.max_table_size_limit
+    }
+
+    pub fn dynamic_table_size(&self) -> usize {
+        self.current_dynamic_table_size()
+    }
+
+    pub fn dynamic_table_len(&self) -> usize {
+        self.dynamic_table.len()
+    }
+
+    pub fn has_pending_table_size_update(&self) -> bool {
+        self.pending_table_size_update.is_some()
     }
 
     fn build_huffman_tree(codes: &[(u8, u32, u8)]) -> HuffmanNode {
@@ -447,19 +497,35 @@ impl HpackCodec {
     }
 
     pub fn encode(&mut self, headers: &HashMap<String, String>) -> Vec<u8> {
+        let ordered: Vec<(String, String)> = headers.iter().map(|(name, value)| {
+            (name.clone(), value.clone())
+        }).collect();
+
+        self.encode_list(&ordered)
+    }
+
+    pub fn encode_list(&mut self, headers: &[(String, String)]) -> Vec<u8> {
         // Encoding HPACK headers
         // Done by checking static table first
         // then encoding as indexed or literal header fields
         // according to the HPACK specification
         // https://datatracker.ietf.org/doc/html/rfc7541#section-2
         let mut output = Vec::new();
-        for (name, value) in headers {
+        if let Some(size) = self.pending_table_size_update.take() {
+            if let Some(minimum) = self.pending_table_size_minimum.take().filter(|&min| min < size) {
+                self.encode_prefixed_integer(&mut output, 0x20, minimum, 5);
+            }
+            self.encode_prefixed_integer(&mut output, 0x20, size, 5);
+        }
+        
+        let pseudo = headers.iter().filter(|(name, _)| name.starts_with(':'));
+        let regular = headers.iter().filter(|(name, _)| !name.starts_with(':'));
+        for (name, value) in pseudo.chain(regular) {
             let name_lower = name.to_lowercase();
             if let Some(index) = self.find_in_static_table(&name_lower, value) {
                 self.encode_indexed(&mut output, index);
             } else if let Some(index) = self.find_name_in_static_table(&name_lower) {
-                output.push(0x40);
-                self.encode_integer(&mut output, index, 6);
+                self.encode_prefixed_integer(&mut output, 0x40, index, 6);
                 self.encode_string_with_huffman(&mut output, value);
                 self.add_to_dynamic_table(name_lower, value.clone());
             } else {
@@ -469,7 +535,7 @@ impl HpackCodec {
                 self.add_to_dynamic_table(name_lower, value.clone());
             }
         }
-        
+
         output
     }
 
@@ -479,6 +545,7 @@ impl HpackCodec {
         // according to the HPACK specification
         let mut headers = HashMap::new();
         let mut pos = 0;
+        let mut allow_size_update = true;
         while pos < data.len() {
             let byte = data[pos];
             if byte & 0x80 != 0 {
@@ -491,6 +558,7 @@ impl HpackCodec {
                     return Err(format!("Invalid table index: {}", index));
                 }
             } else if byte & 0x40 != 0 {
+                allow_size_update = false;
                 let (index, consumed) = self.decode_integer(&data[pos..], 6)?;
                 pos += consumed;
                 
@@ -509,11 +577,20 @@ impl HpackCodec {
                 self.add_to_dynamic_table(name.clone(), value.clone());
                 headers.insert(name, value);
             } else if byte & 0x20 != 0 {
+                if !allow_size_update {
+                    return Err("dynamic table size update must precede header fields".to_string());
+                }
+                
                 let (new_size, consumed) = self.decode_integer(&data[pos..], 5)?;
+                if new_size > self.max_table_size_limit {
+                    return Err(format!("dynamic table size {} exceeds limit {}", new_size, self.max_table_size_limit));
+                }
+
                 self.max_dynamic_table_size = new_size;
                 self.evict_to_fit();
                 pos += consumed;
             } else {
+                allow_size_update = false;
                 let (index, consumed) = self.decode_integer(&data[pos..], 4)?;
                 pos += consumed;
                 
@@ -537,14 +614,7 @@ impl HpackCodec {
     }
 
     fn encode_indexed(&self, output: &mut Vec<u8>, index: usize) {
-        let mut byte = 0x80u8;
-        if index < 127 {
-            byte |= index as u8;
-            output.push(byte);
-        } else {
-            output.push(byte | 0x7F);
-            self.encode_integer(output, index - 127, 7);
-        }
+        self.encode_prefixed_integer(output, 0x80, index, 7);
     }
 
     fn find_in_static_table(&self, name: &str, value: &str) -> Option<usize> {
@@ -588,32 +658,24 @@ impl HpackCodec {
         }).sum()
     }
 
-    fn encode_integer(&self, output: &mut Vec<u8>, mut value: usize, prefix_bits: u8) {
+    fn encode_prefixed_integer(&self, output: &mut Vec<u8>, flags: u8, mut value: usize, prefix_bits: u8) {
         // Encoding var-length integer
         // Done by using the prefix bits and continuing with bytes
         // with MSB set until the value is fully encoded
-        let max_prefix = (1 << prefix_bits) - 1;
+        let max_prefix = (1usize << prefix_bits) - 1;
         if value < max_prefix {
-            if output.is_empty() {
-                output.push(value as u8);
-            } else if let Some(last) = output.last_mut() {
-                *last |= value as u8;
-            }
-        } else {
-            if output.is_empty() {
-                output.push(max_prefix as u8);
-            } else if let Some(last) = output.last_mut() {
-                *last |= max_prefix as u8;
-            }
-            
-            value -= max_prefix;
-            while value >= 128 {
-                output.push((value % 128 + 128) as u8);
-                value /= 128;
-            }
-
-            output.push(value as u8);
+            output.push(flags | value as u8);
+            return;
         }
+
+        output.push(flags | max_prefix as u8);
+        value -= max_prefix;
+        while value >= 128 {
+            output.push((value % 128 + 128) as u8);
+            value /= 128;
+        }
+
+        output.push(value as u8);
     }
 
     fn decode_integer(&self, data: &[u8], prefix_bits: u8) -> Result<(usize, usize), String> {
@@ -652,11 +714,10 @@ impl HpackCodec {
         let bytes = s.as_bytes();
         let huffman_encoded = self.huffman_encode(bytes);
         if huffman_encoded.len() < bytes.len() {
-            let len_byte = 0x80 | (huffman_encoded.len() as u8);
-            output.push(len_byte);
+            self.encode_prefixed_integer(output, 0x80, huffman_encoded.len(), 7);
             output.extend_from_slice(&huffman_encoded);
         } else {
-            self.encode_integer(output, bytes.len(), 7);
+            self.encode_prefixed_integer(output, 0x00, bytes.len(), 7);
             output.extend_from_slice(bytes);
         }
     }
@@ -883,6 +944,15 @@ fn serialize_hpack_codec(codec: &HpackCodec) -> Vec<u8> {
         codec.max_dynamic_table_size
     ));
 
+    lines.push(format!("max-table-size-limit={}", codec.max_table_size_limit));
+    if let Some(size) = codec.pending_table_size_update {
+        lines.push(format!("pending-table-size-update={}", size));
+    }
+
+    if let Some(size) = codec.pending_table_size_minimum {
+        lines.push(format!("pending-table-size-minimum={}", size));
+    }
+
     lines.push(format!("dynamic-count={}", codec.dynamic_table.len()));
     for (idx, (name, value)) in codec.dynamic_table.iter().enumerate() {
         lines.push(format!(
@@ -932,7 +1002,11 @@ fn deserialize_hpack_codec(raw_payload: &[u8]) -> io::Result<HpackCodec> {
     )?;
 
     let dynamic_count = parse_usize(required_field(&kv, "dynamic-count")?, "dynamic-count")?;
+    let optional_usize = |key: &str| kv.get(key).map(|v| parse_usize(v, key)).transpose();
     let mut codec = HpackCodec::new(max_dynamic_table_size);
+    codec.max_table_size_limit = optional_usize("max-table-size-limit")?.unwrap_or(max_dynamic_table_size).max(max_dynamic_table_size);
+    codec.pending_table_size_update = optional_usize("pending-table-size-update")?;
+    codec.pending_table_size_minimum = optional_usize("pending-table-size-minimum")?;
     codec.dynamic_table.clear();
     for idx in 0..dynamic_count {
         let name_bytes = decode_blob_field(
@@ -1209,6 +1283,184 @@ mod tests {
         let decoded = decoder.decode(&encoded).expect("Decode failed");
 
         assert_eq!(headers, decoded);
+    }
+
+    #[test]
+    fn test_dynamic_table_size_update_is_emitted_at_block_start() {
+        let mut encoder = HpackCodec::new(128);
+        let mut decoder = HpackCodec::new(128);
+        encoder.set_max_dynamic_table_size(64).unwrap();
+        let headers = HashMap::from([(String::from("x-test"), String::from("value"))]);
+        let encoded = encoder.encode(&headers);
+        assert_eq!(decoder.decode(&encoded).unwrap().get("x-test"), Some(&"value".to_string()));
+        assert_eq!(decoder.max_dynamic_table_size, 64);
+    }
+
+    #[test]
+    fn test_dynamic_table_size_update_after_header_is_rejected() {
+        let mut decoder = HpackCodec::new(128);
+        let data = vec![0x40, 0x01, b'x', 0x01, b'y', 0x20];
+        assert!(decoder.decode(&data).is_err());
+    }
+
+    fn header(name: &str, value: &str) -> (String, String) {
+        (name.to_string(), value.to_string())
+    }
+
+    #[test]
+    fn test_table_size_update_above_limit_is_rejected() {
+        let mut decoder = HpackCodec::new(4096);
+        assert!(decoder.decode(&[0x3f, 0xe2, 0x1f]).is_err());
+        assert!(decoder.decode(&[0x3f, 0xe1, 0x1f]).is_ok());
+        assert_eq!(decoder.max_dynamic_table_size(), 4096);
+    }
+
+    #[test]
+    fn test_multiple_size_updates_at_block_start_are_accepted() {
+        let mut decoder = HpackCodec::new(4096);
+        let decoded = decoder.decode(&[0x20, 0x3f, 0x00, 0x82]).unwrap();
+        assert_eq!(decoded.get(":method"), Some(&"GET".to_string()));
+        assert_eq!(decoder.max_dynamic_table_size(), 31);
+    }
+
+    #[test]
+    fn test_size_update_to_zero_clears_table() {
+        let mut encoder = HpackCodec::new(4096);
+        let mut decoder = HpackCodec::new(4096);
+        let block = encoder.encode_list(&[header("x-a", "1"), header("x-b", "2")]);
+        decoder.decode(&block).unwrap();
+        assert_eq!(decoder.dynamic_table_len(), 2);
+
+        encoder.set_max_dynamic_table_size(0).unwrap();
+        assert_eq!(encoder.dynamic_table_len(), 0);
+        let block = encoder.encode_list(&[header(":method", "GET")]);
+        assert_eq!(block[0], 0x20);
+        decoder.decode(&block).unwrap();
+        assert_eq!(decoder.dynamic_table_len(), 0);
+        assert_eq!(decoder.max_dynamic_table_size(), 0);
+    }
+
+    #[test]
+    fn test_size_reduction_evicts_oldest_entries() {
+        let mut encoder = HpackCodec::new(4096);
+        let mut decoder = HpackCodec::new(4096);
+        let block = encoder.encode_list(&[header("x-a", "1"), header("x-b", "2"), header("x-c", "3")]);
+        decoder.decode(&block).unwrap();
+
+        encoder.set_max_dynamic_table_size(72).unwrap();
+        decoder.decode(&encoder.encode_list(&[])).unwrap();
+        assert_eq!(decoder.dynamic_table_len(), 2);
+        assert_eq!(decoder.dynamic_table_size(), 72);
+        assert_eq!(decoder.get_from_table(STATIC_TABLE.len() + 1), Some(header("x-c", "3")));
+        assert_eq!(decoder.get_from_table(STATIC_TABLE.len() + 2), Some(header("x-b", "2")));
+        assert_eq!(decoder.get_from_table(STATIC_TABLE.len() + 3), None);
+    }
+
+    #[test]
+    fn test_entry_larger_than_table_empties_it() {
+        let mut encoder = HpackCodec::new(64);
+        let mut decoder = HpackCodec::new(64);
+        encoder.encode_list(&[header("x-a", "1")]);
+        decoder.decode(&HpackCodec::new(64).encode_list(&[header("x-a", "1")])).unwrap();
+
+        let big = "v".repeat(100);
+        let block = encoder.encode_list(&[header("x-big", &big)]);
+        let decoded = decoder.decode(&block).unwrap();
+        assert_eq!(decoded.get("x-big"), Some(&big));
+        assert_eq!(decoder.dynamic_table_len(), 0);
+        assert_eq!(encoder.dynamic_table_len(), 0);
+    }
+
+    #[test]
+    fn test_lowering_then_raising_signals_minimum_first() {
+        let mut encoder = HpackCodec::new(4096);
+        let mut decoder = HpackCodec::new(4096);
+        decoder.decode(&encoder.encode_list(&[header("x-a", "1")])).unwrap();
+
+        encoder.set_max_dynamic_table_size(0).unwrap();
+        encoder.set_max_dynamic_table_size(4096).unwrap();
+        let block = encoder.encode_list(&[header(":method", "GET")]);
+        assert_eq!(&block[..4], &[0x20, 0x3f, 0xe1, 0x1f]);
+
+        decoder.decode(&block).unwrap();
+        assert_eq!(decoder.dynamic_table_len(), 0);
+        assert_eq!(decoder.max_dynamic_table_size(), 4096);
+        assert!(!encoder.has_pending_table_size_update());
+    }
+
+    #[test]
+    fn test_unchanged_size_emits_no_update() {
+        let mut encoder = HpackCodec::new(4096);
+        encoder.set_max_dynamic_table_size(4096).unwrap();
+        encoder.set_max_dynamic_table_size_limit(4096).unwrap();
+        assert!(!encoder.has_pending_table_size_update());
+        assert_eq!(encoder.encode_list(&[header(":method", "GET")]), vec![0x82]);
+    }
+
+    #[test]
+    fn test_limit_reduction_shrinks_table_and_rejects_larger_sizes() {
+        let mut encoder = HpackCodec::new(4096);
+        encoder.set_max_dynamic_table_size_limit(256).unwrap();
+        assert_eq!(encoder.max_dynamic_table_size(), 256);
+        assert!(encoder.has_pending_table_size_update());
+        assert!(encoder.set_max_dynamic_table_size(512).is_err());
+
+        encoder.set_max_dynamic_table_size_limit(8192).unwrap();
+        assert_eq!(encoder.max_dynamic_table_size(), 256);
+        assert!(encoder.set_max_dynamic_table_size(8192).is_ok());
+    }
+
+    #[test]
+    fn test_encoder_decoder_stay_in_sync_across_resizes() {
+        let mut encoder = HpackCodec::new(4096);
+        let mut decoder = HpackCodec::new(4096);
+        for (round, size) in [4096usize, 100, 0, 300, 4096].into_iter().enumerate() {
+            encoder.set_max_dynamic_table_size(size).unwrap();
+            let headers = vec![
+                header(":method", "POST"),
+                header(":path", &format!("/round/{}", round)),
+                header("x-round", &round.to_string()),
+                header("x-filler", &"z".repeat(40)),
+            ];
+            let decoded = decoder.decode(&encoder.encode_list(&headers)).unwrap();
+            for (name, value) in &headers {
+                assert_eq!(decoded.get(name), Some(value));
+            }
+            assert_eq!(decoder.max_dynamic_table_size(), encoder.max_dynamic_table_size());
+            assert_eq!(decoder.dynamic_table, encoder.dynamic_table);
+        }
+    }
+
+    #[test]
+    fn test_long_and_non_huffman_strings_encode_correctly() {
+        let mut encoder = HpackCodec::new(4096);
+        let mut decoder = HpackCodec::new(4096);
+        let binary = "\u{7f}\u{7e}\u{7d}\u{7c}";
+        let long = "a".repeat(300);
+        let headers = vec![header("x-binary", binary), header("x-long", &long), header("x-after", "ok")];
+        let decoded = decoder.decode(&encoder.encode_list(&headers)).unwrap();
+        assert_eq!(decoded.get("x-binary"), Some(&binary.to_string()));
+        assert_eq!(decoded.get("x-long"), Some(&long));
+        assert_eq!(decoded.get("x-after"), Some(&"ok".to_string()));
+    }
+
+    #[test]
+    fn test_pseudo_headers_are_encoded_first() {
+        let mut encoder = HpackCodec::new(4096);
+        let block = encoder.encode_list(&[header("x-a", "1"), header(":method", "GET")]);
+        assert_eq!(block[0], 0x82);
+    }
+
+    #[test]
+    fn test_secure_hpack_codec_preserves_pending_size_update() {
+        let mut codec = HpackCodec::new(4096);
+        codec.set_max_dynamic_table_size(0).unwrap();
+        codec.set_max_dynamic_table_size(1024).unwrap();
+
+        let (_, blob) = encode_secure_hpack_codec(&codec, CompressionAlgorithm::Identity).unwrap();
+        let (_, mut restored) = decode_secure_hpack_codec(&blob).unwrap();
+        assert_eq!(restored.max_dynamic_table_size_limit(), 4096);
+        assert_eq!(&restored.encode_list(&[])[..], &[0x20, 0x3f, 0xe1, 0x07]);
     }
 
     #[test]

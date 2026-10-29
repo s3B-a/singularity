@@ -20,12 +20,12 @@ use std::io;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub use alpn::{AlpnNegotiator, AlpnProtocol, NpnNegotiator, NpnProtocol};
-pub use connection::Http2Connection;
+pub use connection::{Http2Connection, Http2Transport, Role};
 pub use error::{ErrorCode, Http2Error, Result};
 pub use flow_control::FlowControl;
 pub use frame::{Frame, FrameFlags, FrameHeader, FrameType};
 pub use hpack::HpackCodec;
-pub use priority::{Priority, PriorityTree};
+pub use priority::{parse_priority_header, ExtensiblePriority, Priority, PriorityTree};
 pub use push::{PushManager, PushConfig, PushedResource, PushStatus, PushStats};
 pub use settings::{Settings, SettingId};
 pub use scheduler::{PriorityScheduler, DependencyTreeStats, StreamScheduleState};
