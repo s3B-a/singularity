@@ -4,11 +4,15 @@ use crate::crypto::hash::hmac::hmac_sha256;
 use crate::crypto::hash::sha2::sha256;
 use crate::crypto::random;
 use crate::net::http::compression::{self, CompressionAlgorithm, CompressionLevel};
+use std::fmt;
 use std::io::{self, Read};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const CHUNKED_BLOB_MAGIC: &str = "SINGULARITY_HTTP_CHUNKED_BLOB_V1";
 const CHUNKED_BLOB_CONTEXT: &str = "SINGULARITY_HTTP_CHUNKED_BLOB_BINDING_V1";
+
+pub const DEFAULT_MAX_CHUNK_LINE: usize = 4096;
+pub const DEFAULT_MAX_TRAILER_BYTES: usize = 16 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SecureChunkedBlobMeta {
@@ -19,6 +23,20 @@ pub struct SecureChunkedBlobMeta {
     pub raw_size: usize,
     pub encoded_size: usize,
     pub issued_at_unix: u64,
+}
+
+pub struct ChunkedDecoder<R> {
+    reader: R,
+    max_body_size: usize,
+    max_line_len: usize,
+    max_trailer_bytes: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChunkedLimitError {
+    BodyTooLarge { limit: usize },
+    LineTooLong { limit: usize },
+    TrailersTooLarge { limit: usize },
 }
 
 pub fn select_secure_chunked_algorithm(accept_encoding: &str) -> CompressionAlgorithm {
@@ -343,74 +361,136 @@ fn parse_secure_chunked_meta(header: &str, body_len: usize) -> io::Result<Secure
     })
 }
 
-pub struct ChunkedDecoder<R> {
-    reader: R,
+impl ChunkedLimitError {
+    pub fn from_io(err: &io::Error) -> Option<&ChunkedLimitError> {
+        err.get_ref().and_then(|inner| inner.downcast_ref::<ChunkedLimitError>())
+    }
+
+    fn into_io(self) -> io::Error {
+        io::Error::new(io::ErrorKind::InvalidData, self)
+    }
 }
 
 impl<R: Read> ChunkedDecoder<R> {
     pub fn new(reader: R) -> Self {
-        Self { reader }
+        Self {
+            reader,
+            max_body_size: usize::MAX,
+            max_line_len: DEFAULT_MAX_CHUNK_LINE,
+            max_trailer_bytes: DEFAULT_MAX_TRAILER_BYTES,
+        }
     }
 
-    pub fn decode(mut self) -> io::Result<Vec<u8>> {
+    pub fn with_limits(reader: R, max_body_size: usize, max_line_len: usize, max_trailer_bytes: usize) -> Self {
+        Self { reader, max_body_size, max_line_len, max_trailer_bytes }
+    }
+
+    pub fn decode(self) -> io::Result<Vec<u8>> {
+        self.decode_with_trailers().map(|(body, _)| body)
+    }
+
+    pub fn decode_with_trailers(mut self) -> io::Result<(Vec<u8>, Vec<(String, String)>)> {
         let mut body = Vec::new();
+        let max_line = self.max_line_len;
         loop {
-            let chunk_size_line = self.read_line()?;
-            let chunk_size = self.parse_chunk_size(&chunk_size_line)?;
+            let chunk_size_line = self.read_line(max_line, || ChunkedLimitError::LineTooLong { limit: max_line })?;
+            let chunk_size = Self::parse_chunk_size(&chunk_size_line)?;
             if chunk_size == 0 {
-                // Read trailing headers if any and final CRLF
-                self.read_trailing_headers()?;
-                break;
+                let trailers = self.read_trailers()?;
+                return Ok((body, trailers));
             }
 
-            let mut chunk_data = vec![0u8; chunk_size];
-            self.reader.read_exact(&mut chunk_data)?;
-            body.extend_from_slice(&chunk_data);
-            self.read_line()?;
-        }
-
-        Ok(body)
-    }
-
-    fn read_line(&mut self) -> io::Result<String> {
-        let mut line = String::new();
-        let mut buffer = [0u8; 1];
-        loop {
-            self.reader.read_exact(&mut buffer)?;
-            let ch = buffer[0] as char;
-            if ch == '\n' {
-                break;
+            if chunk_size > self.max_body_size.saturating_sub(body.len()) {
+                return Err(ChunkedLimitError::BodyTooLarge { limit: self.max_body_size }.into_io());
             }
 
-            if ch != '\r' {
-                line.push(ch);
+            let start = body.len();
+            body.resize(start + chunk_size, 0);
+            self.reader.read_exact(&mut body[start..])?;
+
+            let mut crlf = [0u8; 2];
+            self.reader.read_exact(&mut crlf)?;
+            if &crlf != b"\r\n" {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "chunk data not followed by CRLF"));
             }
         }
-
-        Ok(line)
     }
 
-    fn parse_chunk_size(&self, line: &str) -> io::Result<usize> {
-        let size_part = line.split(';').next().unwrap_or(line).trim();
-        usize::from_str_radix(size_part, 16).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("invalid chunk size: {}", line),
-            )
-        })
-    }
-
-    fn read_trailing_headers(&mut self) -> io::Result<()> {
+    fn read_line(&mut self, max: usize, too_long: impl Fn() -> ChunkedLimitError) -> io::Result<Vec<u8>> {
+        let mut line = Vec::new();
+        let mut byte = [0u8; 1];
         loop {
-            let line = self.read_line()?;
+            self.reader.read_exact(&mut byte)?;
+            match byte[0] {
+                b'\r' => {
+                    self.reader.read_exact(&mut byte)?;
+                    if byte[0] != b'\n' {
+                        return Err(io::Error::new(io::ErrorKind::InvalidData, "bare CR in chunked encoding"));
+                    }
+
+                    return Ok(line);
+                }
+                b'\n' => return Err(io::Error::new(io::ErrorKind::InvalidData, "bare LF in chunked encoding")),
+                b => {
+                    if line.len() >= max {
+                        return Err(too_long().into_io());
+                    }
+
+                    line.push(b);
+                }
+            }
+        }
+    }
+
+    fn parse_chunk_size(line: &[u8]) -> io::Result<usize> {
+        let invalid = || io::Error::new(io::ErrorKind::InvalidData, format!("invalid chunk size: {}", String::from_utf8_lossy(line)));
+        let size_end = line.iter().position(|&b| !b.is_ascii_hexdigit()).unwrap_or(line.len());
+        let (size, rest) = line.split_at(size_end);
+        if size.is_empty() {
+            return Err(invalid());
+        }
+
+        let rest = rest.iter().skip_while(|&&b| b == b' ' || b == b'\t').copied().collect::<Vec<u8>>();
+        if !rest.is_empty() && rest[0] != b';' {
+            return Err(invalid());
+        }
+
+        let size = std::str::from_utf8(size).map_err(|_| invalid())?;
+        usize::from_str_radix(size, 16).map_err(|_| invalid())
+    }
+
+    fn read_trailers(&mut self) -> io::Result<Vec<(String, String)>> {
+        let mut trailers = Vec::new();
+        let mut total = 0usize;
+        let limit = self.max_trailer_bytes;
+        loop {
+            let line = self.read_line(limit.saturating_sub(total), || ChunkedLimitError::TrailersTooLarge { limit })?;
             if line.is_empty() {
-                break;
+                return Ok(trailers);
             }
-        }
 
-        Ok(())
+            total += line.len() + 2;
+            let line = String::from_utf8(line).map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "trailer field is not UTF-8"))?;
+            let (name, value) = line.split_once(':').filter(|(name, _)| !name.is_empty() && !name.ends_with([' ', '\t'])).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, format!("malformed trailer field: {}", line))
+            })?;
+
+            trailers.push((name.to_string(), value.trim().to_string()));
+        }
     }
 }
+
+impl fmt::Display for ChunkedLimitError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ChunkedLimitError::BodyTooLarge { limit } => write!(f, "chunked body exceeds {} bytes", limit),
+            ChunkedLimitError::LineTooLong { limit } => write!(f, "chunk-size line exceeds {} bytes", limit),
+            ChunkedLimitError::TrailersTooLarge { limit } => write!(f, "chunked trailers exceed {} bytes", limit),
+        }
+    }
+}
+
+impl std::error::Error for ChunkedLimitError {}
 
 #[cfg(test)]
 mod tests {
@@ -430,6 +510,52 @@ mod tests {
         let decoder = ChunkedDecoder::new(&data[..]);
         let result = decoder.decode().unwrap();
         assert_eq!(result, b"Hello World");
+    }
+
+    #[test]
+    fn test_decode_with_extensions_and_trailers() {
+        let data = b"5;name=value\r\nHello\r\n6 ; ext\r\n World\r\n0\r\nChecksum: abc\r\nX-Other:  1 \r\n\r\n";
+        let (body, trailers) = ChunkedDecoder::new(&data[..]).decode_with_trailers().unwrap();
+        assert_eq!(body, b"Hello World");
+        assert_eq!(trailers, vec![("Checksum".to_string(), "abc".to_string()), ("X-Other".to_string(), "1".to_string())]);
+    }
+
+    #[test]
+    fn test_decode_rejects_malformed_framing() {
+        for data in [
+            &b"+5\r\nHello\r\n0\r\n\r\n"[..],
+            b"0x5\r\nHello\r\n0\r\n\r\n",
+            b"\r\nHello\r\n0\r\n\r\n",
+            b"5 junk\r\nHello\r\n0\r\n\r\n",
+            b"5\r\nHelloXX0\r\n\r\n",
+            b"5\nHello\r\n0\r\n\r\n",
+            b"5\r\nHello\r\n0\r\nbad trailer\r\n\r\n",
+            b"FFFFFFFFFFFFFFFFFFFF\r\n",
+        ] {
+            assert!(ChunkedDecoder::new(data).decode().is_err(), "{:?}", String::from_utf8_lossy(data));
+        }
+    }
+
+    #[test]
+    fn test_decode_enforces_body_limit_before_allocating() {
+        let data = b"FFFFFFFF\r\n";
+        let err = ChunkedDecoder::with_limits(&data[..], 1024, DEFAULT_MAX_CHUNK_LINE, DEFAULT_MAX_TRAILER_BYTES).decode().unwrap_err();
+        assert_eq!(ChunkedLimitError::from_io(&err), Some(&ChunkedLimitError::BodyTooLarge { limit: 1024 }));
+
+        let data = b"4\r\nabcd\r\n4\r\nefgh\r\n0\r\n\r\n";
+        let err = ChunkedDecoder::with_limits(&data[..], 6, DEFAULT_MAX_CHUNK_LINE, DEFAULT_MAX_TRAILER_BYTES).decode().unwrap_err();
+        assert!(matches!(ChunkedLimitError::from_io(&err), Some(ChunkedLimitError::BodyTooLarge { .. })));
+    }
+
+    #[test]
+    fn test_decode_enforces_line_and_trailer_limits() {
+        let long_line = format!("5;{}\r\nHello\r\n0\r\n\r\n", "x".repeat(100));
+        let err = ChunkedDecoder::with_limits(long_line.as_bytes(), usize::MAX, 32, DEFAULT_MAX_TRAILER_BYTES).decode().unwrap_err();
+        assert!(matches!(ChunkedLimitError::from_io(&err), Some(ChunkedLimitError::LineTooLong { .. })));
+
+        let big_trailers = format!("0\r\nA: {}\r\nB: {}\r\n\r\n", "x".repeat(20), "y".repeat(20));
+        let err = ChunkedDecoder::with_limits(big_trailers.as_bytes(), usize::MAX, DEFAULT_MAX_CHUNK_LINE, 30).decode().unwrap_err();
+        assert!(matches!(ChunkedLimitError::from_io(&err), Some(ChunkedLimitError::TrailersTooLarge { .. })));
     }
 
     #[test]

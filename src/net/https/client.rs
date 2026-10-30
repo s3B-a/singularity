@@ -582,14 +582,14 @@ impl HttpsClient {
         })?;
 
         let mut status_code = 200u16;
-        let mut headers = HashMap::new();
+        let mut headers = Vec::new();
         for (name, value) in decoded_headers {
             if name == ":status" {
                 status_code = value.parse::<u16>().map_err(|_| {
                     HttpsError::InvalidResponse(format!("invalid HTTP/2 status code: {}", value))
                 })?;
             } else if !name.starts_with(':') {
-                headers.insert(name, value);
+                headers.push((name, value));
             }
         }
 
@@ -599,22 +599,21 @@ impl HttpsClient {
             HttpsError::InvalidResponse(format!("failed to parse synthesized HTTP/2 response: {}", e))
         })?;
 
-        let response = HttpResponse::new(
+        let response = HttpResponse::with_fields(
             parsed.status_code(),
             parsed.reason_phrase().to_string(),
             HttpVersion::Http2,
-            parsed.headers().clone(),
+            parsed.header_fields().to_vec(),
             parsed.body().to_vec(),
         );
 
         self.maybe_decode_secure_response(response)
     }
 
-    fn maybe_decode_secure_response(&self, response: HttpResponse) -> Result<HttpResponse, HttpsError> {
+    fn maybe_decode_secure_response(&self, mut response: HttpResponse) -> Result<HttpResponse, HttpsError> {
         self.verify_optional_response_integrity(&response)?;
 
-        let mut headers = response.headers().clone();
-        let secure_marker = map_get_case_insensitive(&headers, "x-singularity-secure-envelope").unwrap_or_default();
+        let secure_marker = response.header("x-singularity-secure-envelope").cloned().unwrap_or_default();
         if !is_truthy_header(&secure_marker) {
             return Ok(response);
         }
@@ -623,17 +622,11 @@ impl HttpsClient {
             HttpsError::InvalidResponse(format!("failed to decode secure envelope: {}", e))
         })?;
 
-        map_remove_case_insensitive(&mut headers, "x-singularity-secure-envelope");
-        map_remove_case_insensitive(&mut headers, "content-encoding");
-        headers.insert("content-length".to_string(), payload.len().to_string());
-
-        Ok(HttpResponse::new(
-            response.status_code(),
-            response.reason_phrase().to_string(),
-            response.version(),
-            headers,
-            payload,
-        ))
+        response.remove_header("x-singularity-secure-envelope");
+        response.remove_header("content-encoding");
+        response.set_header("content-length", payload.len().to_string());
+        response.set_body(payload);
+        Ok(response)
     }
 
     fn verify_optional_response_integrity(&self, response: &HttpResponse) -> Result<(), HttpsError> {
@@ -1275,14 +1268,6 @@ fn map_get_case_insensitive(map: &HashMap<String, String>, key: &str) -> Option<
     })
 }
 
-fn map_remove_case_insensitive(map: &mut HashMap<String, String>, key: &str) -> Option<String> {
-    let existing = map.keys().find(|k| {
-        k.eq_ignore_ascii_case(key)
-    }).cloned()?;
-
-    map.remove(&existing)
-}
-
 fn find_http_header_end(data: &[u8]) -> Option<usize> {
     data.windows(4).position(|w| {
         w == b"\r\n\r\n"
@@ -1318,7 +1303,7 @@ fn chunked_body_complete(body: &[u8]) -> bool {
     body.windows(7).any(|w| w == b"\r\n0\r\n\r\n") || body.ends_with(b"0\r\n\r\n")
 }
 
-fn build_synthetic_http1_response(status_code: u16, reason_phrase: &str, headers: &HashMap<String, String>, body: &[u8]) -> Vec<u8> {
+fn build_synthetic_http1_response(status_code: u16, reason_phrase: &str, headers: &[(String, String)], body: &[u8]) -> Vec<u8> {
     let mut out = String::new();
     out.push_str(&format!("HTTP/1.1 {} {}\r\n", status_code, reason_phrase));
     let mut has_content_length = false;

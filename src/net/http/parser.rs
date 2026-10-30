@@ -33,15 +33,18 @@ impl HttpParser {
         let headers = Self::read_headers(stream)?;
         let wire_body = Self::read_body(stream, &headers)?;
         Self::verify_digest(&headers, &wire_body)?;
+        let fields = headers.iter()
+            .flat_map(|(name, values)| values.iter().map(move |value| (name.clone(), value.clone())))
+            .collect();
+        let mut response = HttpResponse::with_fields(status.code(), reason, version, fields, Vec::new());
         let mut final_body = wire_body;
-        let mut headers_map = headers.clone().into_map();
         if let Some(content_encoding) = headers.get("content-encoding") {
             final_body = Self::decode_content_encoding(content_encoding, &final_body)?;
-            headers_map.remove("content-encoding");
-            headers_map.insert("content-length".to_string(), final_body.len().to_string());
+            response.remove_header("content-encoding");
+            response.set_header("content-length", final_body.len().to_string());
         }
 
-        let response = HttpResponse::new(status.code(), reason, version, headers_map, final_body);
+        response.set_body(final_body);
         Ok(response)
     }
 

@@ -11,7 +11,7 @@ use crate::net::http::compression::{self, CompressionAlgorithm, CompressionLevel
 use std::io;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub use cookie::{Cookie, SameSite};
+pub use cookie::{domain_match, Cookie, CookiePrefix, SameSite};
 pub use jar::CookieJar;
 pub use parser::{parse_cookie_header, parse_set_cookie, ParseError};
 
@@ -171,7 +171,7 @@ pub fn new_jar() -> CookieJar {
 fn serialize_cookie_jar(jar: &CookieJar) -> Vec<u8> {
     let mut lines = Vec::new();
     for cookie in jar.all() {
-        lines.push(cookie.to_string());
+        lines.push(CookieJar::snapshot_line(cookie));
     }
 
     lines.join("\n").into_bytes()
@@ -193,7 +193,7 @@ fn deserialize_cookie_jar(raw_payload: &[u8], expected_count: usize) -> io::Resu
             continue;
         }
 
-        let cookie = parse_set_cookie(line).map_err(|e| {
+        let cookie = CookieJar::parse_snapshot_line(line).map_err(|e| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("failed to parse secure cookie entry: {}", e),

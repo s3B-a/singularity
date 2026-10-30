@@ -6,10 +6,11 @@ use crate::crypto::random;
 use crate::net::http::compression::{self, CompressionAlgorithm, CompressionLevel};
 use crate::net::http::http2::alpn::AlpnProtocol;
 use crate::net::http::http2::{Http2Connection, Http2Error, StreamState};
+use crate::net::http::server::{Http1ReadError, Http1RequestLimits, HttpServer};
 use crate::net::http::{HttpMethod, HttpRequest, HttpResponse, HttpVersion};
 use crate::net::tcp::{TcpListener, TcpStream};
 use std::collections::{HashMap, HashSet};
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -52,6 +53,20 @@ pub struct HttpsServerCfg {
     pub preferred_compression: Vec<CompressionAlgorithm>,
     pub require_request_digest: bool,
     pub require_request_tag: bool,
+    pub max_request_line_size: usize,
+    pub max_header_bytes: usize,
+    pub max_header_count: usize,
+}
+
+impl HttpsServerCfg {
+    fn http1_limits(&self) -> Http1RequestLimits {
+        Http1RequestLimits {
+            max_request_line_size: self.max_request_line_size,
+            max_header_bytes: self.max_header_bytes,
+            max_header_count: self.max_header_count,
+            max_body_size: self.max_body_size,
+        }
+    }
 }
 
 pub struct HttpsServer {
@@ -346,9 +361,9 @@ impl HttpsServer {
         )?;
 
         let mut headers = vec![(":status".to_string(), response.status_code().to_string())];
-        for (name, value) in response.headers() {
+        for (name, value) in response.header_fields() {
             if !Self::is_controlled_response_header(name) {
-                headers.push((name.clone(), value.clone()));
+                headers.push((name.to_ascii_lowercase(), value.clone()));
             }
         }
 
@@ -381,7 +396,7 @@ impl HttpsServer {
 
         let mut reader = BufReader::new(cloned_stream);
         loop {
-            match Self::parse_request(&mut reader, &config) {
+            match Self::parse_request(&mut reader, &mut tls_stream, &config) {
                 Ok(request) => {
                     let response = if let Some(ref h) = handler {
                         h(&request)
@@ -390,18 +405,24 @@ impl HttpsServer {
                     };
 
                     let accept_encoding = request.headers().get("accept-encoding");
-                    let keep_alive = config.keep_alive && request.wants_keep_alive();
-                    let response_bytes = Self::serialize_response(&response, accept_encoding, keep_alive, &config)?;
+                    let keep_alive = config.keep_alive && request.wants_keep_alive() && !response.should_close_connection();
+                    let head_request = request.method() == HttpMethod::HEAD;
+                    let response_bytes = Self::serialize_response(&response, accept_encoding, keep_alive, head_request, &config)?;
                     tls_stream.write_all(&response_bytes)?;
                     tls_stream.flush()?;
                     if !keep_alive {
                         break;
                     }
                 }
-                Err(e) => {
-                    eprintln!("Error parsing HTTPS request from {}: {}", peer_addr, e);
-                    let err_response = Self::error_response(400, "Bad Request");
-                    let response_bytes = Self::serialize_response(&err_response, None, false, &config)
+                Err(Http1ReadError::Closed) => break,
+                Err(Http1ReadError::Io(e)) => {
+                    eprintln!("Error reading HTTPS request from {}: {}", peer_addr, e);
+                    break;
+                }
+                Err(Http1ReadError::Reject(status, reason)) => {
+                    eprintln!("Rejecting HTTPS request from {} with {}: {}", peer_addr, status, reason);
+                    let err_response = Self::error_response(status, &HttpResponse::default_reason_phrase(status));
+                    let response_bytes = Self::serialize_response(&err_response, None, false, false, &config)
                         .unwrap_or_else(|_| err_response.to_bytes());
 
                     let _ = tls_stream.write_all(&response_bytes);
@@ -414,81 +435,33 @@ impl HttpsServer {
         Ok(())
     }
 
-    fn parse_request(reader: &mut BufReader<TlsStream>, config: &HttpsServerCfg) -> std::io::Result<HttpRequest> {
-        let mut request_line = String::new();
-        loop {
-            request_line.clear();
-            let n = reader.read_line(&mut request_line)?;
-            if n == 0 {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
-                    "connection closed",
-                ));
-            }
-
-            if !request_line.trim().is_empty() {
-                break;
-            }
-        }
-
-        let parts: Vec<&str> = request_line.split_whitespace().collect();
-        if parts.len() < 3 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "invalid request line",
-            ));
-        }
-
-        let method = HttpMethod::from_str(parts[0]).ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::InvalidData, "unknown HTTP method")
-        })?;
-
-        let path = parts[1].to_string();
-        let version = HttpVersion::from_str(parts[2]).unwrap_or(HttpVersion::Http11);
-        let mut headers = HashMap::new();
-        let mut content_length = 0usize;
-        loop {
-            let mut header_line = String::new();
-            let n = reader.read_line(&mut header_line)?;
-            if n == 0 || header_line.trim().is_empty() {
-                break;
-            }
-
-            if let Some(colon_pos) = header_line.find(':') {
-                let key = header_line[..colon_pos].trim().to_string();
-                let value = header_line[colon_pos + 1..].trim().to_string();
-                if key.eq_ignore_ascii_case(HEADER_CONTENT_LENGTH) {
-                    content_length = value.parse::<usize>().unwrap_or(0);
+    fn parse_request<R: BufRead, W: Write>(reader: &mut R, writer: &mut W, config: &HttpsServerCfg) -> Result<HttpRequest, Http1ReadError> {
+        let raw = HttpServer::read_http1_request(reader, writer, &config.http1_limits())?;
+        let mut headers: HashMap<String, String> = HashMap::new();
+        for (name, value) in &raw.fields {
+            match headers.iter_mut().find(|(k, _)| k.eq_ignore_ascii_case(name)) {
+                Some((_, existing)) => {
+                    existing.push_str(", ");
+                    existing.push_str(value);
                 }
-
-                headers.insert(key, value);
+                None => {
+                    headers.insert(name.clone(), value.clone());
+                }
             }
         }
 
-        if content_length > config.max_body_size {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "request body too large",
-            ));
+        let bad_request = |e: std::io::Error| Http1ReadError::Reject(400, e.to_string());
+        Self::verify_request_integrity(raw.method.as_str(), &raw.target, &headers, &raw.body, config).map_err(bad_request)?;
+        let decoded_body = Self::decode_body_from_headers(&headers, &raw.body).map_err(bad_request)?;
+        let mut request = HttpRequest::new(raw.method, &raw.target).version(raw.version);
+        for (name, value) in raw.fields {
+            request.headers_mut().append(name, value);
         }
 
-        let mut wire_body = vec![0u8; content_length];
-        if content_length > 0 {
-            reader.read_exact(&mut wire_body)?;
-        }
-
-        Self::verify_request_integrity(parts[0], &path, &headers, &wire_body, config)?;
-        let decoded_body = Self::decode_body_from_headers(&headers, &wire_body)?;
-        let mut request = HttpRequest::new(method, &path).version(version);
-        for (key, value) in &headers {
-            request.set_header(key.clone(), value.clone());
-        }
-
-        request = request.set_body(decoded_body);
-        Ok(request)
+        Ok(request.set_body(decoded_body))
     }
 
-    fn serialize_response(response: &HttpResponse, accept_encoding: Option<&str>, keep_alive: bool, config: &HttpsServerCfg) -> std::io::Result<Vec<u8>> {
+    fn serialize_response(response: &HttpResponse, accept_encoding: Option<&str>, keep_alive: bool, head_request: bool, config: &HttpsServerCfg) -> std::io::Result<Vec<u8>> {
         let (meta, wire_body) = Self::prepare_secure_response_body(
             response.status_code(),
             response.reason_phrase(),
@@ -497,37 +470,35 @@ impl HttpsServer {
             config,
         )?;
 
-        let mut headers = HashMap::new();
-        for (name, value) in response.headers() {
-            if !Self::is_controlled_response_header(name) {
-                headers.insert(name.clone(), value.clone());
-            }
-        }
+        let mut headers: Vec<(String, String)> = response.header_fields().iter()
+            .filter(|(name, _)| !Self::is_controlled_response_header(name))
+            .cloned()
+            .collect();
 
         if !wire_body.is_empty() {
-            headers.insert(HEADER_CONTENT_LENGTH.to_string(), wire_body.len().to_string());
+            headers.push((HEADER_CONTENT_LENGTH.to_string(), wire_body.len().to_string()));
         }
 
         if meta.algorithm != CompressionAlgorithm::Identity {
-            headers.insert(
+            headers.push((
                 HEADER_CONTENT_ENCODING.to_string(),
                 meta.algorithm.content_encoding().to_string(),
-            );
+            ));
         }
 
-        headers.insert(HEADER_DIGEST.to_string(), format!("SHA-256={}", meta.digest_b64));
-        headers.insert(HEADER_CONTENT_SHA256_HEX.to_string(), Self::to_hex(&sha256(&wire_body)));
-        headers.insert(HEADER_NONCE.to_string(), meta.nonce_b64);
-        headers.insert(HEADER_RESPONSE_TAG.to_string(), meta.tag_b64);
-        if !headers.keys().any(|k| k.eq_ignore_ascii_case(HEADER_CONNECTION)) {
-            headers.insert(
+        headers.push((HEADER_DIGEST.to_string(), format!("SHA-256={}", meta.digest_b64)));
+        headers.push((HEADER_CONTENT_SHA256_HEX.to_string(), Self::to_hex(&sha256(&wire_body))));
+        headers.push((HEADER_NONCE.to_string(), meta.nonce_b64));
+        headers.push((HEADER_RESPONSE_TAG.to_string(), meta.tag_b64));
+        if !headers.iter().any(|(k, _)| k.eq_ignore_ascii_case(HEADER_CONNECTION)) {
+            headers.push((
                 HEADER_CONNECTION.to_string(),
                 if keep_alive {
                     "keep-alive".to_string()
                 } else {
                     "close".to_string()
                 },
-            );
+            ));
         }
 
         let mut bytes = Vec::new();
@@ -546,7 +517,9 @@ impl HttpsServer {
         }
 
         bytes.extend_from_slice(b"\r\n");
-        bytes.extend_from_slice(&wire_body);
+        if !head_request {
+            bytes.extend_from_slice(&wire_body);
+        }
 
         Ok(bytes)
     }
@@ -841,6 +814,7 @@ impl HttpsServer {
 
 impl Default for HttpsServerCfg {
     fn default() -> Self {
+        let http1_defaults = Http1RequestLimits::default();
         Self {
             tls_config: TlsCfg::default(),
             max_connections: 100,
@@ -858,6 +832,9 @@ impl Default for HttpsServerCfg {
             ],
             require_request_digest: false,
             require_request_tag: false,
+            max_request_line_size: http1_defaults.max_request_line_size,
+            max_header_bytes: http1_defaults.max_header_bytes,
+            max_header_count: http1_defaults.max_header_count,
         }
     }
 }
@@ -930,6 +907,46 @@ mod tests {
 
         let ok = HttpsServer::verify_request_tag(method, path, &headers, &wire_body).unwrap();
         assert!(ok);
+    }
+
+    fn parse_https_request(raw: &[u8]) -> (Result<HttpRequest, Http1ReadError>, Vec<u8>) {
+        let mut reader = std::io::Cursor::new(raw.to_vec());
+        let mut writer = Vec::new();
+        let result = HttpsServer::parse_request(&mut reader, &mut writer, &HttpsServerCfg::default());
+        (result, writer)
+    }
+
+    #[test]
+    fn test_https_http1_requests_use_shared_framing_rules() {
+        assert!(matches!(parse_https_request(b"GET / HTTP/1.1\r\n\r\n").0, Err(Http1ReadError::Reject(400, _))));
+        assert!(matches!(
+            parse_https_request(b"POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 3\r\nTransfer-Encoding: chunked\r\n\r\n").0,
+            Err(Http1ReadError::Reject(400, _))
+        ));
+
+        let long_line = format!("GET /{} HTTP/1.1\r\nHost: a\r\n\r\n", "x".repeat(10_000));
+        assert!(matches!(parse_https_request(long_line.as_bytes()).0, Err(Http1ReadError::Reject(414, _))));
+
+        let (request, interim) = parse_https_request(
+            b"POST /upload HTTP/1.1\r\nHost: a\r\nExpect: 100-continue\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\n\r\n",
+        );
+        assert_eq!(interim, b"HTTP/1.1 100 Continue\r\n\r\n");
+        assert_eq!(request.unwrap().body_bytes(), b"abc");
+    }
+
+    #[test]
+    fn test_https_serialize_keeps_repeated_headers() {
+        let mut response = HttpResponse::new(200, "OK".to_string(), HttpVersion::Http11, HashMap::new(), b"hi".to_vec());
+        response.append_header("Set-Cookie", "a=1");
+        response.append_header("Set-Cookie", "b=2");
+
+        let bytes = HttpsServer::serialize_response(&response, None, true, false, &HttpsServerCfg::default()).unwrap();
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(text.contains("Set-Cookie: a=1\r\n"));
+        assert!(text.contains("Set-Cookie: b=2\r\n"));
+
+        let head = HttpsServer::serialize_response(&response, None, true, true, &HttpsServerCfg::default()).unwrap();
+        assert!(head.ends_with(b"\r\n\r\n"));
     }
 
     #[test]

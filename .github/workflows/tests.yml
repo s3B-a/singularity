@@ -1,0 +1,133 @@
+name: Tests
+
+on:
+  push:
+    branches: ["**"]
+  workflow_dispatch:
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  checks: write
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUSTUP_TOOLCHAIN: stable
+
+jobs:
+  windows:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows Server 2022
+            id: windows-2022
+            runner: windows-2022
+          - name: Windows Server 2025
+            id: windows-2025
+            runner: windows-2025
+          - name: Windows 11 (ARM64)
+            id: windows-11-arm
+            runner: windows-11-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.id }}
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+
+      - name: Run tests
+        run: cargo nextest run --all-targets --locked --profile ci
+
+      - name: Test report
+        if: ${{ !cancelled() }}
+        uses: mikepenz/action-junit-report@v5
+        with:
+          report_paths: target/nextest/ci/junit.xml
+          check_name: Test report (${{ matrix.name }})
+          detailed_summary: true
+          include_passed: true
+          include_time_in_summary: true
+
+      - name: Upload JUnit report
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: junit-${{ matrix.id }}
+          path: target/nextest/ci/junit.xml
+          if-no-files-found: ignore
+
+  linux:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    container: ${{ matrix.image }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Debian (stable)
+            id: debian
+            image: debian:stable
+            packages: apt-get update && apt-get install -y --no-install-recommends build-essential ca-certificates curl git tar
+          - name: Arch Linux
+            id: arch
+            image: archlinux:latest
+            packages: pacman -Syu --noconfirm --needed base-devel curl git tar
+          - name: Fedora (latest)
+            id: fedora
+            image: fedora:latest
+            packages: dnf install -y gcc curl git tar
+          - name: Red Hat Enterprise Linux 9 (UBI)
+            id: rhel9
+            image: registry.access.redhat.com/ubi9/ubi:latest
+            packages: dnf install -y gcc git tar
+    steps:
+      - name: Install system packages
+        run: ${{ matrix.packages }}
+
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.id }}
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+
+      - name: Run tests
+        run: cargo nextest run --all-targets --locked --profile ci
+
+      - name: Test report
+        if: ${{ !cancelled() }}
+        uses: mikepenz/action-junit-report@v5
+        with:
+          report_paths: target/nextest/ci/junit.xml
+          check_name: Test report (${{ matrix.name }})
+          detailed_summary: true
+          include_passed: true
+          include_time_in_summary: true
+
+      - name: Upload JUnit report
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: junit-${{ matrix.id }}
+          path: target/nextest/ci/junit.xml
+          if-no-files-found: ignore

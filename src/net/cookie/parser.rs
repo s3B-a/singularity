@@ -30,6 +30,8 @@ pub enum ParseError {
     InvalidFormat,
     EmptyName,
     InvalidDate,
+    PrefixViolation(String),
+    Rejected(String),
 }
 
 impl std::fmt::Display for ParseError {
@@ -39,6 +41,8 @@ impl std::fmt::Display for ParseError {
             ParseError::InvalidFormat => write!(f, "Invalid cookie format"),
             ParseError::EmptyName => write!(f, "Empty cookie name"),
             ParseError::InvalidDate => write!(f, "Invalid date format"),
+            ParseError::PrefixViolation(reason) => write!(f, "Cookie prefix violation: {}", reason),
+            ParseError::Rejected(reason) => write!(f, "Cookie rejected: {}", reason),
         }
     }
 }
@@ -57,6 +61,7 @@ pub fn parse_set_cookie(header: &str) -> Result<Cookie, ParseError> {
         parse_attributes(&mut cookie, part)?;
     }
 
+    cookie.validate_prefix().map_err(ParseError::PrefixViolation)?;
     Ok(cookie)
 }
 
@@ -250,7 +255,10 @@ fn parse_attributes(cookie: &mut Cookie, attr: &str) -> Result<(), ParseError> {
         let value = value[1..].trim();
         match key.as_str() {
             "domain" => {
-                cookie.set_domain(value.to_string());
+                let domain = value.strip_prefix('.').unwrap_or(value).to_ascii_lowercase();
+                if !domain.is_empty() {
+                    cookie.set_domain(domain);
+                }
             }
             "path" => {
                 cookie.set_path(Some(value.to_string()));

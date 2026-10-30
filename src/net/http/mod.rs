@@ -15,6 +15,8 @@ pub mod trailer;
 pub mod server;
 pub mod negotiation;
 pub mod compression;
+pub mod conditional;
+pub mod range;
 
 pub use status::StatusCode;
 pub use headers::Headers;
@@ -24,8 +26,10 @@ pub use client::{HttpClient, HttpClientBuilder};
 pub use request::HttpRequest;
 pub use trailer::TrailerHeaders;
 pub use response::HttpResponse;
-pub use server::{HttpServer, HttpServerCfg};
+pub use server::{Http1RawRequest, Http1ReadError, Http1RequestLimits, HttpServer, HttpServerCfg};
 pub use negotiation::{ContentNegotiator, MediaType, LanguageTag, EncodingPreference};
+pub use conditional::{EntityTag, EntityTagMatch, PreconditionOutcome, evaluate_preconditions, format_http_date, parse_http_date};
+pub use range::{ByteRange, ByteRangeSpec, ContentRange, RangeError, RangeOutcome};
 pub use http3_client::Http3Client;
 pub use crate::crypto as crypto;
 
