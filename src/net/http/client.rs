@@ -12,12 +12,15 @@ use crate::crypto::hash::hmac::hmac_sha256;
 use crate::crypto::hash::sha2::sha256;
 use crate::crypto::random;
 use crate::net::connection_pool::{ConnectionPool, PooledProtocol};
-use crate::net::cookie::{parse_set_cookie, Cookie, CookieJar};
+use crate::net::cookie::{Cookie, CookieJar};
 use crate::net::dns::DnsResolver;
+use crate::net::http::chunked::ChunkedDecoder;
+use crate::net::http::conditional::{format_http_date, EntityTag};
+use crate::net::http::range::{format_range_header, ByteRangeSpec};
 use crate::net::http::compression::{self, CompressionAlgorithm, CompressionLevel};
 use crate::net::tcp::TcpStream;
 use std::collections::{HashMap, VecDeque};
-use std::io::{self, BufRead, BufReader, Read};
+use std::io::{self, BufRead, BufReader, Write};
 use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -25,6 +28,8 @@ const HTTP_CLIENT_PROFILE_BLOB_MAGIC: &str = "SINGULARITY_HTTP_CLIENT_PROFILE_BL
 const HTTP_CLIENT_PROFILE_BLOB_CONTEXT: &str = "SINGULARITY_HTTP_CLIENT_PROFILE_BLOB_BINDING_V1";
 
 const HAPPY_EYEBALLS_ATTEMPT_DELAY: Duration = Duration::from_millis(250);
+
+const EXPECT_CONTINUE_WAIT: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SecureHttpClientProfileMeta {
@@ -1208,7 +1213,7 @@ impl HttpClient {
             match self.send_to_address(request, addr) {
                 Ok(response) => {
                     if self.follow_redirects && response.is_redirect() {
-                        if let Some(location) = response.headers().get("Location") {
+                        if let Some(location) = response.header("Location") {
                             let redirect_request = self.build_redirect_request(request, location)?;
                             return self.send_with_redirects(&redirect_request, redirect_count + 1);
                         }
@@ -1274,7 +1279,7 @@ impl HttpClient {
 
         stream.flush().map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
         let mut reader = BufReader::new(&mut stream);
-        self.read_response(&mut reader)
+        self.read_response(&mut reader, request.method() == HttpMethod::HEAD)
     }
 
     pub fn send_pipelined(&mut self, requests: Vec<HttpRequest>) -> Result<Vec<HttpResponse>, io::Error> {
@@ -1335,63 +1340,8 @@ impl HttpClient {
         }
     }
 
-    fn read_response<R: BufRead>(&self, reader: &mut R) -> Result<HttpResponse, io::Error> {
-        let mut status_line = String::new();
-        reader.read_line(&mut status_line)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-
-        let parts: Vec<&str> = status_line.trim().split_whitespace().collect();
-        if parts.len() < 3 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Invalid status line",
-            ));
-        }
-
-        let version = match parts[0] {
-            "HTTP/1.0" => HttpVersion::Http10,
-            "HTTP/1.1" => HttpVersion::Http11,
-            "HTTP/2.0" => HttpVersion::Http2,
-            _ => HttpVersion::Http2,
-        };
-
-        let status_code: u16 = parts[1].parse().map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Invalid status code"))?;
-        let reason_phrase = parts[2..].join(" ");
-        let mut headers = HashMap::new();
-        loop {
-            let mut line = String::new();
-            reader.read_line(&mut line)?;
-            if line.trim().is_empty() {
-                break;
-            }
-
-            if let Some(pos) = line.find(':') {
-                let key = line[..pos].trim().to_string();
-                let value = line[pos + 1..].trim().to_string();
-                headers.insert(key, value);
-            }
-        }
-
-        let body = if let Some(content_length) = headers.get("Content-Length") {
-            let length: usize = content_length.parse().unwrap_or(0);
-            let mut body = vec![0u8; length];
-            reader.read_exact(&mut body)?;
-            body
-        } else if headers.get("Transfer-Encoding").map(|s| s.as_str()) == Some("chunked") {
-            read_chunked_body(reader)?
-        } else {
-            let mut body = Vec::new();
-            reader.read_to_end(&mut body)?;
-            body
-        };
-
-        Ok(HttpResponse::new(
-            status_code,
-            reason_phrase,
-            version,
-            headers,
-            body,
-        ))
+    fn read_response<R: BufRead>(&self, reader: &mut R, head_request: bool) -> Result<HttpResponse, io::Error> {
+        read_http1_response_from(reader, None, head_request)
     }
 
     fn send_request(&mut self, request: &HttpRequest, url: &str) -> io::Result<HttpResponse> {
@@ -1466,7 +1416,7 @@ impl HttpClient {
         let request_bytes = modified_request.build(host);
         conn.stream.write_all(&request_bytes)?;
         conn.stream.flush()?;
-        let response = self.read_http1_response(&mut conn.stream)?;
+        let response = self.read_http1_response(&mut conn.stream, request.method() == HttpMethod::HEAD)?;
         conn.mark_used();
         self.store_or_release_http1_connection(connection_key, conn, response.wants_keep_alive(), host, port);
 
@@ -1637,6 +1587,50 @@ impl HttpClient {
         self.send(&request)
     }
 
+    pub fn get_range(&mut self, url: &str, ranges: &[ByteRangeSpec]) -> io::Result<HttpResponse> {
+        let request = Self::range_request(url, ranges)?;
+        self.execute(request)
+    }
+
+    pub fn get_range_if(&mut self, url: &str, ranges: &[ByteRangeSpec], validator: &str) -> io::Result<HttpResponse> {
+        let mut request = Self::range_request(url, ranges)?;
+        request.set_header("If-Range", validator.to_string());
+        self.execute(request)
+    }
+
+    fn range_request(url: &str, ranges: &[ByteRangeSpec]) -> io::Result<HttpRequest> {
+        if ranges.is_empty() {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "at least one byte range is required"));
+        }
+
+        if let Some(ByteRangeSpec::FromTo(first, last)) = ranges.iter().find(|r| matches!(r, ByteRangeSpec::FromTo(f, l) if l < f)) {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("invalid byte range {}-{}", first, last)));
+        }
+
+        let mut request = HttpRequest::new(HttpMethod::GET, url);
+        request.set_header("Range", format_range_header(ranges));
+
+        Ok(request)
+    }
+
+    pub fn get_conditional(&mut self, url: &str, etag: Option<&EntityTag>, last_modified: Option<u64>) -> io::Result<HttpResponse> {
+        let mut request = HttpRequest::new(HttpMethod::GET, url);
+        if let Some(etag) = etag {
+            request.set_header("If-None-Match", etag.to_string());
+        }
+
+        if let Some(last_modified) = last_modified {
+            request.set_header("If-Modified-Since", format_http_date(last_modified));
+        }
+
+        self.execute(request)
+    }
+
+    pub fn revalidate(&mut self, url: &str, cached: &HttpResponse) -> io::Result<HttpResponse> {
+        let etag = cached.etag();
+        self.get_conditional(url, etag.as_ref(), cached.last_modified())
+    }
+
     fn add_cookies_to_request(&mut self, request: &mut HttpRequest) -> Result<(), io::Error> {
         let url = request.path();
         let (scheme, host, _port, path) = parse_url(url)?;
@@ -1655,25 +1649,10 @@ impl HttpClient {
             return Ok(());
         }
 
-        let (_scheme, host, _port, path) = parse_url(url)?;
-        for (key, value) in response.headers() {
-            if key.to_lowercase() == "set-cookie" {
-                match parse_set_cookie(value) {
-                    Ok(mut cookie) => {
-                        if cookie.domain().is_none() {
-                            cookie.set_domain(host.clone());
-                        }
-
-                        if cookie.path().is_none() {
-                            cookie.set_path(Some(path.clone()));
-                        }
-
-                        self.cookie_jar.add(cookie);
-                    }
-                    Err(e) => {
-                        eprintln!("Failed to parse Set-Cookie header: {}", e);
-                    }
-                }
+        let (scheme, host, _port, path) = parse_url(url)?;
+        for value in response.set_cookies() {
+            if let Err(e) = self.cookie_jar.store_set_cookie(value, &host, &path, scheme == "https") {
+                eprintln!("Ignoring Set-Cookie from {}: {}", host, e);
             }
         }
 
@@ -1707,7 +1686,7 @@ impl HttpClient {
         let response = self.execute_internal(request.clone())?;
         self.store_cookies_from_response(&response, &url)?;
         if self.follow_redirects && response.is_redirect() {
-            if let Some(location) = response.headers().get("Location") {
+            if let Some(location) = response.header("Location") {
                 let new_url = resolve_url(request.path(), location);
                 let new_request = HttpRequest::new(request.method().clone(), &new_url);
                 return self.execute_with_redirects(new_request, redirect_count + 1);
@@ -1729,7 +1708,7 @@ impl HttpClient {
         }?;
 
         self.store_negotiated_version(&url, negotiated_version);
-        if let Some(alt_svc) = response.headers().get("Alt-Svc") {
+        if let Some(alt_svc) = response.header("Alt-Svc") {
             self.process_alt_svc_header(&url, alt_svc);
         }
 
@@ -1782,93 +1761,87 @@ impl HttpClient {
             }
         }
 
+        let head_request = request.method() == HttpMethod::HEAD;
         if use_expect_continue {
             conn.stream.write_all(b"\r\n")?;
             conn.stream.flush()?;
-            let mut reader = BufReader::new(&conn.stream);
-            let mut status_line = String::new();
-            reader.read_line(&mut status_line)?;
-            let parts: Vec<&str> = status_line.trim().split_whitespace().collect();
-            if parts.len() >= 2 {
-                let status: u16 = parts[1].parse().unwrap_or(0);
-                if status == 100 {
-                    let mut line = String::new();
-                    reader.read_line(&mut line)?;
-                    conn.stream.write_all(request.body_bytes())?;
-                    conn.stream.flush()?;
-                } else if status >= 400 {
-                    drop(reader);
-                    let response = self.read_http1_response(&mut conn.stream)?;
-                    conn.mark_used();
-                    self.store_or_release_http1_connection(connection_key, conn, use_keep_alive && response.wants_keep_alive(), &host, port);
-                    return Ok(response);
-                }
-            }
-        } else {
-            conn.stream.write_all(b"\r\n")?;
-            let body = request.body_bytes();
-            if !body.is_empty() {
-                conn.stream.write_all(body)?;
-            }
-
-            conn.stream.flush()?;
+            let (response, body_sent) = self.await_continue_then_send(&conn.stream, request.body_bytes(), head_request)?;
+            conn.mark_used();
+            let reusable = body_sent && use_keep_alive && response.wants_keep_alive();
+            self.store_or_release_http1_connection(connection_key, conn, reusable, &host, port);
+            
+            return Ok(response);
         }
 
-        let response = self.read_http1_response(&mut conn.stream)?;
+        conn.stream.write_all(b"\r\n")?;
+        let body = request.body_bytes();
+        if !body.is_empty() {
+            conn.stream.write_all(body)?;
+        }
+
+        conn.stream.flush()?;
+        let response = self.read_http1_response(&mut conn.stream, head_request)?;
         conn.mark_used();
         self.store_or_release_http1_connection(connection_key, conn, use_keep_alive && response.wants_keep_alive(), &host, port);
         Ok(response)
     }
 
-    fn read_http1_response(&self, stream: &mut TcpStream) -> io::Result<HttpResponse> {
+    fn await_continue_then_send(&self, stream: &TcpStream, body: &[u8], head_request: bool) -> io::Result<(HttpResponse, bool)> {
+        stream.set_read_timeout(Some(self.timeout.map(|t| t.min(EXPECT_CONTINUE_WAIT)).unwrap_or(EXPECT_CONTINUE_WAIT)))?;
         let mut reader = BufReader::new(stream);
-        let mut status_line = String::new();
-        reader.read_line(&mut status_line)?;
-        let parts: Vec<&str> = status_line.trim().split_whitespace().collect();
-        if parts.len() < 2 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Invalid status line",
-            ));
-        }
-
-        let version = HttpVersion::from_str(parts[0]).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Invalid HTTP version"))?;
-        let status_code = parts[1].parse::<u16>().map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Invalid status code"))?;
-        let reason_phrase = parts.get(2..).map(|p| p.join(" ")).unwrap_or_default();
-        let mut headers = HashMap::new();
-        loop {
-            let mut line = String::new();
-            reader.read_line(&mut line)?;
-            if line.trim().is_empty() {
-                break;
+        let interim = loop {
+            let mut status_line = String::new();
+            match reader.read_line(&mut status_line) {
+                Ok(0) => {
+                    stream.set_read_timeout(self.timeout)?;
+                    return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "connection closed while awaiting 100 Continue"));
+                }
+                Ok(_) => match status_code_of(&status_line) {
+                    Some(100) => {
+                        Self::skip_header_block(&mut reader)?;
+                        break None;
+                    }
+                    Some(code) if (100..200).contains(&code) && code != 101 => Self::skip_header_block(&mut reader)?,
+                    _ => break Some(status_line),
+                },
+                Err(e) if matches!(e.kind(), io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock) && status_line.is_empty() => break None,
+                Err(e) => {
+                    stream.set_read_timeout(self.timeout)?;
+                    return Err(e);
+                }
             }
-
-            if let Some((key, value)) = line.split_once(':') {
-                headers.insert(key.trim().to_lowercase(), value.trim().to_string());
-            }
-        }
-
-        let body = if let Some(content_length_str) = headers.get("content-length") {
-            let content_length = content_length_str.parse::<usize>().map_err(|_| {
-                io::Error::new(io::ErrorKind::InvalidData, "Invalid content-length")
-            })?;
-
-            let mut body = vec![0u8; content_length];
-            reader.read_exact(&mut body)?;
-            body
-        } else if headers.get("transfer-encoding").map(|v| v.as_str()) == Some("chunked") {
-            read_chunked_body(&mut reader)?
-        } else {
-            Vec::new()
         };
 
-        Ok(HttpResponse::new(
-            status_code,
-            reason_phrase,
-            version,
-            headers,
-            body,
-        ))
+        stream.set_read_timeout(self.timeout)?;
+        if let Some(final_status_line) = interim {
+            let response = read_http1_response_from(&mut reader, Some(final_status_line), head_request)?;
+            return Ok((response, false));
+        }
+
+        let mut writer = stream;
+        writer.write_all(body)?;
+        writer.flush()?;
+        let response = read_http1_response_from(&mut reader, None, head_request)?;
+        
+        Ok((response, true))
+    }
+
+    fn skip_header_block<R: BufRead>(reader: &mut R) -> io::Result<()> {
+        loop {
+            let mut line = String::new();
+            if reader.read_line(&mut line)? == 0 {
+                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "connection closed inside an interim response"));
+            }
+
+            if line.trim().is_empty() {
+                return Ok(());
+            }
+        }
+    }
+
+    fn read_http1_response(&self, stream: &mut TcpStream, head_request: bool) -> io::Result<HttpResponse> {
+        let mut reader = BufReader::new(stream);
+        read_http1_response_from(&mut reader, None, head_request)
     }
 
     fn execute_http2(&mut self, request: HttpRequest) -> Result<HttpResponse, io::Error> {
@@ -2774,39 +2747,84 @@ fn resolve_url(base: &str, relative: &str) -> String {
 }
 
 fn read_chunked_body<R: BufRead>(reader: &mut R) -> Result<Vec<u8>, io::Error> {
-    let mut body = Vec::new();
-    loop {
-        let mut size_line = String::new();
-        reader.read_line(&mut size_line)?;
+    ChunkedDecoder::new(reader).decode()
+}
 
-        let size_str = size_line.trim().split(';').next().unwrap_or("0");
-        let chunk_size = usize::from_str_radix(size_str, 16).map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Invalid chunk size"))?;
-        if chunk_size == 0 {
-            break;
+fn read_http1_response_from<R: BufRead>(reader: &mut R, mut status_line: Option<String>, head_request: bool) -> io::Result<HttpResponse> {
+    loop {
+        let line = match status_line.take() {
+            Some(line) => line,
+            None => {
+                let mut line = String::new();
+                if reader.read_line(&mut line)? == 0 {
+                    return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "connection closed before a response"));
+                }
+
+                line
+            }
+        };
+
+        let mut parts = line.trim_end_matches(['\r', '\n']).splitn(3, ' ');
+        let version = parts.next().and_then(HttpVersion::from_str).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Invalid HTTP version"))?;
+        let status_code = parts.next().and_then(|s| s.parse::<u16>().ok()).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Invalid status code"))?;
+        let reason_phrase = parts.next().unwrap_or("").to_string();
+
+        let mut fields = Vec::new();
+        loop {
+            let mut header_line = String::new();
+            if reader.read_line(&mut header_line)? == 0 {
+                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "connection closed inside response headers"));
+            }
+
+            let header_line = header_line.trim_end_matches(['\r', '\n']);
+            if header_line.is_empty() {
+                break;
+            }
+
+            if let Some((name, value)) = header_line.split_once(':') {
+                fields.push((name.trim().to_string(), value.trim().to_string()));
+            }
         }
 
-        let mut chunk = vec![0u8; chunk_size];
-        reader.read_exact(&mut chunk)?;
-        body.extend_from_slice(&chunk);
-
-        let mut crlf = [0u8; 2];
-        reader.read_exact(&mut crlf)?;
-    }
-
-    loop {
-        let mut line = String::new();
-        reader.read_line(&mut line)?;
-        if line.trim().is_empty() {
-            break;
+        if (100..200).contains(&status_code) && status_code != 101 {
+            continue;
         }
-    }
 
-    Ok(body)
+        let field = |name: &str| fields.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.as_str());
+        let chunked = fields.iter()
+            .filter(|(k, _)| k.eq_ignore_ascii_case("transfer-encoding"))
+            .flat_map(|(_, v)| v.split(','))
+            .last()
+            .map(|coding| coding.trim().eq_ignore_ascii_case("chunked"))
+            .unwrap_or(false);
+
+        let body = if head_request || (100..200).contains(&status_code) || status_code == 204 || status_code == 304 {
+            Vec::new()
+        } else if chunked {
+            read_chunked_body(reader)?
+        } else if let Some(length) = field("content-length") {
+            let length = length.parse::<usize>().map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Invalid content-length"))?;
+            let mut body = vec![0u8; length];
+            reader.read_exact(&mut body)?;
+            body
+        } else {
+            let mut body = Vec::new();
+            reader.read_to_end(&mut body)?;
+            body
+        };
+
+        return Ok(HttpResponse::with_fields(status_code, reason_phrase, version, fields, body));
+    }
+}
+
+fn status_code_of(status_line: &str) -> Option<u16> {
+    status_line.split(' ').nth(1).and_then(|code| code.trim().parse().ok())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Read;
 
     #[test]
     fn test_parse_url() {
@@ -2847,6 +2865,154 @@ mod tests {
 
         let result = race_connect(&addresses, addr.port(), Duration::from_millis(500));
         assert!(result.is_ok(), "expected the reachable address to win the race: {:?}", result.err());
+    }
+
+    fn scripted_server<F>(script: F) -> (String, std::thread::JoinHandle<()>)
+    where
+        F: FnOnce(TcpStream, BufReader<TcpStream>) + Send + 'static,
+    {
+        let listener = crate::net::tcp::TcpListener::bind("127.0.0.1:0").expect("bind must succeed");
+        let addr = listener.local_addr().expect("local_addr must succeed");
+        let handle = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept must succeed");
+            let reader = BufReader::new(stream.try_clone().expect("clone must succeed"));
+            script(stream, reader);
+        });
+
+        (format!("http://{}", addr), handle)
+    }
+
+    fn read_request_head<R: BufRead>(reader: &mut R) -> String {
+        let mut head = String::new();
+        loop {
+            let mut line = String::new();
+            let n = reader.read_line(&mut line).expect("read_line must succeed");
+            if n == 0 || line == "\r\n" {
+                return head.to_ascii_lowercase();
+            }
+
+            head.push_str(&line);
+        }
+    }
+
+    fn content_length_of(head: &str) -> usize {
+        head.lines().find_map(|l| l.strip_prefix("content-length:")).map(|v| v.trim().parse().unwrap()).unwrap_or(0)
+    }
+
+    #[test]
+    fn test_expect_continue_sends_body_after_100() {
+        let (base, server) = scripted_server(|mut stream, mut reader| {
+            let head = read_request_head(&mut reader);
+            assert!(head.contains("expect: 100-continue"));
+            stream.write_all(b"HTTP/1.1 100 Continue\r\n\r\n").unwrap();
+            let mut body = vec![0u8; content_length_of(&head)];
+            reader.read_exact(&mut body).unwrap();
+            stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).as_bytes()).unwrap();
+            stream.write_all(&body).unwrap();
+        });
+
+        let mut client = HttpClient::new();
+        client.expect_100_continue_threshold = 4;
+        let response = client.post(&format!("{}/upload", base), b"payload".to_vec()).unwrap();
+        assert_eq!(response.status_code(), 200);
+        assert_eq!(response.body(), b"payload");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn test_expect_continue_returns_final_status_sent_instead_of_100() {
+        let (base, server) = scripted_server(|mut stream, mut reader| {
+            read_request_head(&mut reader);
+            stream.write_all(b"HTTP/1.1 413 Content Too Large\r\nContent-Length: 4\r\nConnection: close\r\n\r\nnope").unwrap();
+        });
+
+        let mut client = HttpClient::new();
+        client.expect_100_continue_threshold = 4;
+        let response = client.post(&format!("{}/upload", base), vec![b'x'; 64]).unwrap();
+        assert_eq!(response.status_code(), 413);
+        assert_eq!(response.body(), b"nope");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn test_expect_continue_sends_body_when_server_ignores_expectation() {
+        let (base, server) = scripted_server(|mut stream, mut reader| {
+            let head = read_request_head(&mut reader);
+            let mut body = vec![0u8; content_length_of(&head)];
+            reader.read_exact(&mut body).unwrap();
+            stream.write_all(b"HTTP/1.1 201 Created\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+        });
+
+        let mut client = HttpClient::new();
+        client.expect_100_continue_threshold = 4;
+        let started = Instant::now();
+        let response = client.post(&format!("{}/upload", base), b"payload".to_vec()).unwrap();
+        assert_eq!(response.status_code(), 201);
+        assert!(started.elapsed() < Duration::from_secs(10), "client should stop waiting for 100 after a short delay");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn test_client_skips_interim_responses_and_stores_every_set_cookie() {
+        let (base, server) = scripted_server(|mut stream, mut reader| {
+            read_request_head(&mut reader);
+            stream.write_all(
+                b"HTTP/1.1 103 Early Hints\r\nLink: </style.css>; rel=preload\r\n\r\n\
+                  HTTP/1.1 200 OK\r\nSet-Cookie: a=1; Path=/\r\nSet-Cookie: b=2; Path=/\r\nSet-Cookie: __Host-c=3; Path=/\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+            ).unwrap();
+        });
+
+        let mut client = HttpClient::new();
+        let response = client.get(&format!("{}/", base)).unwrap();
+        assert_eq!(response.status_code(), 200);
+        assert_eq!(response.body(), b"ok");
+        assert_eq!(response.set_cookies().len(), 3);
+
+        let jar = client.cookie_jar();
+        assert_eq!(jar.get("a").unwrap().value(), "1");
+        assert_eq!(jar.get("b").unwrap().value(), "2");
+        assert!(jar.get("a").unwrap().is_host_only());
+        assert!(jar.get("__Host-c").is_none());
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn test_get_range_sends_range_and_if_range() {
+        let (base, server) = scripted_server(|mut stream, mut reader| {
+            let head = read_request_head(&mut reader);
+            assert!(head.contains("range: bytes=0-3,-2\r\n"), "{}", head);
+            assert!(head.contains("if-range: \"v1\"\r\n"), "{}", head);
+            stream.write_all(b"HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-3/10\r\nContent-Length: 4\r\nConnection: close\r\n\r\nabcd").unwrap();
+        });
+
+        let mut client = HttpClient::new();
+        let response = client.get_range_if(&format!("{}/file", base), &[ByteRangeSpec::FromTo(0, 3), ByteRangeSpec::Suffix(2)], "\"v1\"").unwrap();
+        assert!(response.is_partial());
+        let parts = response.byte_ranges().unwrap();
+        assert_eq!(parts[0].data, b"abcd");
+        server.join().unwrap();
+
+        assert!(client.get_range("http://127.0.0.1:1/", &[]).is_err());
+        assert!(client.get_range("http://127.0.0.1:1/", &[ByteRangeSpec::FromTo(5, 1)]).is_err());
+    }
+
+    #[test]
+    fn test_get_conditional_sends_validators_and_reads_bodyless_304() {
+        let (base, server) = scripted_server(|mut stream, mut reader| {
+            let head = read_request_head(&mut reader);
+            assert!(head.contains("if-none-match: \"v1\"\r\n"), "{}", head);
+            assert!(head.contains("if-modified-since: sun, 06 nov 1994 08:49:37 gmt\r\n"), "{}", head);
+            stream.write_all(b"HTTP/1.1 304 Not Modified\r\nETag: \"v1\"\r\n\r\n").unwrap();
+            let mut rest = Vec::new();
+            let _ = reader.read_to_end(&mut rest);
+        });
+
+        let mut client = HttpClient::new();
+        let response = client.get_conditional(&format!("{}/file", base), Some(&EntityTag::strong("v1")), Some(784_111_777)).unwrap();
+        assert!(response.is_not_modified());
+        assert_eq!(response.etag(), Some(EntityTag::strong("v1")));
+        drop(client);
+        server.join().unwrap();
     }
 
     #[test]

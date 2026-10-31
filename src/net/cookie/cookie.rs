@@ -12,6 +12,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const COOKIE_BLOB_MAGIC: &str = "SINGULARITY_COOKIE_BLOB_V1";
 const COOKIE_BLOB_CONTEXT: &str = "SINGULARITY_COOKIE_BLOB_BINDING_V1";
 
+pub const SECURE_PREFIX: &str = "__Secure-";
+pub const HOST_PREFIX: &str = "__Host-";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SecureCookieBlobMeta {
     pub algorithm: CompressionAlgorithm,
@@ -41,6 +44,13 @@ pub struct Cookie {
     secure: bool,
     http_only: bool,
     same_site: Option<SameSite>,
+    host_only: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CookiePrefix {
+    Secure,
+    Host,
 }
 
 impl Cookie {
@@ -55,7 +65,54 @@ impl Cookie {
             secure: false,
             http_only: false,
             same_site: None,
+            host_only: false,
         }
+    }
+
+    pub fn prefix(&self) -> Option<CookiePrefix> {
+        let starts_with = |prefix: &str| {
+            self.name.len() >= prefix.len() && self.name.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes())
+        };
+
+        if starts_with(HOST_PREFIX) {
+            Some(CookiePrefix::Host)
+        } else if starts_with(SECURE_PREFIX) {
+            Some(CookiePrefix::Secure)
+        } else {
+            None
+        }
+    }
+
+    pub fn validate_prefix(&self) -> Result<(), String> {
+        match self.prefix() {
+            None => Ok(()),
+            Some(CookiePrefix::Secure) => {
+                if self.secure {
+                    Ok(())
+                } else {
+                    Err(format!("cookie '{}' uses the __Secure- prefix without the Secure attribute", self.name))
+                }
+            }
+            Some(CookiePrefix::Host) => {
+                if !self.secure {
+                    Err(format!("cookie '{}' uses the __Host- prefix without the Secure attribute", self.name))
+                } else if self.path.as_deref() != Some("/") {
+                    Err(format!("cookie '{}' uses the __Host- prefix without Path=/", self.name))
+                } else if self.domain.is_some() && !self.host_only {
+                    Err(format!("cookie '{}' uses the __Host- prefix with a Domain attribute", self.name))
+                } else {
+                    Ok(())
+                }
+            }
+        }
+    }
+
+    pub fn is_host_only(&self) -> bool {
+        self.host_only
+    }
+
+    pub fn set_host_only(&mut self, host_only: bool) {
+        self.host_only = host_only;
     }
 
     pub fn name(&self) -> &str {
@@ -141,9 +198,8 @@ impl Cookie {
 
     pub fn matches_domain(&self, domain: &str) -> bool {
         match &self.domain {
-            Some(cookie_domain) => {
-                domain == cookie_domain || domain.ends_with(&format!(".{}", cookie_domain))
-            }
+            Some(cookie_domain) if self.host_only => domain.eq_ignore_ascii_case(cookie_domain),
+            Some(cookie_domain) => domain_match(domain, cookie_domain),
             None => true,
         }
     }
@@ -305,7 +361,7 @@ fn serialize_cookie(cookie: &Cookie) -> Vec<u8> {
     };
 
     let payload = format!(
-        "name={name}\nvalue={value}\ndomain={domain}\npath={path}\nexpires={expires}\nmax-age={max_age}\nsecure={secure}\nhttp-only={http_only}\nsame-site={same_site}\n",
+        "name={name}\nvalue={value}\ndomain={domain}\npath={path}\nexpires={expires}\nmax-age={max_age}\nsecure={secure}\nhttp-only={http_only}\nsame-site={same_site}\nhost-only={host_only}\n",
         name = pem::encode(cookie.name.as_bytes()),
         value = pem::encode(cookie.value.as_bytes()),
         domain = domain_b64,
@@ -315,6 +371,7 @@ fn serialize_cookie(cookie: &Cookie) -> Vec<u8> {
         secure = if cookie.secure { "1" } else { "0" },
         http_only = if cookie.http_only { "1" } else { "0" },
         same_site = same_site,
+        host_only = if cookie.host_only { "1" } else { "0" },
     );
 
     payload.into_bytes()
@@ -411,6 +468,10 @@ fn deserialize_cookie(raw_payload: &[u8]) -> io::Result<Cookie> {
 
     if let Some(http_only_str) = values.get("http-only") {
         cookie.set_http_only(parse_bool(http_only_str)?);
+    }
+
+    if let Some(host_only_str) = values.get("host-only") {
+        cookie.set_host_only(parse_bool(host_only_str)?);
     }
 
     if let Some(same_site_str) = values.get("same-site") {
@@ -590,10 +651,17 @@ fn parse_secure_cookie_meta(header: &str, body_len: usize) -> io::Result<SecureC
     })
 }
 
+pub fn domain_match(host: &str, domain: &str) -> bool {
+    let (host, domain) = (host.as_bytes(), domain.as_bytes());
+    host.eq_ignore_ascii_case(domain) || (host.len() > domain.len() 
+        && host[host.len() - domain.len() - 1] == b'.'
+        && host[host.len() - domain.len()..].eq_ignore_ascii_case(domain))
+}
+
 impl fmt::Display for Cookie {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}={}", self.name, self.value)?;
-        if let Some(domain) = &self.domain {
+        if let Some(domain) = self.domain.as_ref().filter(|_| !self.host_only) {
             write!(f, "; Domain={}", domain)?;
         }
 

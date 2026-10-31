@@ -1,5 +1,5 @@
-use super::cookie::Cookie;
-use super::parser::parse_set_cookie;
+use super::cookie::{domain_match, Cookie};
+use super::parser::{parse_set_cookie, ParseError};
 use crate::crypto::constant_time_eq;
 use crate::crypto::encoding::pem;
 use crate::crypto::hash::hmac::hmac_sha256;
@@ -12,6 +12,19 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const COOKIE_JAR_SNAPSHOT_MAGIC: &str = "SINGULARITY_COOKIE_JAR_SNAPSHOT_V2";
 const COOKIE_JAR_SNAPSHOT_CONTEXT: &str = "SINGULARITY_COOKIE_JAR_SNAPSHOT_BINDING_V2";
+const SNAPSHOT_HOST_ONLY_ATTRIBUTE: &str = "X-Singularity-Host-Only";
+
+fn default_cookie_path(request_path: &str) -> String {
+    let path = request_path.split(['?', '#']).next().unwrap_or("");
+    if !path.starts_with('/') {
+        return "/".to_string();
+    }
+
+    match path.rfind('/') {
+        Some(0) | None => "/".to_string(),
+        Some(idx) => path[..idx].to_string(),
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CookieJarSnapshotMeta {
@@ -38,8 +51,74 @@ impl CookieJar {
     }
 
     pub fn add(&mut self, cookie: Cookie) {
+        let _ = self.try_add(cookie);
+    }
+
+    pub fn try_add(&mut self, cookie: Cookie) -> Result<(), ParseError> {
+        cookie.validate_prefix().map_err(ParseError::PrefixViolation)?;
         let key = self.make_key(&cookie);
         self.cookies.insert(key, cookie);
+
+        Ok(())
+    }
+
+    pub fn store_set_cookie(&mut self, set_cookie: &str, request_host: &str, request_path: &str, secure_origin: bool) -> Result<(), ParseError> {
+        let mut cookie = parse_set_cookie(set_cookie)?;
+        if !secure_origin {
+            if cookie.prefix().is_some() {
+                return Err(ParseError::Rejected(format!(
+                    "prefixed cookie '{}' set from an insecure origin",
+                    cookie.name()
+                )));
+            }
+
+            if cookie.is_secure() {
+                return Err(ParseError::Rejected(format!(
+                    "Secure cookie '{}' set from an insecure origin",
+                    cookie.name()
+                )));
+            }
+        }
+
+        let request_host = request_host.trim_end_matches('.').to_ascii_lowercase();
+        match cookie.domain().map(str::to_string) {
+            Some(domain) => {
+                if !domain_match(&request_host, &domain) {
+                    return Err(ParseError::Rejected(format!(
+                        "Domain={} does not domain-match request host {}",
+                        domain, request_host
+                    )));
+                }
+            }
+            None => {
+                cookie.set_domain(request_host);
+                cookie.set_host_only(true);
+            }
+        }
+
+        if !cookie.path().map(|p| p.starts_with('/')).unwrap_or(false) {
+            cookie.set_path(Some(default_cookie_path(request_path)));
+        }
+
+        self.try_add(cookie)
+    }
+
+    pub(crate) fn snapshot_line(cookie: &Cookie) -> String {
+        match cookie.domain().filter(|_| cookie.is_host_only()) {
+            Some(host) => format!("{}; {}={}", cookie, SNAPSHOT_HOST_ONLY_ATTRIBUTE, host),
+            None => cookie.to_string(),
+        }
+    }
+
+    pub(crate) fn parse_snapshot_line(line: &str) -> Result<Cookie, ParseError> {
+        let mut cookie = parse_set_cookie(line)?;
+        let marker = format!("{}=", SNAPSHOT_HOST_ONLY_ATTRIBUTE);
+        if let Some(host) = line.split(';').map(str::trim).find_map(|attr| attr.strip_prefix(marker.as_str())) {
+            cookie.set_domain(host.to_string());
+            cookie.set_host_only(true);
+        }
+
+        Ok(cookie)
     }
 
     pub fn get(&self, name: &str) -> Option<&Cookie> {
@@ -268,7 +347,7 @@ impl CookieJar {
         entries.sort_by(|(a, _), (b, _)| a.cmp(b));
         let mut lines = Vec::with_capacity(entries.len());
         for (_, cookie) in entries {
-            lines.push(cookie.to_string());
+            lines.push(Self::snapshot_line(cookie));
         }
 
         lines.join("\n").into_bytes()
@@ -290,7 +369,7 @@ impl CookieJar {
                 continue;
             }
 
-            let cookie = parse_set_cookie(line).map_err(|e| {
+            let cookie = Self::parse_snapshot_line(line).map_err(|e| {
                 io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!("failed to parse cookie snapshot line: {}", e),
@@ -509,6 +588,106 @@ impl Extend<Cookie> for CookieJar {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_parse_rejects_secure_prefix_without_secure() {
+        assert!(matches!(parse_set_cookie("__Secure-id=1; Path=/"), Err(ParseError::PrefixViolation(_))));
+        assert!(parse_set_cookie("__Secure-id=1; Secure").is_ok());
+        assert!(matches!(parse_set_cookie("__secure-id=1"), Err(ParseError::PrefixViolation(_))));
+    }
+
+    #[test]
+    fn test_parse_enforces_host_prefix_requirements() {
+        assert!(parse_set_cookie("__Host-id=1; Secure; Path=/").is_ok());
+        for header in [
+            "__Host-id=1; Path=/",
+            "__Host-id=1; Secure",
+            "__Host-id=1; Secure; Path=/app",
+            "__Host-id=1; Secure; Path=/; Domain=example.com",
+            "__HOST-id=1; Path=/",
+        ] {
+            assert!(
+                matches!(parse_set_cookie(header), Err(ParseError::PrefixViolation(_))),
+                "{} should be rejected",
+                header
+            );
+        }
+    }
+
+    #[test]
+    fn test_add_drops_prefix_violations() {
+        let mut jar = CookieJar::new();
+        jar.add(Cookie::new("__Secure-id", "1"));
+        jar.add(Cookie::new("__Host-id", "1"));
+        assert!(jar.is_empty());
+        assert!(matches!(jar.try_add(Cookie::new("__Secure-id", "1")), Err(ParseError::PrefixViolation(_))));
+
+        let mut ok = Cookie::new("__Secure-id", "1");
+        ok.set_secure(true);
+        assert!(jar.try_add(ok).is_ok());
+        assert_eq!(jar.len(), 1);
+    }
+
+    #[test]
+    fn test_store_host_prefix_cookie_is_host_only() {
+        let mut jar = CookieJar::new();
+        jar.store_set_cookie("__Host-sid=abc; Secure; Path=/", "app.example.com", "/login", true).unwrap();
+
+        let cookie = jar.get("__Host-sid").unwrap();
+        assert!(cookie.is_host_only());
+        assert_eq!(cookie.domain(), Some("app.example.com"));
+        assert_eq!(jar.cookie_header("app.example.com", "/", true), Some("__Host-sid=abc".to_string()));
+        assert_eq!(jar.cookie_header("evil.app.example.com", "/", true), None);
+        assert!(!cookie.to_string().contains("Domain="));
+    }
+
+    #[test]
+    fn test_store_rejects_prefixed_or_secure_cookie_from_insecure_origin() {
+        let mut jar = CookieJar::new();
+        for header in ["__Secure-id=1; Secure", "__Host-id=1; Secure; Path=/", "plain=1; Secure"] {
+            assert!(matches!(
+                jar.store_set_cookie(header, "example.com", "/", false),
+                Err(ParseError::Rejected(_))
+            ));
+        }
+
+        assert!(jar.is_empty());
+        jar.store_set_cookie("plain=1", "example.com", "/", false).unwrap();
+        assert_eq!(jar.len(), 1);
+    }
+
+    #[test]
+    fn test_store_rejects_foreign_domain_and_defaults_path() {
+        let mut jar = CookieJar::new();
+        assert!(matches!(
+            jar.store_set_cookie("a=1; Domain=bank.com", "evil.com", "/", true),
+            Err(ParseError::Rejected(_))
+        ));
+        assert!(matches!(
+            jar.store_set_cookie("a=1; Domain=ample.com", "example.com", "/", true),
+            Err(ParseError::Rejected(_))
+        ));
+
+        jar.store_set_cookie("b=2; Domain=.Example.com", "www.example.com", "/docs/page.html", true).unwrap();
+        let cookie = jar.get("b").unwrap();
+        assert_eq!(cookie.domain(), Some("example.com"));
+        assert!(!cookie.is_host_only());
+        assert_eq!(cookie.path(), Some("/docs"));
+        assert!(cookie.matches_domain("api.example.com"));
+    }
+
+    #[test]
+    fn test_snapshot_preserves_host_only_cookies() {
+        let mut jar = CookieJar::new();
+        jar.store_set_cookie("__Host-sid=abc; Secure; Path=/", "example.com", "/", true).unwrap();
+
+        let (_, blob) = jar.export_secure_snapshot(CompressionAlgorithm::Identity).unwrap();
+        let (_, restored) = CookieJar::import_secure_snapshot(&blob).unwrap();
+        let cookie = restored.get("__Host-sid").unwrap();
+        assert!(cookie.is_host_only());
+        assert_eq!(cookie.domain(), Some("example.com"));
+        assert!(!cookie.matches_domain("sub.example.com"));
+    }
 
     #[test]
     fn test_add_and_get_cookie() {

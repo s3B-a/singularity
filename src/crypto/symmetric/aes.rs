@@ -409,7 +409,14 @@ impl AesOptimized {
      */
     pub fn encrypt_block(&self, plaintext: &[u8; 16]) -> [u8; 16] {
         if self.use_hardware && cfg!(any(target_arch = "x86", target_arch = "x86_64")) {
-            self.encrypt_block_aes_ni(plaintext)
+            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+            {
+                self.encrypt_block_aes_ni(plaintext)
+            }
+            #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+            {
+                self.encrypt_block_software(plaintext)
+            }
         } else if self.use_hardware && cfg!(target_arch = "aarch64") {
             #[cfg(target_arch = "aarch64")]
             {

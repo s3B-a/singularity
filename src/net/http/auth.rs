@@ -71,6 +71,12 @@ pub struct DigestChallenge {
     pub stale: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DigestAlgorithm {
+    Md5,
+    Sha256,
+}
+
 #[derive(Debug, Clone)]
 pub enum AuthChallenge {
     Basic { realm: String },
@@ -359,54 +365,28 @@ impl Authenticator {
             None
         };
 
-        let ha1 = match challenge.algorithm.to_uppercase().as_str() {
-            "MD5-SESS" => {
-                let h1 = Self::hash_with_algo(
-                    &challenge.algorithm,
-                    &format!("{}:{}:{}", creds.username, challenge.realm, creds.password),
-                );
-                Self::hash_with_algo(
-                    &challenge.algorithm,
-                    &format!("{}:{}:{}", h1, challenge.nonce, cnonce),
-                )
-            }
-            "MD5" | "" => Self::hash_with_algo(
-                &challenge.algorithm,
-                &format!("{}:{}:{}", creds.username, challenge.realm, creds.password),
-            ),
-            "SHA-256" | "SHA-256-SESS" => {
-                let hash = sha256(
-                    format!("{}:{}:{}", creds.username, challenge.realm, creds.password)
-                        .as_bytes(),
-                );
-                hex::encode(&hash)
-            }
-            algo => {
-                return Err(AuthError::UnsupportedScheme(format!(
-                    "Unsupported algorithm: {}",
-                    algo
-                )));
-            }
-        };
+        let (digest_algorithm, session) = DigestAlgorithm::parse(&challenge.algorithm)?;
+        let hash = |input: &[u8]| digest_algorithm.hex_digest(input);
+
+        let mut ha1 = hash(format!("{}:{}:{}", creds.username, challenge.realm, creds.password).as_bytes());
+        if session {
+            ha1 = hash(format!("{}:{}:{}", ha1, challenge.nonce, cnonce).as_bytes());
+        }
 
         let ha2 = if qop == Some("auth-int") {
-            let body_hash = if let Some(body_data) = body {
-                Self::md5_hash(&hex::encode(body_data))
-            } else {
-                Self::md5_hash("")
-            };
-            Self::md5_hash(&format!("{}:{}:{}", method, uri, body_hash))
+            let body_hash = hash(body.unwrap_or_default());
+            hash(format!("{}:{}:{}", method, uri, body_hash).as_bytes())
         } else {
-            Self::md5_hash(&format!("{}:{}", method, uri))
+            hash(format!("{}:{}", method, uri).as_bytes())
         };
 
         let response = if let Some(qop_value) = qop {
-            Self::md5_hash(&format!(
+            hash(format!(
                 "{}:{}:{}:{}:{}:{}",
                 ha1, challenge.nonce, nc, cnonce, qop_value, ha2
-            ))
+            ).as_bytes())
         } else {
-            Self::md5_hash(&format!("{}:{}:{}", ha1, challenge.nonce, ha2))
+            hash(format!("{}:{}:{}", ha1, challenge.nonce, ha2).as_bytes())
         };
 
         let mut auth = format!(
@@ -437,21 +417,6 @@ impl Authenticator {
         });
 
         hex::encode(&random_bytes)
-    }
-
-    fn md5_hash(input: &str) -> String {
-        md5_hex(input.as_bytes())
-    }
-
-    fn hash_with_algo(algo: &str, input: &str) -> String {
-        match algo.to_uppercase().as_str() {
-            "MD5" | "MD5-SESS" | "" => md5_hex(input.as_bytes()),
-            "SHA-256" | "SHA-256-SESS" => {
-                let hash = sha256(input.as_bytes());
-                hex::encode(&hash)
-            }
-            _ => md5_hex(input.as_bytes()),
-        }
     }
 
     fn validate_domain(challenge: &DigestChallenge, uri: &str) -> bool {
@@ -890,6 +855,26 @@ impl fmt::Display for AuthError {
 
 impl std::error::Error for AuthError {}
 
+impl DigestAlgorithm {
+    fn parse(value: &str) -> Result<(Self, bool), AuthError> {
+        let value = value.trim();
+        match value.to_ascii_uppercase().as_str() {
+            "" | "MD5" => Ok((DigestAlgorithm::Md5, false)),
+            "MD5-SESS" => Ok((DigestAlgorithm::Md5, true)),
+            "SHA-256" => Ok((DigestAlgorithm::Sha256, false)),
+            "SHA-256-SESS" => Ok((DigestAlgorithm::Sha256, true)),
+            _ => Err(AuthError::UnsupportedScheme(format!("Unsupported algorithm: {}", value))),
+        }
+    }
+
+    fn hex_digest(self, input: &[u8]) -> String {
+        match self {
+            DigestAlgorithm::Md5 => md5_hex(input),
+            DigestAlgorithm::Sha256 => hex::encode(&sha256(input)),
+        }
+    }
+}
+
 mod hex {
     pub fn encode(bytes: &[u8]) -> String {
         bytes.iter().map(|b| format!("{:02x}", b)).collect()
@@ -971,6 +956,122 @@ mod tests {
         assert!(header.starts_with("Digest "));
         assert!(header.contains("username=\"Mufasa\""));
         assert!(header.contains("realm=\"testrealm@host.com\""));
+    }
+
+    fn digest_response_value(header: &str) -> String {
+        let start = header.find("response=\"").unwrap() + "response=\"".len();
+        header[start..start + header[start..].find('"').unwrap()].to_string()
+    }
+
+    fn rfc7616_challenge(algorithm: &str) -> AuthChallenge {
+        AuthChallenge::Digest(DigestChallenge {
+            realm: "http-auth@example.org".to_string(),
+            nonce: "7ypf/xlj9XXwfDPEoM4URrv/xwf94BcCAzFZH4GiTo0v".to_string(),
+            opaque: Some("FQhe/qaU925kfnzjCev0ciny7QMkPqMAFRtzCUYo5tdS".to_string()),
+            algorithm: algorithm.to_string(),
+            qop: Some(vec!["auth".to_string()]),
+            domain: None,
+            stale: false,
+        })
+    }
+
+    fn rfc7616_authenticator() -> Authenticator {
+        let mut auth = Authenticator::with_credentials(Credentials::new("Mufasa", "Circle of Life"));
+        auth.cnonce_cache = Some("f2/wE4q74E6zIJEtWaHKaf5wv/H5QzzpXusqGemxURZJ".to_string());
+        auth
+    }
+
+    #[test]
+    fn test_digest_auth_rfc2617_md5_vector() {
+        let mut auth = Authenticator::with_credentials(Credentials::new("Mufasa", "Circle Of Life"));
+        auth.cnonce_cache = Some("0a4f113b".to_string());
+        let challenge = AuthChallenge::Digest(DigestChallenge {
+            realm: "testrealm@host.com".to_string(),
+            nonce: "dcd98b7102dd2f0e8b11d0f600bfb0c093".to_string(),
+            opaque: Some("5ccc069c403ebaf9f0171e9517f40e41".to_string()),
+            algorithm: "MD5".to_string(),
+            qop: Some(vec!["auth".to_string(), "auth-int".to_string()]),
+            domain: None,
+            stale: false,
+        });
+
+        let header = auth.authorize(&challenge, "GET", "/dir/index.html").unwrap();
+        assert_eq!(digest_response_value(&header), "6629fae49393a05397450978507c4ef1");
+    }
+
+    #[test]
+    fn test_digest_auth_rfc7616_md5_vector() {
+        let mut auth = rfc7616_authenticator();
+        let header = auth.authorize(&rfc7616_challenge("MD5"), "GET", "/dir/index.html").unwrap();
+        assert_eq!(digest_response_value(&header), "8ca523f5e9506fed4657c9700eebdbec");
+    }
+
+    #[test]
+    fn test_digest_auth_rfc7616_sha256_vector() {
+        let mut auth = rfc7616_authenticator();
+        let header = auth.authorize(&rfc7616_challenge("SHA-256"), "GET", "/dir/index.html").unwrap();
+        assert_eq!(
+            digest_response_value(&header),
+            "753927fa0e85d155564e2e272a28d1802ca10daf4496794697cf8db5856cb6c1"
+        );
+        assert!(header.contains("algorithm=SHA-256"));
+    }
+
+    #[test]
+    fn test_digest_auth_sha256_sess_uses_session_ha1() {
+        let mut plain = rfc7616_authenticator();
+        let mut sess = rfc7616_authenticator();
+        let plain_header = plain.authorize(&rfc7616_challenge("SHA-256"), "GET", "/").unwrap();
+        let sess_header = sess.authorize(&rfc7616_challenge("SHA-256-sess"), "GET", "/").unwrap();
+
+        let creds = "Mufasa:http-auth@example.org:Circle of Life";
+        let base_ha1 = hex::encode(&sha256(creds.as_bytes()));
+        let ha1 = hex::encode(&sha256(format!(
+            "{}:7ypf/xlj9XXwfDPEoM4URrv/xwf94BcCAzFZH4GiTo0v:f2/wE4q74E6zIJEtWaHKaf5wv/H5QzzpXusqGemxURZJ",
+            base_ha1
+        ).as_bytes()));
+        let ha2 = hex::encode(&sha256(b"GET:/"));
+        let expected = hex::encode(&sha256(format!(
+            "{}:7ypf/xlj9XXwfDPEoM4URrv/xwf94BcCAzFZH4GiTo0v:00000001:f2/wE4q74E6zIJEtWaHKaf5wv/H5QzzpXusqGemxURZJ:auth:{}",
+            ha1, ha2
+        ).as_bytes()));
+
+        assert_eq!(digest_response_value(&sess_header), expected);
+        assert_ne!(digest_response_value(&plain_header), expected);
+    }
+
+    #[test]
+    fn test_digest_auth_int_hashes_raw_body_with_challenge_algorithm() {
+        let mut auth = rfc7616_authenticator();
+        let challenge = match rfc7616_challenge("SHA-256") {
+            AuthChallenge::Digest(mut d) => {
+                d.qop = Some(vec!["auth-int".to_string()]);
+                AuthChallenge::Digest(d)
+            }
+            other => other,
+        };
+
+        let body = b"hello";
+        let header = auth.authorize_with_body(&challenge, "POST", "/upload", Some(body)).unwrap();
+
+        let ha1 = hex::encode(&sha256(b"Mufasa:http-auth@example.org:Circle of Life"));
+        let ha2 = hex::encode(&sha256(format!("POST:/upload:{}", hex::encode(&sha256(body))).as_bytes()));
+        let expected = hex::encode(&sha256(format!(
+            "{}:7ypf/xlj9XXwfDPEoM4URrv/xwf94BcCAzFZH4GiTo0v:00000001:f2/wE4q74E6zIJEtWaHKaf5wv/H5QzzpXusqGemxURZJ:auth-int:{}",
+            ha1, ha2
+        ).as_bytes()));
+
+        assert!(header.contains("qop=auth-int"));
+        assert_eq!(digest_response_value(&header), expected);
+    }
+
+    #[test]
+    fn test_digest_auth_rejects_unknown_algorithm() {
+        let mut auth = rfc7616_authenticator();
+        assert!(matches!(
+            auth.authorize(&rfc7616_challenge("SHA-512-256"), "GET", "/"),
+            Err(AuthError::UnsupportedScheme(_))
+        ));
     }
 
     #[test]

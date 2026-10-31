@@ -1,4 +1,7 @@
 use super::compression::{self, CompressionAlgorithm, CompressionLevel};
+use super::conditional::{parse_http_date, EntityTag};
+use super::range::{parse_multipart_byteranges, BytePart, ContentRange};
+use super::status::StatusCode;
 use super::version::HttpVersion;
 use crate::crypto::constant_time_eq;
 use crate::crypto::encoding::pem;
@@ -27,25 +30,120 @@ pub struct HttpResponse {
     status_code: u16,
     reason_phrase: String,
     version: HttpVersion,
+    fields: Vec<(String, String)>,
     headers: HashMap<String, String>,
     body: Vec<u8>,
 }
 
 impl HttpResponse {
-    pub fn new(
-        status_code: u16,
-        reason_phrase: String,
-        version: HttpVersion,
-        headers: HashMap<String, String>,
-        body: Vec<u8>,
-    ) -> Self {
-        Self {
+    pub fn new(status_code: u16, reason_phrase: String, version: HttpVersion, headers: HashMap<String, String>, body: Vec<u8>) -> Self {
+        let mut fields: Vec<(String, String)> = headers.into_iter().collect();
+        fields.sort_by(|(a, _), (b, _)| a.to_ascii_lowercase().cmp(&b.to_ascii_lowercase()));
+        Self::with_fields(status_code, reason_phrase, version, fields, body)
+    }
+
+    pub fn with_fields(status_code: u16, reason_phrase: String, version: HttpVersion, fields: Vec<(String, String)>, body: Vec<u8>) -> Self {
+        let mut response = Self {
             status_code,
             reason_phrase,
             version,
-            headers,
+            fields,
+            headers: HashMap::new(),
             body,
+        };
+        response.rebuild_header_view();
+        response
+    }
+
+    pub fn header_fields(&self) -> &[(String, String)] {
+        &self.fields
+    }
+
+    pub fn header_values(&self, name: &str) -> Vec<&str> {
+        self.fields.iter().filter(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.as_str()).collect()
+    }
+
+    pub fn set_cookies(&self) -> Vec<&str> {
+        self.header_values("set-cookie")
+    }
+
+    pub fn append_header(&mut self, name: impl Into<String>, value: impl Into<String>) {
+        self.fields.push((name.into(), value.into()));
+        self.rebuild_header_view();
+    }
+
+    pub fn set_header(&mut self, name: impl Into<String>, value: impl Into<String>) {
+        let name = name.into();
+        let value = value.into();
+        match self.fields.iter().position(|(k, _)| k.eq_ignore_ascii_case(&name)) {
+            Some(first) => {
+                self.fields[first] = (name.clone(), value);
+                let mut idx = 0;
+                self.fields.retain(|(k, _)| {
+                    let keep = idx <= first || !k.eq_ignore_ascii_case(&name);
+                    idx += 1;
+                    keep
+                });
+            }
+            None => self.fields.push((name, value)),
         }
+
+        self.rebuild_header_view();
+    }
+
+    pub fn remove_header(&mut self, name: &str) -> Vec<String> {
+        let mut removed = Vec::new();
+        self.fields.retain(|(k, v)| {
+            if k.eq_ignore_ascii_case(name) {
+                removed.push(v.clone());
+                false
+            } else {
+                true
+            }
+        });
+
+        self.rebuild_header_view();
+        removed
+    }
+
+    pub fn has_header(&self, name: &str) -> bool {
+        self.fields.iter().any(|(k, _)| k.eq_ignore_ascii_case(name))
+    }
+
+    pub fn set_body(&mut self, body: Vec<u8>) {
+        self.body = body;
+    }
+
+    pub fn set_status(&mut self, status_code: u16, reason_phrase: impl Into<String>) {
+        self.status_code = status_code;
+        self.reason_phrase = reason_phrase.into();
+    }
+
+    pub fn into_body(self) -> Vec<u8> {
+        self.body
+    }
+
+    fn rebuild_header_view(&mut self) {
+        let mut view: HashMap<String, String> = HashMap::new();
+        let mut spelling: HashMap<String, String> = HashMap::new();
+        for (name, value) in &self.fields {
+            let lower = name.to_ascii_lowercase();
+            match spelling.get(&lower) {
+                Some(key) if lower != "set-cookie" => {
+                    if let Some(existing) = view.get_mut(key) {
+                        existing.push_str(", ");
+                        existing.push_str(value);
+                    }
+                }
+                Some(_) => {}
+                None => {
+                    spelling.insert(lower, name.clone());
+                    view.insert(name.clone(), value.clone());
+                }
+            }
+        }
+
+        self.headers = view;
     }
 
     pub fn status_code(&self) -> u16 {
@@ -92,6 +190,65 @@ impl HttpResponse {
         Self::get_header_case_insensitive(&self.headers, key)
     }
 
+    pub fn etag(&self) -> Option<EntityTag> {
+        self.header("ETag").and_then(|v| EntityTag::parse(v))
+    }
+
+    pub fn last_modified(&self) -> Option<u64> {
+        self.header("Last-Modified").and_then(|v| parse_http_date(v))
+    }
+
+    pub fn is_not_modified(&self) -> bool {
+        self.status_code == 304
+    }
+
+    pub fn is_partial(&self) -> bool {
+        self.status_code == 206
+    }
+
+    pub fn accepts_byte_ranges(&self) -> bool {
+        self.header("Accept-Ranges")
+            .map(|v| v.split(',').any(|unit| unit.trim().eq_ignore_ascii_case("bytes")))
+            .unwrap_or(false)
+    }
+
+    pub fn content_range(&self) -> Option<ContentRange> {
+        self.header("Content-Range").and_then(|v| ContentRange::parse(v))
+    }
+
+    pub fn byte_ranges(&self) -> Result<Vec<BytePart>, String> {
+        if self.status_code != 206 {
+            return Err(format!("status {} is not a partial response", self.status_code));
+        }
+
+        let content_type = self.header("Content-Type").cloned();
+        let boundary = content_type.as_deref().and_then(|ct| {
+            let (media_type, params) = ct.split_once(';')?;
+            if !media_type.trim().eq_ignore_ascii_case("multipart/byteranges") {
+                return None;
+            }
+
+            params.split(';').find_map(|p| {
+                let (name, value) = p.split_once('=')?;
+                name.trim().eq_ignore_ascii_case("boundary").then(|| value.trim().trim_matches('"').to_string())
+            })
+        });
+
+        match boundary {
+            Some(boundary) => parse_multipart_byteranges(&self.body, &boundary),
+            None => {
+                let content_range = self.content_range().ok_or("206 response without a valid Content-Range")?;
+                if let ContentRange::Bytes { range, .. } = content_range {
+                    if range.len() != self.body.len() as u64 {
+                        return Err(format!("Content-Range covers {} bytes but the body has {}", range.len(), self.body.len()));
+                    }
+                }
+
+                Ok(vec![BytePart { content_range, content_type, data: self.body.clone() }])
+            }
+        }
+    }
+
     pub fn to_secure_blob(&self, algorithm: CompressionAlgorithm) -> io::Result<(SecureHttpResponseBlobMeta, Vec<u8>)> {
         encode_secure_http_response(self, algorithm)
     }
@@ -113,11 +270,11 @@ impl HttpResponse {
             self.reason_phrase
         ));
 
-        for (key, value) in &self.headers {
+        for (key, value) in &self.fields {
             response.push_str(&format!("{}: {}\r\n", key, value));
         }
 
-        if !self.body.is_empty() && Self::get_header_case_insensitive(&self.headers, "content-length").is_none() {
+        if !self.body.is_empty() && !self.has_header("content-length") {
             response.push_str(&format!("Content-Length: {}\r\n", self.body.len()));
         }
 
@@ -156,7 +313,7 @@ impl HttpResponse {
             Self::default_reason_phrase(status_code)
         };
 
-        let mut headers = HashMap::new();
+        let mut fields = Vec::new();
         for line in lines {
             if line.is_empty() {
                 break;
@@ -165,12 +322,14 @@ impl HttpResponse {
             if let Some(colon_pos) = line.find(':') {
                 let name = line[..colon_pos].trim().to_string();
                 let value = line[colon_pos + 1..].trim().to_string();
-                headers.insert(name, value);
+                fields.push((name, value));
             } else {
                 return Err(format!("Invalid header line: {}", line));
             }
         }
 
+        let mut response = Self::with_fields(status_code, reason_phrase, version, fields, Vec::new());
+        let headers = &response.headers;
         let wire_body = if body_start < bytes.len() {
             if let Some(content_length_str) = Self::get_header_case_insensitive(&headers, "content-length") {
                 let content_length = content_length_str.parse::<usize>()
@@ -195,21 +354,16 @@ impl HttpResponse {
             Vec::new()
         };
 
-        Self::verify_digest_header(&headers, &wire_body)?;
+        Self::verify_digest_header(headers, &wire_body)?;
         let mut final_body = wire_body;
-        if let Some(content_encoding) = Self::get_header_case_insensitive(&headers, "content-encoding").cloned() {
+        if let Some(content_encoding) = Self::get_header_case_insensitive(headers, "content-encoding").cloned() {
             final_body = Self::decode_content_encoding(&content_encoding, &final_body)?;
-            headers.remove("content-encoding");
-            headers.insert("Content-Length".to_string(), final_body.len().to_string());
+            response.remove_header("content-encoding");
+            response.set_header("Content-Length", final_body.len().to_string());
         }
 
-        Ok(Self {
-            status_code,
-            reason_phrase,
-            version,
-            headers,
-            body: final_body,
-        })
+        response.body = final_body;
+        Ok(response)
     }
 
     fn decode_chunked(data: &[u8]) -> Result<Vec<u8>, String> {
@@ -295,30 +449,9 @@ impl HttpResponse {
     }
 
     pub fn default_reason_phrase(status_code: u16) -> String {
-        match status_code {
-            100 => "Continue",
-            101 => "Switching Protocols",
-            200 => "OK",
-            201 => "Created",
-            202 => "Accepted",
-            204 => "No Content",
-            301 => "Moved Permanently",
-            302 => "Found",
-            303 => "See Other",
-            304 => "Not Modified",
-            307 => "Temporary Redirect",
-            308 => "Permanent Redirect",
-            400 => "Bad Request",
-            401 => "Unauthorized",
-            403 => "Forbidden",
-            404 => "Not Found",
-            405 => "Method Not Allowed",
-            408 => "Request Timeout",
-            500 => "Internal Server Error",
-            501 => "Not Implemented",
-            502 => "Bad Gateway",
-            503 => "Service Unavailable",
-            _ => "Unknown",
+        match StatusCode::new(status_code).reason_phrase() {
+            "Unknown Status Code" => "Unknown",
+            phrase => phrase,
         }
         .to_string()
     }
@@ -643,7 +776,7 @@ impl std::fmt::Debug for HttpResponse {
             .field("status_code", &self.status_code)
             .field("reason_phrase", &self.reason_phrase)
             .field("version", &self.version)
-            .field("headers", &self.headers)
+            .field("headers", &self.fields)
             .field("body_len", &self.body.len())
             .finish()
     }
@@ -671,6 +804,67 @@ mod tests {
         assert_eq!(decoded.status_code(), 200);
         assert_eq!(decoded.reason_phrase(), "OK");
         assert_eq!(decoded.body(), b"hello");
+    }
+
+    #[test]
+    fn test_repeated_headers_roundtrip_and_combined_view() {
+        let mut response = HttpResponse::new(200, "OK".to_string(), HttpVersion::Http11, HashMap::new(), b"x".to_vec());
+        response.append_header("Set-Cookie", "a=1");
+        response.append_header("set-cookie", "b=2");
+        response.append_header("Cache-Control", "no-cache");
+        response.append_header("Cache-Control", "no-store");
+
+        assert_eq!(response.set_cookies(), vec!["a=1", "b=2"]);
+        assert_eq!(response.header("cache-control").map(String::as_str), Some("no-cache, no-store"));
+        assert_eq!(response.header("set-cookie").map(String::as_str), Some("a=1"));
+
+        let decoded = HttpResponse::from_bytes(&response.to_bytes()).unwrap();
+        assert_eq!(decoded.set_cookies(), vec!["a=1", "b=2"]);
+        assert_eq!(decoded.header_values("cache-control"), vec!["no-cache", "no-store"]);
+    }
+
+    #[test]
+    fn test_set_and_remove_header_replace_every_instance() {
+        let mut response = HttpResponse::new(200, "OK".to_string(), HttpVersion::Http11, HashMap::new(), Vec::new());
+        response.append_header("Vary", "Accept");
+        response.append_header("X-Other", "1");
+        response.append_header("vary", "Origin");
+
+        response.set_header("VARY", "*");
+        assert_eq!(response.header_values("vary"), vec!["*"]);
+        assert_eq!(response.header_fields()[0], ("VARY".to_string(), "*".to_string()));
+
+        assert_eq!(response.remove_header("x-other"), vec!["1".to_string()]);
+        assert!(!response.has_header("X-Other"));
+    }
+
+    #[test]
+    fn test_default_reason_phrase_covers_range_and_conditional_statuses() {
+        assert_eq!(HttpResponse::default_reason_phrase(206), "Partial Content");
+        assert_eq!(HttpResponse::default_reason_phrase(412), "Precondition Failed");
+        assert_eq!(HttpResponse::default_reason_phrase(416), "Range Not Satisfiable");
+        assert_eq!(HttpResponse::default_reason_phrase(431), "Request Header Fields Too Large");
+        assert_eq!(HttpResponse::default_reason_phrase(999), "Unknown");
+    }
+
+    #[test]
+    fn test_validator_and_range_accessors() {
+        let mut response = HttpResponse::new(206, "Partial Content".to_string(), HttpVersion::Http11, HashMap::new(), b"2345".to_vec());
+        response.set_header("ETag", "\"v1\"");
+        response.set_header("Last-Modified", "Sun, 06 Nov 1994 08:49:37 GMT");
+        response.set_header("Content-Range", "bytes 2-5/20");
+        response.set_header("Accept-Ranges", "bytes");
+
+        assert_eq!(response.etag(), Some(EntityTag::strong("v1")));
+        assert_eq!(response.last_modified(), Some(784_111_777));
+        assert!(response.is_partial() && response.accepts_byte_ranges());
+
+        let parts = response.byte_ranges().unwrap();
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0].data, b"2345");
+
+        response.set_header("Content-Range", "bytes 2-9/20");
+        assert!(response.byte_ranges().is_err());
     }
 
     #[test]
