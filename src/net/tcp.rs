@@ -1,10 +1,11 @@
-use super::socket::Socket;
 use crate::crypto::constant_time_eq;
 use crate::crypto::encoding::pem;
 use crate::crypto::hash::hmac::hmac_sha256;
 use crate::crypto::hash::sha2::sha256;
 use crate::crypto::random;
 use crate::net::http::compression::{self, CompressionAlgorithm, CompressionLevel};
+use super::socket::Socket;
+
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -46,151 +47,6 @@ pub struct TcpStream {
 
 pub struct TcpListener {
     socket: Socket,
-}
-
-pub fn select_secure_tcp_compression_algorithm(accept_encoding: &str) -> CompressionAlgorithm {
-    let accepted = compression::parse_accept_encoding(accept_encoding);
-    for (algorithm, quality) in accepted {
-        if quality > 0.0 && algorithm.is_implemented() && algorithm != CompressionAlgorithm::Identity {
-            return algorithm;
-        }
-    }
-
-    CompressionAlgorithm::Identity
-}
-
-pub fn encode_secure_tcp_frame(raw_payload: &[u8], security_cfg: &TcpSecurityCfg, compression_cfg: &TcpCompressionCfg) -> io::Result<(SecureTcpFrameMeta, Vec<u8>)> {
-    let mut selected_algorithm = CompressionAlgorithm::Identity;
-    if compression_cfg.enabled && raw_payload.len() >= compression_cfg.min_size {
-        if compression_cfg.algorithm.is_implemented() {
-            selected_algorithm = compression_cfg.algorithm;
-        }
-    }
-
-    let encoded_payload = if selected_algorithm == CompressionAlgorithm::Identity {
-        raw_payload.to_vec()
-    } else {
-        compression::compress(selected_algorithm, raw_payload, compression_cfg.level)?
-    };
-
-    let nonce = if security_cfg.enable_integrity {
-        random::generate_random(security_cfg.nonce_len.max(8)).map_err(|e| {
-            io::Error::new(
-                io::ErrorKind::Other,
-                format!("failed to generate tcp frame nonce: {}", e),
-            )
-        })?
-    } else {
-        Vec::new()
-    };
-
-    let digest = sha256(raw_payload);
-    let tag = if security_cfg.enable_integrity {
-        compute_frame_tag(&nonce, selected_algorithm, raw_payload.len(), &encoded_payload).to_vec()
-    } else {
-        Vec::new()
-    };
-
-    let issued_at_unix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
-    let meta = SecureTcpFrameMeta {
-        algorithm: selected_algorithm,
-        integrity_enabled: security_cfg.enable_integrity,
-        nonce_b64: if security_cfg.enable_integrity {
-            pem::encode(&nonce)
-        } else {
-            String::new()
-        },
-        digest_b64: pem::encode(&digest),
-        tag_b64: if security_cfg.enable_integrity {
-            pem::encode(&tag)
-        } else {
-            String::new()
-        },
-        raw_size: raw_payload.len(),
-        encoded_size: encoded_payload.len(),
-        issued_at_unix,
-    };
-
-    let header = format!(
-        "{magic}\ncontent-encoding={encoding}\nintegrity={integrity}\nnonce={nonce}\ndigest=SHA-256={digest}\ntag=HMAC-SHA-256={tag}\nraw-size={raw_size}\nencoded-size={encoded_size}\nissued-at={issued_at}\n\n",
-        magic = TCP_SECURE_FRAME_MAGIC,
-        encoding = meta.algorithm.content_encoding(),
-        integrity = if meta.integrity_enabled { "on" } else { "off" },
-        nonce = meta.nonce_b64,
-        digest = meta.digest_b64,
-        tag = meta.tag_b64,
-        raw_size = meta.raw_size,
-        encoded_size = meta.encoded_size,
-        issued_at = meta.issued_at_unix,
-    );
-
-    let mut out = header.into_bytes();
-    out.extend_from_slice(&encoded_payload);
-
-    Ok((meta, out))
-}
-
-pub fn decode_secure_tcp_frame(secure_frame: &[u8], security_cfg: &TcpSecurityCfg) -> io::Result<(SecureTcpFrameMeta, Vec<u8>)> {
-    let (header, body) = split_header_body(secure_frame)?;
-    let meta = parse_secure_frame_meta(&header, body.len())?;
-    if security_cfg.enable_integrity && !meta.integrity_enabled {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "received tcp secure frame has integrity disabled",
-        ));
-    }
-
-    if meta.integrity_enabled {
-        let nonce = pem::decode(&meta.nonce_b64).map_err(|_| {
-            io::Error::new(io::ErrorKind::InvalidData, "invalid nonce in tcp secure frame")
-        })?;
-
-        let expected_tag = pem::decode(&meta.tag_b64).map_err(|_| {
-            io::Error::new(io::ErrorKind::InvalidData, "invalid tag in tcp secure frame")
-        })?;
-
-        let computed_tag = compute_frame_tag(&nonce, meta.algorithm, meta.raw_size, body);
-        if !constant_time_eq(&expected_tag, &computed_tag) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "tcp secure frame integrity verification failed",
-            ));
-        }
-    }
-
-    let decoded_payload = if meta.algorithm == CompressionAlgorithm::Identity {
-        body.to_vec()
-    } else {
-        compression::decompress(meta.algorithm, body)?
-    };
-
-    if decoded_payload.len() != meta.raw_size {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "tcp secure frame size mismatch: expected {}, got {}",
-                meta.raw_size,
-                decoded_payload.len()
-            ),
-        ));
-    }
-
-    let expected_digest = pem::decode(&meta.digest_b64).map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            "invalid digest in tcp secure frame",
-        )
-    })?;
-
-    let computed_digest = sha256(&decoded_payload);
-    if !constant_time_eq(&expected_digest, &computed_digest) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "tcp secure frame digest verification failed",
-        ));
-    }
-
-    Ok((meta, decoded_payload))
 }
 
 impl TcpListener {
@@ -444,6 +300,151 @@ impl Default for TcpCompressionCfg {
             min_size: 512,
         }
     }
+}
+
+pub fn select_secure_tcp_compression_algorithm(accept_encoding: &str) -> CompressionAlgorithm {
+    let accepted = compression::parse_accept_encoding(accept_encoding);
+    for (algorithm, quality) in accepted {
+        if quality > 0.0 && algorithm.is_implemented() && algorithm != CompressionAlgorithm::Identity {
+            return algorithm;
+        }
+    }
+
+    CompressionAlgorithm::Identity
+}
+
+pub fn encode_secure_tcp_frame(raw_payload: &[u8], security_cfg: &TcpSecurityCfg, compression_cfg: &TcpCompressionCfg) -> io::Result<(SecureTcpFrameMeta, Vec<u8>)> {
+    let mut selected_algorithm = CompressionAlgorithm::Identity;
+    if compression_cfg.enabled && raw_payload.len() >= compression_cfg.min_size {
+        if compression_cfg.algorithm.is_implemented() {
+            selected_algorithm = compression_cfg.algorithm;
+        }
+    }
+
+    let encoded_payload = if selected_algorithm == CompressionAlgorithm::Identity {
+        raw_payload.to_vec()
+    } else {
+        compression::compress(selected_algorithm, raw_payload, compression_cfg.level)?
+    };
+
+    let nonce = if security_cfg.enable_integrity {
+        random::generate_random(security_cfg.nonce_len.max(8)).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::Other,
+                format!("failed to generate tcp frame nonce: {}", e),
+            )
+        })?
+    } else {
+        Vec::new()
+    };
+
+    let digest = sha256(raw_payload);
+    let tag = if security_cfg.enable_integrity {
+        compute_frame_tag(&nonce, selected_algorithm, raw_payload.len(), &encoded_payload).to_vec()
+    } else {
+        Vec::new()
+    };
+
+    let issued_at_unix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    let meta = SecureTcpFrameMeta {
+        algorithm: selected_algorithm,
+        integrity_enabled: security_cfg.enable_integrity,
+        nonce_b64: if security_cfg.enable_integrity {
+            pem::encode(&nonce)
+        } else {
+            String::new()
+        },
+        digest_b64: pem::encode(&digest),
+        tag_b64: if security_cfg.enable_integrity {
+            pem::encode(&tag)
+        } else {
+            String::new()
+        },
+        raw_size: raw_payload.len(),
+        encoded_size: encoded_payload.len(),
+        issued_at_unix,
+    };
+
+    let header = format!(
+        "{magic}\ncontent-encoding={encoding}\nintegrity={integrity}\nnonce={nonce}\ndigest=SHA-256={digest}\ntag=HMAC-SHA-256={tag}\nraw-size={raw_size}\nencoded-size={encoded_size}\nissued-at={issued_at}\n\n",
+        magic = TCP_SECURE_FRAME_MAGIC,
+        encoding = meta.algorithm.content_encoding(),
+        integrity = if meta.integrity_enabled { "on" } else { "off" },
+        nonce = meta.nonce_b64,
+        digest = meta.digest_b64,
+        tag = meta.tag_b64,
+        raw_size = meta.raw_size,
+        encoded_size = meta.encoded_size,
+        issued_at = meta.issued_at_unix,
+    );
+
+    let mut out = header.into_bytes();
+    out.extend_from_slice(&encoded_payload);
+
+    Ok((meta, out))
+}
+
+pub fn decode_secure_tcp_frame(secure_frame: &[u8], security_cfg: &TcpSecurityCfg) -> io::Result<(SecureTcpFrameMeta, Vec<u8>)> {
+    let (header, body) = split_header_body(secure_frame)?;
+    let meta = parse_secure_frame_meta(&header, body.len())?;
+    if security_cfg.enable_integrity && !meta.integrity_enabled {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "received tcp secure frame has integrity disabled",
+        ));
+    }
+
+    if meta.integrity_enabled {
+        let nonce = pem::decode(&meta.nonce_b64).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidData, "invalid nonce in tcp secure frame")
+        })?;
+
+        let expected_tag = pem::decode(&meta.tag_b64).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidData, "invalid tag in tcp secure frame")
+        })?;
+
+        let computed_tag = compute_frame_tag(&nonce, meta.algorithm, meta.raw_size, body);
+        if !constant_time_eq(&expected_tag, &computed_tag) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "tcp secure frame integrity verification failed",
+            ));
+        }
+    }
+
+    let decoded_payload = if meta.algorithm == CompressionAlgorithm::Identity {
+        body.to_vec()
+    } else {
+        compression::decompress(meta.algorithm, body)?
+    };
+
+    if decoded_payload.len() != meta.raw_size {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "tcp secure frame size mismatch: expected {}, got {}",
+                meta.raw_size,
+                decoded_payload.len()
+            ),
+        ));
+    }
+
+    let expected_digest = pem::decode(&meta.digest_b64).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid digest in tcp secure frame",
+        )
+    })?;
+
+    let computed_digest = sha256(&decoded_payload);
+    if !constant_time_eq(&expected_digest, &computed_digest) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "tcp secure frame digest verification failed",
+        ));
+    }
+
+    Ok((meta, decoded_payload))
 }
 
 fn compute_frame_tag(nonce: &[u8], algorithm: CompressionAlgorithm, raw_size: usize, encoded_payload: &[u8]) -> [u8; 32] {

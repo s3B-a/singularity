@@ -1,11 +1,12 @@
-use super::error::{Error, Result};
-use super::{decode_varint, encode_varint, ConnectionId};
 use crate::crypto::constant_time_eq;
 use crate::crypto::encoding::pem;
 use crate::crypto::hash::hmac::hmac_sha256;
 use crate::crypto::hash::sha2::sha256;
 use crate::crypto::random;
 use crate::net::http::compression::{self, CompressionAlgorithm, CompressionLevel};
+use super::error::{Error, Result};
+use super::{decode_varint, encode_varint, ConnectionId};
+
 use std::collections::HashMap;
 use std::fmt;
 use std::io;
@@ -25,6 +26,41 @@ pub struct SecurePacketBlobMeta {
     pub issued_at_unix: u64,
 }
 
+#[derive(Debug, Clone)]
+pub struct PacketHeader {
+    pub packet_type: PacketType,
+    pub version: u32,
+    pub dcid: ConnectionId,
+    pub scid: ConnectionId,
+    pub token: Option<Vec<u8>>,
+    pub packet_number: u64,
+    pub key_phase: bool,
+    pub largest_acked: u64,
+}
+
+pub struct ProtectedLongHeaderPrefix {
+    pub packet_type: PacketType,
+    pub version: u32,
+    pub dcid: ConnectionId,
+    pub scid: ConnectionId,
+    pub token: Option<Vec<u8>>,
+    pub pn_offset: usize,
+}
+
+pub struct ProtectedShortHeaderPrefix {
+    pub dcid: ConnectionId,
+    pub pn_offset: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct Packet {
+    pub header: PacketHeader,
+    pub payload: Vec<u8>,
+    pub encrypted: bool,
+}
+
+pub struct PacketNumber;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PacketType {
     Initial,
@@ -33,6 +69,13 @@ pub enum PacketType {
     Retry,
     Short,
     VersionNegotiation,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum PacketNumberSpace {
+    Initial,
+    Handshake,
+    ApplicationData,
 }
 
 impl PacketType {
@@ -61,13 +104,6 @@ impl PacketType {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum PacketNumberSpace {
-    Initial,
-    Handshake,
-    ApplicationData,
-}
-
 impl PacketNumberSpace {
     pub fn from_packet_type(ty: PacketType) -> Self {
         match ty {
@@ -77,32 +113,6 @@ impl PacketNumberSpace {
             _ => PacketNumberSpace::Initial,
         }
     }
-}
-
-#[derive(Debug, Clone)]
-pub struct PacketHeader {
-    pub packet_type: PacketType,
-    pub version: u32,
-    pub dcid: ConnectionId,
-    pub scid: ConnectionId,
-    pub token: Option<Vec<u8>>,
-    pub packet_number: u64,
-    pub key_phase: bool,
-    pub largest_acked: u64,
-}
-
-pub struct ProtectedLongHeaderPrefix {
-    pub packet_type: PacketType,
-    pub version: u32,
-    pub dcid: ConnectionId,
-    pub scid: ConnectionId,
-    pub token: Option<Vec<u8>>,
-    pub pn_offset: usize,
-}
-
-pub struct ProtectedShortHeaderPrefix {
-    pub dcid: ConnectionId,
-    pub pn_offset: usize,
 }
 
 impl PacketHeader {
@@ -505,13 +515,6 @@ impl PacketHeader {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct Packet {
-    pub header: PacketHeader,
-    pub payload: Vec<u8>,
-    pub encrypted: bool,
-}
-
 impl Packet {
     pub fn new(header: PacketHeader, payload: Vec<u8>) -> Self {
         Self {
@@ -718,6 +721,61 @@ impl Packet {
 
         let packet = deserialize_packet(&raw_payload)?;
         Ok((meta, packet))
+    }
+}
+
+impl PacketNumber {
+    pub fn encode(full_pn: u64, largest_acked: u64) -> (Vec<u8>, usize) {
+        let num_unacked = if full_pn >= largest_acked {
+            full_pn - largest_acked
+        } else {
+            0
+        };
+
+        let bytes_needed = if num_unacked < (1 << 7) {
+            1
+        } else if num_unacked < (1 << 15) {
+            2
+        } else if num_unacked < (1 << 23) {
+            3
+        } else {
+            4
+        };
+
+        let mut encoded = Vec::new();
+        for i in (0..bytes_needed).rev() {
+            encoded.push(((full_pn >> (i * 8)) & 0xFF) as u8);
+        }
+
+        (encoded, bytes_needed)
+    }
+
+    pub fn decode(truncated_pn: u64, truncated_len: usize, largest_pn: u64) -> u64 {
+        let expected_pn = largest_pn + 1;
+        let pn_win = 1u64 << (truncated_len * 8);
+        let pn_hwin = pn_win / 2;
+        let pn_mask = pn_win - 1;
+        let candidate_pn = (expected_pn & !pn_mask) | truncated_pn;
+        if candidate_pn <= expected_pn.saturating_sub(pn_hwin) && candidate_pn < (1u64 << 62) - pn_win {
+            candidate_pn + pn_win
+        } else if candidate_pn > expected_pn + pn_hwin && candidate_pn >= pn_win {
+            candidate_pn - pn_win
+        } else {
+            candidate_pn
+        }
+    }
+}
+
+impl fmt::Display for PacketType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            PacketType::Initial => write!(f, "Initial"),
+            PacketType::ZeroRtt => write!(f, "0-RTT"),
+            PacketType::Handshake => write!(f, "Handshake"),
+            PacketType::Retry => write!(f, "Retry"),
+            PacketType::Short => write!(f, "Short"),
+            PacketType::VersionNegotiation => write!(f, "VersionNegotiation"),
+        }
     }
 }
 
@@ -1068,63 +1126,6 @@ fn parse_secure_packet_meta(header: &str, body_len: usize) -> io::Result<SecureP
     }
 
     Ok(meta)
-}
-
-pub struct PacketNumber;
-
-impl PacketNumber {
-    pub fn encode(full_pn: u64, largest_acked: u64) -> (Vec<u8>, usize) {
-        let num_unacked = if full_pn >= largest_acked {
-            full_pn - largest_acked
-        } else {
-            0
-        };
-
-        let bytes_needed = if num_unacked < (1 << 7) {
-            1
-        } else if num_unacked < (1 << 15) {
-            2
-        } else if num_unacked < (1 << 23) {
-            3
-        } else {
-            4
-        };
-
-        let mut encoded = Vec::new();
-        for i in (0..bytes_needed).rev() {
-            encoded.push(((full_pn >> (i * 8)) & 0xFF) as u8);
-        }
-
-        (encoded, bytes_needed)
-    }
-
-    pub fn decode(truncated_pn: u64, truncated_len: usize, largest_pn: u64) -> u64 {
-        let expected_pn = largest_pn + 1;
-        let pn_win = 1u64 << (truncated_len * 8);
-        let pn_hwin = pn_win / 2;
-        let pn_mask = pn_win - 1;
-        let candidate_pn = (expected_pn & !pn_mask) | truncated_pn;
-        if candidate_pn <= expected_pn.saturating_sub(pn_hwin) && candidate_pn < (1u64 << 62) - pn_win {
-            candidate_pn + pn_win
-        } else if candidate_pn > expected_pn + pn_hwin && candidate_pn >= pn_win {
-            candidate_pn - pn_win
-        } else {
-            candidate_pn
-        }
-    }
-}
-
-impl fmt::Display for PacketType {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            PacketType::Initial => write!(f, "Initial"),
-            PacketType::ZeroRtt => write!(f, "0-RTT"),
-            PacketType::Handshake => write!(f, "Handshake"),
-            PacketType::Retry => write!(f, "Retry"),
-            PacketType::Short => write!(f, "Short"),
-            PacketType::VersionNegotiation => write!(f, "VersionNegotiation"),
-        }
-    }
 }
 
 #[cfg(test)]

@@ -1,14 +1,15 @@
-use super::tls::{TlsCfg, TlsStream};
 use crate::crypto::constant_time_eq;
 use crate::crypto::encoding::pem;
 use crate::crypto::hash::sha2::sha256;
 use crate::crypto::random;
 use crate::net::http::compression::{self, CompressionAlgorithm, CompressionLevel};
 use crate::net::http::http2::alpn::AlpnProtocol;
-use crate::net::http::http2::{Http2Connection, Http2Error, StreamState};
+use crate::net::http::http2::{Http2Connection, Http2Error, PaddingStrategy, StreamState};
 use crate::net::http::server::{Http1ReadError, Http1RequestLimits, HttpServer};
 use crate::net::http::{HttpMethod, HttpRequest, HttpResponse, HttpVersion};
 use crate::net::tcp::{TcpListener, TcpStream};
+use super::tls::{TlsCfg, TlsStream};
+
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Write};
 use std::net::SocketAddr;
@@ -56,6 +57,15 @@ pub struct HttpsServerCfg {
     pub max_request_line_size: usize,
     pub max_header_bytes: usize,
     pub max_header_count: usize,
+    pub http2_padding: PaddingStrategy,
+}
+
+pub struct HttpsServer {
+    config: HttpsServerCfg,
+    handler: Option<HttpsHandler>,
+    listener: Option<TcpListener>,
+    running: Arc<AtomicBool>,
+    address: Option<SocketAddr>,
 }
 
 impl HttpsServerCfg {
@@ -67,14 +77,6 @@ impl HttpsServerCfg {
             max_body_size: self.max_body_size,
         }
     }
-}
-
-pub struct HttpsServer {
-    config: HttpsServerCfg,
-    handler: Option<HttpsHandler>,
-    listener: Option<TcpListener>,
-    running: Arc<AtomicBool>,
-    address: Option<SocketAddr>,
 }
 
 impl HttpsServer {
@@ -227,6 +229,7 @@ impl HttpsServer {
             )
         })?;
 
+        http2_conn.set_padding_strategy(config.http2_padding);
         http2_conn.handshake_with_alpn(Some(AlpnProtocol::Http2))
             .map_err(|e| {
                 std::io::Error::new(
@@ -417,6 +420,13 @@ impl HttpsServer {
                 Err(Http1ReadError::Closed) => break,
                 Err(Http1ReadError::Io(e)) => {
                     eprintln!("Error reading HTTPS request from {}: {}", peer_addr, e);
+                    break;
+                }
+                Err(Http1ReadError::Http2Preface) => {
+                    eprintln!("Rejecting HTTP/2 preface from {}: HTTP/2 over TLS must be negotiated with ALPN", peer_addr);
+                    let err_response = Self::error_response(505, &HttpResponse::default_reason_phrase(505));
+                    let _ = tls_stream.write_all(&err_response.to_bytes());
+                    let _ = tls_stream.flush();
                     break;
                 }
                 Err(Http1ReadError::Reject(status, reason)) => {
@@ -835,6 +845,7 @@ impl Default for HttpsServerCfg {
             max_request_line_size: http1_defaults.max_request_line_size,
             max_header_bytes: http1_defaults.max_header_bytes,
             max_header_count: http1_defaults.max_header_count,
+            http2_padding: PaddingStrategy::None,
         }
     }
 }

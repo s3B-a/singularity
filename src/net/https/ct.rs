@@ -3,12 +3,18 @@ use crate::crypto::encoding::asn1::{decode_oid_content, DerDecoder, DerEncoder, 
 use crate::crypto::encoding::pem;
 use crate::crypto::encoding::x509::{Certificate, SubjectPublicKeyInfo};
 use crate::crypto::hash::sha2::sha256;
+
 use std::collections::HashMap;
 
 const BUNDLED_CT_LOGS: &str = include_str!("data/ct_logs.txt");
 
 const RSA_ENCRYPTION_OID: [u64; 7] = [1, 2, 840, 113549, 1, 1, 1];
 const EC_PUBLIC_KEY_OID: [u64; 6] = [1, 2, 840, 10045, 2, 1];
+
+#[derive(Debug, Clone, Default)]
+pub struct CtLogBundle {
+    logs_by_id: HashMap<[u8; 32], CtLog>,
+}
 
 #[derive(Debug, Clone)]
 struct CtLog {
@@ -17,9 +23,12 @@ struct CtLog {
     public_key_der: Vec<u8>,
 }
 
-#[derive(Debug, Clone, Default)]
-pub struct CtLogBundle {
-    logs_by_id: HashMap<[u8; 32], CtLog>,
+struct Sct {
+    version: u8,
+    log_id: [u8; 32],
+    timestamp: u64,
+    extensions: Vec<u8>,
+    signature: Vec<u8>,
 }
 
 impl CtLogBundle {
@@ -78,12 +87,47 @@ impl CtLogBundle {
     }
 }
 
-struct Sct {
-    version: u8,
-    log_id: [u8; 32],
-    timestamp: u64,
-    extensions: Vec<u8>,
-    signature: Vec<u8>,
+pub fn verify_embedded_scts(leaf: &Certificate, issuer: &Certificate, bundle: &CtLogBundle) -> Result<(), String> {
+    if bundle.is_empty() {
+        return Err("no CT log bundle loaded".to_string());
+    }
+
+    let raw_list = leaf.get_sct_list().map_err(|e| format!("failed to read SCT list extension: {:?}", e))?;
+    if raw_list.is_empty() {
+        return Err("certificate has no embedded SCTs".to_string());
+    }
+
+    let scts = parse_sct_list(&raw_list);
+    if scts.is_empty() {
+        return Err("SCT list extension present but no SCT entries could be parsed".to_string());
+    }
+
+    let precert_tbs = leaf.tbs_for_precert().map_err(|e| format!("failed to reconstruct precertificate TBS: {:?}", e))?;
+    let issuer_spki_der = encode_spki_der(&issuer.subject_public_key_info)?;
+    let issuer_key_hash = sha256(&issuer_spki_der);
+    for sct in &scts {
+        let log = match bundle.find(&sct.log_id) {
+            Some(log) => log,
+            None => continue,
+        };
+
+        let point = match extract_spki_point(&log.public_key_der) {
+            Some(p) => p,
+            None => continue,
+        };
+
+        let fixed_sig = match ecc_generic::der_signature_to_fixed(&sct.signature, 32) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+
+        let to_sign = precert_signed_data(sct, &issuer_key_hash, &precert_tbs);
+        if ecdsa::verify(ecdsa::SignatureCurve::P256, &point, &to_sign, &fixed_sig).unwrap_or(false) {
+            return Ok(());
+        }
+    }
+
+    Err("no embedded SCT verified against a known CT log".to_string())
 }
 
 fn parse_sct_list(raw: &[u8]) -> Vec<Sct> {
@@ -207,49 +251,6 @@ fn extract_spki_point(spki_der: &[u8]) -> Option<Vec<u8>> {
             Ok(point)
         })
         .ok()
-}
-
-pub fn verify_embedded_scts(leaf: &Certificate, issuer: &Certificate, bundle: &CtLogBundle) -> Result<(), String> {
-    if bundle.is_empty() {
-        return Err("no CT log bundle loaded".to_string());
-    }
-
-    let raw_list = leaf.get_sct_list().map_err(|e| format!("failed to read SCT list extension: {:?}", e))?;
-    if raw_list.is_empty() {
-        return Err("certificate has no embedded SCTs".to_string());
-    }
-
-    let scts = parse_sct_list(&raw_list);
-    if scts.is_empty() {
-        return Err("SCT list extension present but no SCT entries could be parsed".to_string());
-    }
-
-    let precert_tbs = leaf.tbs_for_precert().map_err(|e| format!("failed to reconstruct precertificate TBS: {:?}", e))?;
-    let issuer_spki_der = encode_spki_der(&issuer.subject_public_key_info)?;
-    let issuer_key_hash = sha256(&issuer_spki_der);
-    for sct in &scts {
-        let log = match bundle.find(&sct.log_id) {
-            Some(log) => log,
-            None => continue,
-        };
-
-        let point = match extract_spki_point(&log.public_key_der) {
-            Some(p) => p,
-            None => continue,
-        };
-
-        let fixed_sig = match ecc_generic::der_signature_to_fixed(&sct.signature, 32) {
-            Ok(s) => s,
-            Err(_) => continue,
-        };
-
-        let to_sign = precert_signed_data(sct, &issuer_key_hash, &precert_tbs);
-        if ecdsa::verify(ecdsa::SignatureCurve::P256, &point, &to_sign, &fixed_sig).unwrap_or(false) {
-            return Ok(());
-        }
-    }
-
-    Err("no embedded SCT verified against a known CT log".to_string())
 }
 
 #[cfg(test)]

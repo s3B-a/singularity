@@ -5,19 +5,21 @@ pub mod server;
 pub mod trust_store;
 pub mod revocation;
 
-use crate::crypto::constant_time_eq;
-use crate::crypto::encoding::pem;
-use crate::crypto::hash::sha2::sha256;
-use crate::crypto::random;
-use crate::net::http::compression::{self, CompressionAlgorithm, CompressionLevel};
-use std::io;
-
 pub use client::{HttpsClient, HttpsClientCfg, HttpsError};
 pub use tls::{TlsCfg, TlsError, TlsStream};
 pub use server::{HttpsServer, HttpsServerCfg};
 pub use trust_store::{TrustStore, TrustStoreError};
 
+use crate::crypto::constant_time_eq;
+use crate::crypto::encoding::pem;
+use crate::crypto::hash::sha2::sha256;
+use crate::crypto::random;
+use crate::net::http::compression::{self, CompressionAlgorithm, CompressionLevel};
+
+use std::io;
+
 pub const HTTPS_SECURE_ENVELOPE_MAGIC: &str = "SINGULARITY_HTTPS_SECURE_ENVELOPE_V1";
+
 const HTTPS_SECURE_ENVELOPE_CTX: &str = "SINGULARITY_HTTPS_SECURE_TAG_CTX_V1";
 
 #[derive(Debug, Clone, PartialEq, Eq)]

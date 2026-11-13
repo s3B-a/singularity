@@ -1,5 +1,3 @@
-use super::packet::DnsPacket;
-use super::record::{DnsRecord, RecordClass, RecordData, RecordType};
 use crate::crypto::constant_time_eq;
 use crate::crypto::encoding::pem;
 use crate::crypto::hash::sha2::sha256;
@@ -7,6 +5,9 @@ use crate::crypto::random;
 use crate::net::http::compression::{self, CompressionAlgorithm, CompressionLevel};
 use crate::net::https::tls::{TlsCfg, TlsStream};
 use crate::net::tcp::TcpStream as DotTcpStream;
+use super::packet::DnsPacket;
+use super::record::{DnsRecord, RecordClass, RecordData, RecordType};
+
 use std::fmt::Write;
 use std::io::{self, Read as _, Write as _};
 use std::net::{SocketAddr, TcpStream, UdpSocket};

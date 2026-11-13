@@ -3,9 +3,6 @@
 
 use crate::crypto::{Error, Result};
 
-// Field Element type for X25519
-type Fe = [i64; 10];
-
 // Base point for X25519 key exchange
 const BASE_POINT: [u8; 32] = [
     9, 0, 0, 0, 0, 0, 0, 0,
@@ -13,6 +10,9 @@ const BASE_POINT: [u8; 32] = [
     0, 0, 0, 0, 0, 0, 0, 0,
     0, 0, 0, 0, 0, 0, 0, 0
 ];
+
+// Field Element type for X25519
+type Fe = [i64; 10];
 
 // X25519 Private Key structure
 #[derive(Clone)]
@@ -150,88 +150,6 @@ impl X25519PublicKey {
     pub fn to_bytes(&self) -> [u8; 32] {
         self.point
     }
-}
-
-/**
- * Computes the X25519 public key point from a given scalar
- * Args:
- *    scalar - &[u8; 32]: The private key scalar
- * 
- * Returns:
- *    [u8; 32]: The resulting public key point
- */
-fn x25519_base(scalar: &[u8; 32]) -> [u8; 32] {
-    x25519_scalar_mult(scalar, &BASE_POINT)
-}
-
-/**
- * Performs X25519 scalar multiplication
- * Args:
- *    scalar - &[u8; 32]: The private key scalar
- *    point - &[u8; 32]: The public key point
- * 
- * Returns:
- *    [u8; 32]: The resulting shared secret point
- */
-fn x25519_scalar_mult(scalar: &[u8; 32], point: &[u8; 32]) -> [u8; 32] {
-    let x1 = fe_from_bytes(point);
-    let mut x2 = fe_one();
-    let mut z2 = fe_zero();
-    let mut x3 = x1;
-    let mut z3 = fe_one();
-    let mut swap = 0u8;
-    for t in (0..255).rev() {
-        let bit = (scalar[t >> 3] >> (t & 7)) & 1;
-        swap ^= bit;
-        fe_cswap(&mut x2, &mut x3, swap);
-        fe_cswap(&mut z2, &mut z3, swap);
-        swap = bit;
-
-        let a = fe_add(&x2, &z2);
-        let aa = fe_square(&a);
-        let b = fe_sub(&x2, &z2);
-        let bb = fe_square(&b);
-        let e = fe_sub(&aa, &bb);
-        let c = fe_add(&x3, &z3);
-        let d = fe_sub(&x3, &z3);
-        let da = fe_mul(&d, &a);
-        let cb = fe_mul(&c, &b);
-
-        x3 = fe_square(&fe_add(&da, &cb));
-        z3 = fe_mul(&x1, &fe_square(&fe_sub(&da, &cb)));
-        x2 = fe_mul(&aa, &bb);
-        z2 = fe_mul(&e, &fe_add(&aa, &fe_mul_121666(&e)));
-    }
-
-    fe_cswap(&mut x2, &mut x3, swap);
-    fe_cswap(&mut z2, &mut z3, swap);
-
-    let result = fe_mul(&x2, &fe_invert(&z2));
-    fe_to_bytes(&result)
-}
-
-/**
- * Creates a field element representing zero
- * Args:
- *    (): No arguments
- * 
- * Returns:
- *    Fe: The field element representing zero
- */
-fn fe_zero() -> Fe {
-    [0; 10]
-}
-
-/**
- * Creates a field element representing one
- * Args:
- *    (): No arguments
- * 
- * Returns:
- *    Fe: The field element representing one
- */
-fn fe_one() -> Fe {
-    [1, 0, 0, 0, 0, 0, 0, 0, 0, 0]
 }
 
 /**
@@ -556,6 +474,88 @@ pub fn fe_cswap(a: &mut Fe, b: &mut Fe, swap: u8) {
         a[i] ^= t;
         b[i] ^= t;
     }
+}
+
+/**
+ * Computes the X25519 public key point from a given scalar
+ * Args:
+ *    scalar - &[u8; 32]: The private key scalar
+ * 
+ * Returns:
+ *    [u8; 32]: The resulting public key point
+ */
+fn x25519_base(scalar: &[u8; 32]) -> [u8; 32] {
+    x25519_scalar_mult(scalar, &BASE_POINT)
+}
+
+/**
+ * Performs X25519 scalar multiplication
+ * Args:
+ *    scalar - &[u8; 32]: The private key scalar
+ *    point - &[u8; 32]: The public key point
+ * 
+ * Returns:
+ *    [u8; 32]: The resulting shared secret point
+ */
+fn x25519_scalar_mult(scalar: &[u8; 32], point: &[u8; 32]) -> [u8; 32] {
+    let x1 = fe_from_bytes(point);
+    let mut x2 = fe_one();
+    let mut z2 = fe_zero();
+    let mut x3 = x1;
+    let mut z3 = fe_one();
+    let mut swap = 0u8;
+    for t in (0..255).rev() {
+        let bit = (scalar[t >> 3] >> (t & 7)) & 1;
+        swap ^= bit;
+        fe_cswap(&mut x2, &mut x3, swap);
+        fe_cswap(&mut z2, &mut z3, swap);
+        swap = bit;
+
+        let a = fe_add(&x2, &z2);
+        let aa = fe_square(&a);
+        let b = fe_sub(&x2, &z2);
+        let bb = fe_square(&b);
+        let e = fe_sub(&aa, &bb);
+        let c = fe_add(&x3, &z3);
+        let d = fe_sub(&x3, &z3);
+        let da = fe_mul(&d, &a);
+        let cb = fe_mul(&c, &b);
+
+        x3 = fe_square(&fe_add(&da, &cb));
+        z3 = fe_mul(&x1, &fe_square(&fe_sub(&da, &cb)));
+        x2 = fe_mul(&aa, &bb);
+        z2 = fe_mul(&e, &fe_add(&aa, &fe_mul_121666(&e)));
+    }
+
+    fe_cswap(&mut x2, &mut x3, swap);
+    fe_cswap(&mut z2, &mut z3, swap);
+
+    let result = fe_mul(&x2, &fe_invert(&z2));
+    fe_to_bytes(&result)
+}
+
+/**
+ * Creates a field element representing zero
+ * Args:
+ *    (): No arguments
+ * 
+ * Returns:
+ *    Fe: The field element representing zero
+ */
+fn fe_zero() -> Fe {
+    [0; 10]
+}
+
+/**
+ * Creates a field element representing one
+ * Args:
+ *    (): No arguments
+ * 
+ * Returns:
+ *    Fe: The field element representing one
+ */
+fn fe_one() -> Fe {
+    [1, 0, 0, 0, 0, 0, 0, 0, 0, 0]
 }
 
 #[cfg(test)]

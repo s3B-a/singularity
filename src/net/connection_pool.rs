@@ -1,10 +1,11 @@
-use super::tcp::TcpStream;
 use crate::crypto::constant_time_eq;
 use crate::crypto::encoding::pem;
 use crate::crypto::hash::hmac::hmac_sha256;
 use crate::crypto::hash::sha2::sha256;
 use crate::crypto::random;
 use crate::net::http::compression::{self, CompressionAlgorithm, CompressionLevel};
+use super::tcp::TcpStream;
+
 use std::collections::HashMap;
 use std::io;
 use std::sync::{Arc, Mutex};
@@ -14,21 +15,6 @@ const CONNECTION_POOL_PAYLOAD_MAGIC: &str = "SINGULARITY_CONNECTION_POOL_V1";
 const CONNECTION_POOL_SNAPSHOT_MAGIC_V2: &str = "SINGULARITY_CONNECTION_POOL_SNAPSHOT_V2";
 const CONNECTION_POOL_SNAPSHOT_MAGIC_LEGACY: &str = "SINGULARITY_CONNECTION_POOL_SNAPSHOT";
 const CONNECTION_POOL_SNAPSHOT_CONTEXT: &str = "SINGULARITY_CONNECTION_POOL_SNAPSHOT_BINDING_V1";
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum PooledProtocol {
-    Http1,
-    Http2,
-}
-
-impl PooledProtocol {
-    fn tag(&self) -> &'static str {
-        match self {
-            PooledProtocol::Http1 => "http1",
-            PooledProtocol::Http2 => "http2",
-        }
-    }
-}
 
 #[derive(Debug, Clone)]
 pub struct PoolStats {
@@ -75,6 +61,16 @@ pub struct PoolCompressionCfg {
     pub min_size: usize,
 }
 
+pub struct ConnectionPool {
+    connections: Arc<Mutex<HashMap<String, Vec<PooledConnection>>>>,
+    max_idle_per_host: usize,
+    idle_timeout: Duration,
+    max_connection_age: Duration,
+    max_requests_per_connection: usize,
+    security_cfg: PoolSecurityCfg,
+    compression_cfg: PoolCompressionCfg,
+}
+
 struct PooledConnection {
     stream: TcpStream,
     protocol: PooledProtocol,
@@ -87,14 +83,19 @@ struct PooledConnection {
     peer_fingerprint: String,
 }
 
-pub struct ConnectionPool {
-    connections: Arc<Mutex<HashMap<String, Vec<PooledConnection>>>>,
-    max_idle_per_host: usize,
-    idle_timeout: Duration,
-    max_connection_age: Duration,
-    max_requests_per_connection: usize,
-    security_cfg: PoolSecurityCfg,
-    compression_cfg: PoolCompressionCfg,
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PooledProtocol {
+    Http1,
+    Http2,
+}
+
+impl PooledProtocol {
+    fn tag(&self) -> &'static str {
+        match self {
+            PooledProtocol::Http1 => "http1",
+            PooledProtocol::Http2 => "http2",
+        }
+    }
 }
 
 impl ConnectionPool {

@@ -4,6 +4,7 @@ use crate::crypto::hash::hmac::hmac_sha256;
 use crate::crypto::hash::sha2::sha256;
 use crate::crypto::random;
 use crate::net::http::compression::{self, CompressionAlgorithm, CompressionLevel};
+
 use std::fmt;
 use std::io;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -194,6 +195,12 @@ impl HttpMethod {
     }
 }
 
+impl fmt::Display for HttpMethod {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
 pub fn select_secure_http_method_algorithm(accept_encoding: &str) -> CompressionAlgorithm {
     compression::parse_accept_encoding(accept_encoding).into_iter().find_map(|(algorithm, quality)| {
         if quality > 0.0 && algorithm.is_implemented() {
@@ -377,12 +384,6 @@ fn parse_secure_http_method_meta(header: &str, body_len: usize) -> io::Result<Se
         encoded_size,
         issued_at_unix,
     })
-}
-
-impl fmt::Display for HttpMethod {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.as_str())
-    }
 }
 
 #[cfg(test)]

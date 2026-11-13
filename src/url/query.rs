@@ -1,6 +1,7 @@
+use super::encoder::{encode_form, decode_form};
+
 use std::collections::HashMap;
 use std::fmt;
-use super::encoder::{encode_form, decode_form};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QueryParams {

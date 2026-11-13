@@ -2,12 +2,22 @@
 // This module provides secure random number generation using a system-specific RNG
 // https://en.wikipedia.org/wiki/Cryptographically_secure_pseudorandom_number_generator
 
-use std::sync::Mutex;
 use crate::crypto::{Error, Result};
+
+use std::sync::Mutex;
 
 // Thread-local RNG instance
 thread_local! {
     static THREAD_RNG: std::cell::RefCell<Option<SystemRng>> = std::cell::RefCell::new(None);
+}
+
+// System RNG implementation
+// Uses platform-specific APIs to gather entropy
+pub struct SystemRng {
+    buffer: [u8; 2048],
+    buffer_pos: usize,
+    #[cfg(target_os = "windows")]
+    _phantom: std::marker::PhantomData<()>,
 }
 
 // Trait for cryptographic RNGs
@@ -68,15 +78,6 @@ pub trait CryptoRng {
     }
 }
 
-// System RNG implementation
-// Uses platform-specific APIs to gather entropy
-pub struct SystemRng {
-    buffer: [u8; 2048],
-    buffer_pos: usize,
-    #[cfg(target_os = "windows")]
-    _phantom: std::marker::PhantomData<()>,
-}
-
 // Implementation of SystemRng
 impl SystemRng {
 
@@ -128,7 +129,6 @@ impl Default for SystemRng {
     }
 }
 
-
 // Implement CryptoRng trait for SystemRng
 impl CryptoRng for SystemRng {
 
@@ -162,6 +162,69 @@ impl CryptoRng for SystemRng {
 
         Ok(())
     }
+}
+
+/**
+ * Fill the provided buffer with random bytes using the global SystemRng instance
+ * Args:
+ *    dest - &mut [u8]: The buffer to fill with random bytes
+ * 
+ * Returns:
+ *    Result<()>: Ok(()) on success, Err(Error) on failure
+ */
+pub fn fill_random(dest: &mut [u8]) -> Result<()> {
+    THREAD_RNG.with(|rng| {
+        let mut rng_ref = rng.borrow_mut();
+        if rng_ref.is_none() {
+            *rng_ref = Some(SystemRng::new()?);
+        }
+        rng_ref.as_mut().unwrap().fill_bytes(dest)
+    })
+}
+
+/**
+ * Generate a vector of random bytes of specified length using the global SystemRng instance
+ * Args:
+ *    len - usize: The number of random bytes to generate
+ * 
+ * Returns:
+ *    Result<Vec<u8>>: A vector of random bytes on success, Err(Error) on failure
+ */
+pub fn generate_random(len: usize) -> Result<Vec<u8>> {
+    let mut buffer = vec![0u8; len];
+    fill_random(&mut buffer)?;
+
+    Ok(buffer)
+}
+
+/**
+ * Generate a random u32 integer using the global SystemRng instance
+ * Args:
+ *    (): None
+ * 
+ * Returns:
+ *    Result<u32>: A random u32 integer on success, Err(Error) on failure
+ */
+pub fn generate_random_u32() -> Result<u32> {
+    let mut buffer = [0u8; 4];
+    fill_random(&mut buffer)?;
+
+    Ok(u32::from_le_bytes(buffer))
+}
+
+/**
+ * Generate a random u64 integer using the global SystemRng instance
+ * Args:
+ *    (): None
+ * 
+ * Returns:
+ *    Result<u64>: A random u64 integer on success, Err(Error) on failure
+ */
+pub fn generate_random_u64() -> Result<u64> {
+    let mut buffer = [0u8; 8];
+    fill_random(&mut buffer)?;
+    
+    Ok(u64::from_le_bytes(buffer))
 }
 
 /**
@@ -325,69 +388,6 @@ fn sys_fill_bytes(dest: &mut [u8]) -> Result<()> {
 #[cfg(not(any(target_os = "windows", unix, target_arch = "wasm32")))]
 fn sys_fill_bytes(dest: &[u8]) -> Result<()> {
     compile_error!("Unsupported platform for cryptographic RNG");
-}
-
-/**
- * Fill the provided buffer with random bytes using the global SystemRng instance
- * Args:
- *    dest - &mut [u8]: The buffer to fill with random bytes
- * 
- * Returns:
- *    Result<()>: Ok(()) on success, Err(Error) on failure
- */
-pub fn fill_random(dest: &mut [u8]) -> Result<()> {
-    THREAD_RNG.with(|rng| {
-        let mut rng_ref = rng.borrow_mut();
-        if rng_ref.is_none() {
-            *rng_ref = Some(SystemRng::new()?);
-        }
-        rng_ref.as_mut().unwrap().fill_bytes(dest)
-    })
-}
-
-/**
- * Generate a vector of random bytes of specified length using the global SystemRng instance
- * Args:
- *    len - usize: The number of random bytes to generate
- * 
- * Returns:
- *    Result<Vec<u8>>: A vector of random bytes on success, Err(Error) on failure
- */
-pub fn generate_random(len: usize) -> Result<Vec<u8>> {
-    let mut buffer = vec![0u8; len];
-    fill_random(&mut buffer)?;
-
-    Ok(buffer)
-}
-
-/**
- * Generate a random u32 integer using the global SystemRng instance
- * Args:
- *    (): None
- * 
- * Returns:
- *    Result<u32>: A random u32 integer on success, Err(Error) on failure
- */
-pub fn generate_random_u32() -> Result<u32> {
-    let mut buffer = [0u8; 4];
-    fill_random(&mut buffer)?;
-
-    Ok(u32::from_le_bytes(buffer))
-}
-
-/**
- * Generate a random u64 integer using the global SystemRng instance
- * Args:
- *    (): None
- * 
- * Returns:
- *    Result<u64>: A random u64 integer on success, Err(Error) on failure
- */
-pub fn generate_random_u64() -> Result<u64> {
-    let mut buffer = [0u8; 8];
-    fill_random(&mut buffer)?;
-    
-    Ok(u64::from_le_bytes(buffer))
 }
 
 #[cfg(test)]

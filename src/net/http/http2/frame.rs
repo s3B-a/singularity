@@ -1,10 +1,11 @@
-use super::priority::ExtensiblePriority;
 use crate::crypto::constant_time_eq;
 use crate::crypto::encoding::pem;
 use crate::crypto::hash::hmac::hmac_sha256;
 use crate::crypto::hash::sha2::sha256;
 use crate::crypto::random;
 use crate::net::http::compression::{self, CompressionAlgorithm, CompressionLevel};
+use super::priority::ExtensiblePriority;
+
 use std::io::{self, Read, Write};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -23,6 +24,23 @@ pub struct SecureFrameBlobMeta {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FrameFlags(u8);
+
+#[derive(Debug, Clone)]
+pub struct FrameHeader {
+    pub length: u32,
+    pub frame_type: FrameType,
+    pub flags: FrameFlags,
+    pub stream_id: u32,
+}
+
+#[derive(Debug, Clone)]
+pub struct Frame {
+    pub header: FrameHeader,
+    pub payload: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FrameType {
     Data = 0x0,
     Headers = 0x1,
@@ -36,6 +54,15 @@ pub enum FrameType {
     Continuation = 0x9,
     PriorityUpdate = 0x10,
     Unknown = 0xff,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PaddingStrategy {
+    #[default]
+    None,
+    Fixed(u8),
+    Block(u16),
+    Random(u8),
 }
 
 impl FrameType {
@@ -56,9 +83,6 @@ impl FrameType {
         }
     }
 }
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct FrameFlags(u8);
 
 impl FrameFlags {
     pub const END_STREAM: u8 = 0x1;
@@ -92,12 +116,25 @@ impl FrameFlags {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct FrameHeader {
-    pub length: u32,
-    pub frame_type: FrameType,
-    pub flags: FrameFlags,
-    pub stream_id: u32,
+impl PaddingStrategy {
+    pub fn is_enabled(&self) -> bool {
+        *self != PaddingStrategy::None
+    }
+
+    pub fn padding_for(&self, content_len: usize, room: usize) -> u8 {
+        let wanted = match *self {
+            PaddingStrategy::None => 0,
+            PaddingStrategy::Fixed(len) => len as usize,
+            PaddingStrategy::Block(block) if block > 1 => {
+                let block = block as usize;
+                (block - (content_len + 1) % block) % block
+            }
+            PaddingStrategy::Block(_) => 0,
+            PaddingStrategy::Random(max) => random_up_to(max) as usize,
+        };
+
+        wanted.min(room).min(u8::MAX as usize) as u8
+    }
 }
 
 impl FrameHeader {
@@ -144,12 +181,6 @@ impl FrameHeader {
             stream_id_bytes[3],
         ]
     }
-}
-
-#[derive(Debug, Clone)]
-pub struct Frame {
-    pub header: FrameHeader,
-    pub payload: Vec<u8>,
 }
 
 impl Frame {
@@ -199,6 +230,7 @@ impl Frame {
         if end_headers {
             flags |= FrameFlags::END_HEADERS;
         }
+        
         if end_stream {
             flags |= FrameFlags::END_STREAM;
         }
@@ -278,6 +310,41 @@ impl Frame {
         Self::new(FrameType::PriorityUpdate, 0, 0, payload)
     }
 
+    pub fn with_padding(mut self, pad_length: u8) -> io::Result<Self> {
+        if !matches!(self.header.frame_type, FrameType::Data | FrameType::Headers | FrameType::PushPromise) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{:?} frames cannot carry padding", self.header.frame_type),
+            ));
+        }
+
+        if self.header.flags.has(FrameFlags::PADDED) {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "frame is already padded"));
+        }
+
+        let mut payload = Vec::with_capacity(1 + self.payload.len() + pad_length as usize);
+        payload.push(pad_length);
+        payload.extend_from_slice(&self.payload);
+        payload.resize(payload.len() + pad_length as usize, 0);
+        if payload.len() > FrameHeader::MAX_PAYLOAD_SIZE as usize {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "padded frame payload too large"));
+        }
+
+        self.header.flags.set(FrameFlags::PADDED);
+        self.header.length = payload.len() as u32;
+        self.payload = payload;
+
+        Ok(self)
+    }
+
+    pub fn pad_length(&self) -> Option<u8> {
+        if self.header.flags.has(FrameFlags::PADDED) {
+            self.payload.first().copied()
+        } else {
+            None
+        }
+    }
+
     pub fn to_secure_blob(&self, algorithm: CompressionAlgorithm) -> io::Result<(SecureFrameBlobMeta, Vec<u8>)> {
         encode_secure_frame(self, algorithm)
     }
@@ -288,6 +355,37 @@ impl Frame {
 
     pub fn from_secure_blob(data: &[u8]) -> io::Result<(SecureFrameBlobMeta, Self)> {
         decode_secure_frame(data)
+    }
+}
+
+impl std::fmt::Display for PaddingStrategy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PaddingStrategy::None => write!(f, "none"),
+            PaddingStrategy::Fixed(len) => write!(f, "fixed:{}", len),
+            PaddingStrategy::Block(block) => write!(f, "block:{}", block),
+            PaddingStrategy::Random(max) => write!(f, "random:{}", max),
+        }
+    }
+}
+
+impl std::str::FromStr for PaddingStrategy {
+    type Err = String;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        let value = value.trim();
+        if value.eq_ignore_ascii_case("none") {
+            return Ok(PaddingStrategy::None);
+        }
+
+        let (kind, amount) = value.split_once(':').ok_or_else(|| format!("invalid padding strategy '{}'", value))?;
+        let invalid = |_| format!("invalid padding amount '{}'", amount);
+        match kind.trim().to_ascii_lowercase().as_str() {
+            "fixed" => amount.trim().parse().map(PaddingStrategy::Fixed).map_err(invalid),
+            "block" => amount.trim().parse().map(PaddingStrategy::Block).map_err(invalid),
+            "random" => amount.trim().parse().map(PaddingStrategy::Random).map_err(invalid),
+            _ => Err(format!("unknown padding strategy '{}'", kind)),
+        }
     }
 }
 
@@ -646,6 +744,21 @@ fn parse_secure_frame_meta(header: &str, body_len: usize) -> io::Result<SecureFr
     })
 }
 
+fn random_up_to(max: u8) -> u8 {
+    let span = max as u16 + 1;
+    let limit = 256 - 256 % span;
+    loop {
+        let mut byte = [0u8; 1];
+        if random::fill_random(&mut byte).is_err() {
+            return max;
+        }
+
+        if (byte[0] as u16) < limit {
+            return (byte[0] as u16 % span) as u8;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -697,6 +810,43 @@ mod tests {
         assert_eq!(frame.header.stream_id, 0);
         assert_eq!(&frame.payload[..4], &[0, 0, 0, 5]);
         assert_eq!(&frame.payload[4..], b"u=1, i");
+    }
+
+    #[test]
+    fn test_with_padding_layout() {
+        let frame = Frame::data(1, b"abc".to_vec(), true).with_padding(4).unwrap();
+        assert!(frame.header.flags.has(FrameFlags::PADDED));
+        assert!(frame.header.flags.has(FrameFlags::END_STREAM));
+        assert_eq!(frame.header.length, 8);
+        assert_eq!(frame.payload, [4, b'a', b'b', b'c', 0, 0, 0, 0]);
+        assert_eq!(frame.pad_length(), Some(4));
+
+        let headers = Frame::headers(3, b"block".to_vec(), true, false).with_padding(0).unwrap();
+        assert_eq!(headers.payload, [0, b'b', b'l', b'o', b'c', b'k']);
+
+        assert!(Frame::ping(*b"12345678", false).with_padding(1).is_err());
+        assert!(frame.with_padding(1).is_err(), "padding is applied once");
+    }
+
+    #[test]
+    fn test_padding_strategies() {
+        assert_eq!(PaddingStrategy::None.padding_for(10, 255), 0);
+        assert_eq!(PaddingStrategy::Fixed(32).padding_for(10, 255), 32);
+        assert_eq!(PaddingStrategy::Fixed(32).padding_for(10, 5), 5, "padding never exceeds the room left in the frame");
+        assert_eq!(PaddingStrategy::Block(64).padding_for(10, 255), 53);
+        assert_eq!((10 + 1 + 53) % 64, 0);
+        assert_eq!(PaddingStrategy::Block(64).padding_for(63, 255), 0);
+        assert_eq!(PaddingStrategy::Block(1024).padding_for(0, 2000), 255);
+        for _ in 0..200 {
+            assert!(PaddingStrategy::Random(7).padding_for(0, 255) <= 7);
+        }
+
+        for strategy in [PaddingStrategy::None, PaddingStrategy::Fixed(9), PaddingStrategy::Block(256), PaddingStrategy::Random(200)] {
+            assert_eq!(strategy.to_string().parse::<PaddingStrategy>().unwrap(), strategy);
+        }
+
+        assert!("block:x".parse::<PaddingStrategy>().is_err());
+        assert!("zigzag:4".parse::<PaddingStrategy>().is_err());
     }
 
     #[test]

@@ -1,13 +1,14 @@
-use super::compression::{self, CompressionAlgorithm, CompressionLevel};
-use super::conditional::{parse_http_date, EntityTag};
-use super::range::{parse_multipart_byteranges, BytePart, ContentRange};
-use super::status::StatusCode;
-use super::version::HttpVersion;
 use crate::crypto::constant_time_eq;
 use crate::crypto::encoding::pem;
 use crate::crypto::hash::hmac::hmac_sha256;
 use crate::crypto::hash::sha2::sha256;
 use crate::crypto::random;
+use super::compression::{self, CompressionAlgorithm, CompressionLevel};
+use super::conditional::{parse_http_date, EntityTag};
+use super::range::{parse_multipart_byteranges, BytePart, ContentRange};
+use super::status::StatusCode;
+use super::version::HttpVersion;
+
 use std::collections::HashMap;
 use std::io;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -473,6 +474,18 @@ impl HttpResponse {
     }
 }
 
+impl std::fmt::Debug for HttpResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HttpResponse")
+            .field("status_code", &self.status_code)
+            .field("reason_phrase", &self.reason_phrase)
+            .field("version", &self.version)
+            .field("headers", &self.fields)
+            .field("body_len", &self.body.len())
+            .finish()
+    }
+}
+
 pub fn select_secure_http_response_algorithm(accept_encoding: &str) -> CompressionAlgorithm {
     compression::parse_accept_encoding(accept_encoding).into_iter().find_map(|(algorithm, quality)| {
         if quality > 0.0 && algorithm.is_implemented() {
@@ -768,18 +781,6 @@ fn parse_secure_http_response_meta(header: &str, body_len: usize) -> io::Result<
         encoded_size,
         issued_at_unix,
     })
-}
-
-impl std::fmt::Debug for HttpResponse {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("HttpResponse")
-            .field("status_code", &self.status_code)
-            .field("reason_phrase", &self.reason_phrase)
-            .field("version", &self.version)
-            .field("headers", &self.fields)
-            .field("body_len", &self.body.len())
-            .finish()
-    }
 }
 
 #[cfg(test)]

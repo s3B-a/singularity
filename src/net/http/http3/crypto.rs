@@ -1,6 +1,3 @@
-use super::error::{Error, Result};
-use super::packet::{PacketNumberSpace, PacketType};
-use super::quic_tls::{CryptoAction, QuicTlsState};
 use crate::crypto::constant_time_eq;
 use crate::crypto::encoding::pem;
 use crate::crypto::hash::hmac::hmac_sha256;
@@ -12,12 +9,23 @@ use crate::crypto::symmetric::gcm::Gcm;
 use crate::net::http::compression::{self, CompressionAlgorithm, CompressionLevel};
 use crate::net::https::tls::{TlsCfg, TlsStream};
 use crate::net::tcp::TcpStream;
+use super::error::{Error, Result};
+use super::packet::{PacketNumberSpace, PacketType};
+use super::quic_tls::{CryptoAction, QuicTlsState};
+
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const CRYPTO_STATE_BLOB_MAGIC: &str = "SINGULARITY_HTTP3_CRYPTO_STATE_BLOB_V1";
 const CRYPTO_STATE_BLOB_CONTEXT: &str = "SINGULARITY_HTTP3_CRYPTO_STATE_BLOB_BINDING_V1";
+
+const RETRY_INTEGRITY_KEY: [u8; 16] = [
+    0xbe, 0x0c, 0x69, 0x0b, 0x9f, 0x66, 0x57, 0x5a, 0x1d, 0x76, 0x6b, 0x54, 0xe3, 0x68, 0xc8, 0x4e,
+];
+const RETRY_INTEGRITY_NONCE: [u8; 12] = [
+    0x46, 0x15, 0x99, 0xd3, 0x5d, 0x63, 0x2b, 0xf2, 0x23, 0x98, 0x25, 0xbb,
+];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SecureCryptoStateBlobMeta {
@@ -28,6 +36,33 @@ pub struct SecureCryptoStateBlobMeta {
     pub raw_size: usize,
     pub encoded_size: usize,
     pub issued_at_unix: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct CryptoKeys {
+    pub header_key: Vec<u8>,
+    pub packet_key: Vec<u8>,
+    pub iv: Vec<u8>,
+}
+
+pub struct CryptoState {
+    pub client_keys: HashMap<EncryptionLevel, CryptoKeys>,
+    pub server_keys: HashMap<EncryptionLevel, CryptoKeys>,
+    send_level: EncryptionLevel,
+    receive_level: EncryptionLevel,
+    is_client: bool,
+    tls_secret: TlsSecrets,
+    tls_stream: Option<TlsStream>,
+    handshake_complete: bool,
+    quic_tls: Option<QuicTlsState>,
+}
+
+#[derive(Debug, Clone)]
+struct TlsSecrets {
+    client_handshake_secret: Option<Vec<u8>>,
+    server_handshake_secret: Option<Vec<u8>>,
+    client_application_secret: Option<Vec<u8>>,
+    server_application_secret: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -80,13 +115,6 @@ impl EncryptionLevel {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct CryptoKeys {
-    pub header_key: Vec<u8>,
-    pub packet_key: Vec<u8>,
-    pub iv: Vec<u8>,
-}
-
 impl CryptoKeys {
     pub fn new(header_key: Vec<u8>, packet_key: Vec<u8>, iv: Vec<u8>) -> Self {
         Self {
@@ -95,14 +123,6 @@ impl CryptoKeys {
             iv,
         }
     }
-}
-
-#[derive(Debug, Clone)]
-struct TlsSecrets {
-    client_handshake_secret: Option<Vec<u8>>,
-    server_handshake_secret: Option<Vec<u8>>,
-    client_application_secret: Option<Vec<u8>>,
-    server_application_secret: Option<Vec<u8>>,
 }
 
 impl TlsSecrets {
@@ -114,18 +134,6 @@ impl TlsSecrets {
             server_application_secret: None,
         }
     }
-}
-
-pub struct CryptoState {
-    pub client_keys: HashMap<EncryptionLevel, CryptoKeys>,
-    pub server_keys: HashMap<EncryptionLevel, CryptoKeys>,
-    send_level: EncryptionLevel,
-    receive_level: EncryptionLevel,
-    is_client: bool,
-    tls_secret: TlsSecrets,
-    tls_stream: Option<TlsStream>,
-    handshake_complete: bool,
-    quic_tls: Option<QuicTlsState>,
 }
 
 impl CryptoState {
@@ -570,13 +578,6 @@ impl CryptoState {
         None
     }
 }
-
-const RETRY_INTEGRITY_KEY: [u8; 16] = [
-    0xbe, 0x0c, 0x69, 0x0b, 0x9f, 0x66, 0x57, 0x5a, 0x1d, 0x76, 0x6b, 0x54, 0xe3, 0x68, 0xc8, 0x4e,
-];
-const RETRY_INTEGRITY_NONCE: [u8; 12] = [
-    0x46, 0x15, 0x99, 0xd3, 0x5d, 0x63, 0x2b, 0xf2, 0x23, 0x98, 0x25, 0xbb,
-];
 
 pub fn compute_retry_integrity_tag(odcid: &[u8], header_and_token: &[u8]) -> Result<[u8; 16]> {
     let mut pseudo_packet = Vec::with_capacity(1 + odcid.len() + header_and_token.len());

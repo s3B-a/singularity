@@ -90,16 +90,24 @@ impl ContentRange {
     }
 }
 
-fn parse_digits(value: &str) -> Result<u64, RangeError> {
-    if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
-        return Err(RangeError::Invalid);
+impl fmt::Display for ByteRangeSpec {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ByteRangeSpec::FromTo(first, last) => write!(f, "{}-{}", first, last),
+            ByteRangeSpec::From(first) => write!(f, "{}-", first),
+            ByteRangeSpec::Suffix(length) => write!(f, "-{}", length),
+        }
     }
-
-    value.parse().map_err(|_| RangeError::Invalid)
 }
 
-fn find(haystack: &[u8], needle: &[u8], from: usize) -> Option<usize> {
-    haystack.get(from..)?.windows(needle.len()).position(|w| w == needle).map(|p| p + from)
+impl fmt::Display for ContentRange {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ContentRange::Bytes { range, complete_length: Some(len) } => write!(f, "bytes {}-{}/{}", range.start, range.end, len),
+            ContentRange::Bytes { range, complete_length: None } => write!(f, "bytes {}-{}/*", range.start, range.end),
+            ContentRange::Unsatisfied { complete_length } => write!(f, "bytes */{}", complete_length),
+        }
+    }
 }
 
 pub fn parse_range_header(value: &str) -> Result<Vec<ByteRangeSpec>, RangeError> {
@@ -222,24 +230,16 @@ pub fn parse_multipart_byteranges(body: &[u8], boundary: &str) -> Result<Vec<Byt
     }
 }
 
-impl fmt::Display for ByteRangeSpec {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            ByteRangeSpec::FromTo(first, last) => write!(f, "{}-{}", first, last),
-            ByteRangeSpec::From(first) => write!(f, "{}-", first),
-            ByteRangeSpec::Suffix(length) => write!(f, "-{}", length),
-        }
+fn parse_digits(value: &str) -> Result<u64, RangeError> {
+    if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(RangeError::Invalid);
     }
+
+    value.parse().map_err(|_| RangeError::Invalid)
 }
 
-impl fmt::Display for ContentRange {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            ContentRange::Bytes { range, complete_length: Some(len) } => write!(f, "bytes {}-{}/{}", range.start, range.end, len),
-            ContentRange::Bytes { range, complete_length: None } => write!(f, "bytes {}-{}/*", range.start, range.end),
-            ContentRange::Unsatisfied { complete_length } => write!(f, "bytes */{}", complete_length),
-        }
-    }
+fn find(haystack: &[u8], needle: &[u8], from: usize) -> Option<usize> {
+    haystack.get(from..)?.windows(needle.len()).position(|w| w == needle).map(|p| p + from)
 }
 
 #[cfg(test)]

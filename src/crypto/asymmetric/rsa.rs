@@ -6,6 +6,7 @@ use crate::crypto::encoding::pem;
 use crate::crypto::bignum::{BigNum, MontgomeryContext};
 use crate::crypto::hash::sha2::Sha256;
 use crate::crypto::random;
+
 use std::cmp::Ordering;
 use std::ops::{Add, Sub, Mul, Div};
 
@@ -28,23 +29,6 @@ pub const DIGEST_INFO_SHA512: [u8; 19] = [
     0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x03, 0x05,
     0x00, 0x04, 0x40,
 ];
-
-// RSA Key Sizes
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RsaKeySize {
-    Rsa2048,
-    Rsa3072,
-    Rsa4096,
-}
-
-// RSA Padding Schemes
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RsaPadding {
-    Pkcs1v15,
-    OaepSha256,
-    PssSha256,
-    NoPadding,
-}
 
 // RSA Private Key Structure
 #[derive(Clone, Debug)]
@@ -86,6 +70,23 @@ pub struct RsaPrivateKeyComponents {
 pub struct RsaPublicKeyComponents {
     pub n: Vec<u8>,
     pub e: Vec<u8>,
+}
+
+// RSA Key Sizes
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RsaKeySize {
+    Rsa2048,
+    Rsa3072,
+    Rsa4096,
+}
+
+// RSA Padding Schemes
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RsaPadding {
+    Pkcs1v15,
+    OaepSha256,
+    PssSha256,
+    NoPadding,
 }
 
 impl RsaKeySize {

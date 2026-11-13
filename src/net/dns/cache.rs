@@ -1,16 +1,33 @@
-use super::packet::ResponseCode;
-use super::record::{DnsRecord, RecordType};
 use crate::crypto::constant_time_eq;
 use crate::crypto::encoding::pem;
 use crate::crypto::hash::sha2::sha256;
 use crate::crypto::random;
 use crate::net::http::compression::{self, CompressionAlgorithm, CompressionLevel};
+use super::packet::ResponseCode;
+use super::record::{DnsRecord, RecordType};
+
 use std::collections::HashMap;
 use std::io;
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
 const CACHE_STATS_MAGIC: &str = "SINGULARITY_DNS_CACHE_STATS_V1";
+
+#[derive(Clone)]
+pub struct DnsCache {
+    cache: Arc<RwLock<HashMap<CacheKey, Vec<CacheEntry>>>>,
+    negative_cache: Arc<RwLock<HashMap<CacheKey, NegativeCacheEntry>>>,
+    max_size: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct CacheStats {
+    pub total_keys: usize,
+    pub total_entries: usize,
+    pub expired_entries: usize,
+    pub min_ttl: u32,
+    pub max_ttl: u32,
+}
 
 #[derive(Debug, Clone, Copy)]
 struct NegativeCacheEntry {
@@ -19,18 +36,24 @@ struct NegativeCacheEntry {
     inserted_at: Instant,
 }
 
-impl NegativeCacheEntry {
-    fn is_expired(&self) -> bool {
-        self.inserted_at.elapsed().as_secs() as u32 >= self.ttl
-    }
-}
-
 #[derive(Clone)]
 struct CacheEntry {
     record: DnsRecord,
     insert_time: Instant,
     integrity_nonce: Vec<u8>,
     integrity_tag: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct CacheKey {
+    name_hash: String,
+    record_type: RecordType,
+}
+
+impl NegativeCacheEntry {
+    fn is_expired(&self) -> bool {
+        self.inserted_at.elapsed().as_secs() as u32 >= self.ttl
+    }
 }
 
 impl CacheEntry {
@@ -79,28 +102,6 @@ impl CacheEntry {
 
         pem::encode(&sha256(&material))
     }
-}
-
-#[derive(Clone)]
-pub struct DnsCache {
-    cache: Arc<RwLock<HashMap<CacheKey, Vec<CacheEntry>>>>,
-    negative_cache: Arc<RwLock<HashMap<CacheKey, NegativeCacheEntry>>>,
-    max_size: usize,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct CacheKey {
-    name_hash: String,
-    record_type: RecordType,
-}
-
-#[derive(Debug, Clone)]
-pub struct CacheStats {
-    pub total_keys: usize,
-    pub total_entries: usize,
-    pub expired_entries: usize,
-    pub min_ttl: u32,
-    pub max_ttl: u32,
 }
 
 impl CacheKey {
@@ -356,6 +357,12 @@ impl DnsCache {
     }
 }
 
+impl Default for DnsCache {
+    fn default() -> Self {
+        Self::new(1024)
+    }
+}
+
 fn split_header_body(data: &[u8]) -> io::Result<(String, &[u8])> {
     const SEP: &[u8] = b"\n\n";
     if let Some(pos) = data.windows(SEP.len()).position(|w| w == SEP) {
@@ -420,12 +427,6 @@ fn parse_stats_from_text(payload: &str) -> io::Result<CacheStats> {
             io::Error::new(io::ErrorKind::InvalidData, "missing max_ttl in stats payload")
         })?,
     })
-}
-
-impl Default for DnsCache {
-    fn default() -> Self {
-        Self::new(1024)
-    }
 }
 
 #[cfg(test)]

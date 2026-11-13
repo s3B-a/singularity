@@ -1,3 +1,9 @@
+use crate::crypto::constant_time_eq;
+use crate::crypto::encoding::pem;
+use crate::crypto::hash::hmac::hmac_sha256;
+use crate::crypto::hash::sha2::sha256;
+use crate::net::http::compression::{CompressionAlgorithm};
+use crate::net::udp::UdpSocket;
 use super::crypto::{CryptoState, EncryptionLevel};
 use super::error::{Error, ErrorCode, Result};
 use super::frame::Frame;
@@ -7,12 +13,7 @@ use super::qpack::{QpackDecoder, QpackEncoder};
 use super::stream::{Stream, StreamId, StreamType};
 use super::recovery::RecoveryManager;
 use super::{decode_varint, Config, ConnectionId, ConnectionState, Role, TransportParams};
-use crate::crypto::constant_time_eq;
-use crate::crypto::encoding::pem;
-use crate::crypto::hash::hmac::hmac_sha256;
-use crate::crypto::hash::sha2::sha256;
-use crate::net::http::compression::{CompressionAlgorithm};
-use crate::net::udp::UdpSocket;
+
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -27,6 +28,78 @@ pub struct SecureHttp3ConnectionBlobMeta {
     pub algorithm: CompressionAlgorithm,
     pub timestamp_unix_secs: u64,
     pub version: u16,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ConnectionStats {
+    pub bytes_sent: u64,
+    pub bytes_received: u64,
+    pub packets_sent: u64,
+    pub packets_received: u64,
+    pub packets_lost: u64,
+    pub smoothed_rtt: Option<Duration>,
+    pub min_rtt: Option<Duration>,
+    pub cwnd: u64,
+    pub streams_opened: usize,
+}
+
+pub struct Http3Connection {
+    socket: UdpSocket,
+    peer_addr: SocketAddr,
+    role: Role,
+    state: ConnectionState,
+    config: Config,
+    scid: ConnectionId,
+    dcid: ConnectionId,
+    odcid: Option<ConnectionId>,
+    pub streams: HashMap<StreamId, Stream>,
+    next_client_stream_id: StreamId,
+    next_server_stream_id: StreamId,
+    next_client_uni_stream_id: StreamId,
+    next_server_uni_stream_id: StreamId,
+    crypto: CryptoState,
+    recovery: RecoveryManager,
+    send_queue: VecDeque<Packet>,
+    control_stream_id: Option<StreamId>,
+    qpack_encoder_stream_id: Option<StreamId>,
+    qpack_decoder_stream_id: Option<StreamId>,
+    peer_control_stream_id: Option<StreamId>,
+    peer_qpack_encoder_stream_id: Option<StreamId>,
+    peer_qpack_decoder_stream_id: Option<StreamId>,
+    uni_stream_kind: HashMap<StreamId, UniStreamKind>,
+    uni_stream_pending: HashMap<StreamId, Vec<u8>>,
+    qpack_encoder: QpackEncoder,
+    qpack_decoder: QpackDecoder,
+    peer_settings: HashMap<u64, u64>,
+    local_settings: HashMap<u64, u64>,
+    pending_acks: HashMap<PacketNumberSpace, Vec<u64>>,
+    next_packet_number: HashMap<PacketNumberSpace, u64>,
+    last_ack_sent: HashMap<PacketNumberSpace, Instant>,
+    largest_pn_seen: HashMap<PacketNumberSpace, u64>,
+    close_reason: Option<(ErrorCode, Vec<u8>)>,
+    established_time: Option<Instant>,
+    idle_timeout: Duration,
+    last_activity: Instant,
+    peer_transport_params: Option<TransportParams>,
+    max_data: u64,
+    data_sent: u64,
+    max_data_recieved: u64,
+    data_recieved: u64,
+    address_validated: bool,
+    bytes_received_before_validation: usize,
+    bytes_sent_before_validation: usize,
+    pending_retry: Option<(Vec<u8>, ConnectionId)>,
+    outgoing_initial_token: Option<Vec<u8>>,
+    peer_connection_ids: HashMap<u64, (ConnectionId, [u8; 16])>,
+    last_path_response: Option<[u8; 8]>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UniStreamKind {
+    Control,
+    QpackEncoder,
+    QpackDecoder,
+    Unknown,
 }
 
 impl SecureHttp3ConnectionBlobMeta {
@@ -98,114 +171,6 @@ impl SecureHttp3ConnectionBlobMeta {
             CompressionAlgorithm::Zstd => "zstd",
         }
     }
-}
-
-pub fn select_secure_connection_algorithm(accept_encoding: &str) -> CompressionAlgorithm {
-    let algorithms = [
-        CompressionAlgorithm::Zstd,
-        CompressionAlgorithm::Brotli,
-        CompressionAlgorithm::Gzip,
-        CompressionAlgorithm::Deflate,
-        CompressionAlgorithm::Identity,
-    ];
-
-    for alg in &algorithms {
-        let name = match alg {
-            CompressionAlgorithm::Identity => "identity",
-            CompressionAlgorithm::Gzip => "gzip",
-            CompressionAlgorithm::Deflate => "deflate",
-            CompressionAlgorithm::Brotli => "br",
-            CompressionAlgorithm::Zstd => "zstd",
-        };
-        if accept_encoding.contains(name) {
-            return *alg;
-        }
-    }
-
-    CompressionAlgorithm::Identity
-}
-
-fn parse_compression_algorithm(s: &str) -> Result<CompressionAlgorithm> {
-    match s {
-        "identity" => Ok(CompressionAlgorithm::Identity),
-        "gzip" => Ok(CompressionAlgorithm::Gzip),
-        "deflate" => Ok(CompressionAlgorithm::Deflate),
-        "brotli" => Ok(CompressionAlgorithm::Brotli),
-        "zstd" => Ok(CompressionAlgorithm::Zstd),
-        _ => Err(Error::Crypto("Unknown compression algorithm".to_string())),
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct ConnectionStats {
-    pub bytes_sent: u64,
-    pub bytes_received: u64,
-    pub packets_sent: u64,
-    pub packets_received: u64,
-    pub packets_lost: u64,
-    pub smoothed_rtt: Option<Duration>,
-    pub min_rtt: Option<Duration>,
-    pub cwnd: u64,
-    pub streams_opened: usize,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum UniStreamKind {
-    Control,
-    QpackEncoder,
-    QpackDecoder,
-    Unknown,
-}
-
-pub struct Http3Connection {
-    socket: UdpSocket,
-    peer_addr: SocketAddr,
-    role: Role,
-    state: ConnectionState,
-    config: Config,
-    scid: ConnectionId,
-    dcid: ConnectionId,
-    odcid: Option<ConnectionId>,
-    pub streams: HashMap<StreamId, Stream>,
-    next_client_stream_id: StreamId,
-    next_server_stream_id: StreamId,
-    next_client_uni_stream_id: StreamId,
-    next_server_uni_stream_id: StreamId,
-    crypto: CryptoState,
-    recovery: RecoveryManager,
-    send_queue: VecDeque<Packet>,
-    control_stream_id: Option<StreamId>,
-    qpack_encoder_stream_id: Option<StreamId>,
-    qpack_decoder_stream_id: Option<StreamId>,
-    peer_control_stream_id: Option<StreamId>,
-    peer_qpack_encoder_stream_id: Option<StreamId>,
-    peer_qpack_decoder_stream_id: Option<StreamId>,
-    uni_stream_kind: HashMap<StreamId, UniStreamKind>,
-    uni_stream_pending: HashMap<StreamId, Vec<u8>>,
-    qpack_encoder: QpackEncoder,
-    qpack_decoder: QpackDecoder,
-    peer_settings: HashMap<u64, u64>,
-    local_settings: HashMap<u64, u64>,
-    pending_acks: HashMap<PacketNumberSpace, Vec<u64>>,
-    next_packet_number: HashMap<PacketNumberSpace, u64>,
-    last_ack_sent: HashMap<PacketNumberSpace, Instant>,
-    largest_pn_seen: HashMap<PacketNumberSpace, u64>,
-    close_reason: Option<(ErrorCode, Vec<u8>)>,
-    established_time: Option<Instant>,
-    idle_timeout: Duration,
-    last_activity: Instant,
-    peer_transport_params: Option<TransportParams>,
-    max_data: u64,
-    data_sent: u64,
-    max_data_recieved: u64,
-    data_recieved: u64,
-    address_validated: bool,
-    bytes_received_before_validation: usize,
-    bytes_sent_before_validation: usize,
-    pending_retry: Option<(Vec<u8>, ConnectionId)>,
-    outgoing_initial_token: Option<Vec<u8>>,
-    peer_connection_ids: HashMap<u64, (ConnectionId, [u8; 16])>,
-    last_path_response: Option<[u8; 8]>,
 }
 
 impl Http3Connection {
@@ -1283,6 +1248,31 @@ impl Http3Connection {
     }
 }
 
+pub fn select_secure_connection_algorithm(accept_encoding: &str) -> CompressionAlgorithm {
+    let algorithms = [
+        CompressionAlgorithm::Zstd,
+        CompressionAlgorithm::Brotli,
+        CompressionAlgorithm::Gzip,
+        CompressionAlgorithm::Deflate,
+        CompressionAlgorithm::Identity,
+    ];
+
+    for alg in &algorithms {
+        let name = match alg {
+            CompressionAlgorithm::Identity => "identity",
+            CompressionAlgorithm::Gzip => "gzip",
+            CompressionAlgorithm::Deflate => "deflate",
+            CompressionAlgorithm::Brotli => "br",
+            CompressionAlgorithm::Zstd => "zstd",
+        };
+        if accept_encoding.contains(name) {
+            return *alg;
+        }
+    }
+
+    CompressionAlgorithm::Identity
+}
+
 pub fn encode_secure_http3_connection(conn: &Http3Connection, algorithm: CompressionAlgorithm) -> Result<Vec<u8>> {
     let meta = SecureHttp3ConnectionBlobMeta::new(algorithm)?;
     let meta_str = meta.to_string();
@@ -1653,6 +1643,17 @@ pub fn decode_secure_http3_connection(data: &[u8]) -> Result<(Http3Connection, S
     }
 
     Ok((conn, meta))
+}
+
+fn parse_compression_algorithm(s: &str) -> Result<CompressionAlgorithm> {
+    match s {
+        "identity" => Ok(CompressionAlgorithm::Identity),
+        "gzip" => Ok(CompressionAlgorithm::Gzip),
+        "deflate" => Ok(CompressionAlgorithm::Deflate),
+        "brotli" => Ok(CompressionAlgorithm::Brotli),
+        "zstd" => Ok(CompressionAlgorithm::Zstd),
+        _ => Err(Error::Crypto("Unknown compression algorithm".to_string())),
+    }
 }
 
 fn parse_connection_state(s: &str) -> Result<ConnectionState> {

@@ -1,14 +1,15 @@
-use super::cache::{CacheStats, DnsCache};
-use super::dnssec::{self, DnssecError};
-use super::query::DnsQuery;
-use super::record::{DnsRecord, RecordType};
-use super::response::DnsResponse;
 use crate::crypto::constant_time_eq;
 use crate::crypto::encoding::pem;
 use crate::crypto::hash::sha2::sha256;
 use crate::crypto::random;
 use crate::net::http::compression::{self, CompressionAlgorithm, CompressionLevel};
 use crate::net::https::tls::TlsCfg;
+use super::cache::{CacheStats, DnsCache};
+use super::dnssec::{self, DnssecError};
+use super::query::DnsQuery;
+use super::record::{DnsRecord, RecordType};
+use super::response::DnsResponse;
+
 use std::collections::HashMap;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -22,48 +23,6 @@ const MAX_NEGATIVE_TTL: u32 = 3600;
 
 const MAX_CNAME_CHAIN_DEPTH: usize = 8;
 
-enum ChainStep {
-    Answer(Vec<DnsRecord>, Vec<DnsRecord>),
-    Cname(DnsRecord, Vec<DnsRecord>),
-}
-
-fn interleave_address_families(primary: Vec<IpAddr>, secondary: Vec<IpAddr>) -> Vec<IpAddr> {
-    let mut result = Vec::with_capacity(primary.len() + secondary.len());
-    let mut primary = primary.into_iter();
-    let mut secondary = secondary.into_iter();
-    loop {
-        match (primary.next(), secondary.next()) {
-            (Some(a), Some(b)) => {
-                result.push(a);
-                result.push(b);
-            }
-            (Some(a), None) => {
-                result.push(a);
-                result.extend(primary);
-                break;
-            }
-            (None, Some(b)) => {
-                result.push(b);
-                result.extend(secondary);
-                break;
-            }
-            (None, None) => break,
-        }
-    }
-
-    result
-}
-
-fn negative_ttl_from_response(response: &DnsResponse) -> u32 {
-    response.authority().iter().find_map(|record| {
-        if let super::record::RecordData::SOA { minimum, .. } = &record.data {
-            Some((*minimum).min(record.ttl))
-        } else {
-            None
-        }
-    }).unwrap_or(DEFAULT_NEGATIVE_TTL).min(MAX_NEGATIVE_TTL)
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SecureResolverProfileMeta {
     pub algorithm: CompressionAlgorithm,
@@ -73,48 +32,10 @@ pub struct SecureResolverProfileMeta {
     pub encoded_size: usize,
 }
 
-pub fn well_known_dot_servers() -> Vec<(SocketAddr, &'static str)> {
-    vec![
-        (SocketAddr::new(IpAddr::V4(Ipv4Addr::new(91, 239, 100, 100)), 853), "anycast.uncensoreddns.org"), // UncensoredDNS
-        (SocketAddr::new(IpAddr::V4(Ipv4Addr::new(89, 233, 43, 71)), 853), "unicast.uncensoreddns.org"), // UncensoredDNS
-        (SocketAddr::new(IpAddr::V4(Ipv4Addr::new(9, 9, 9, 9)), 853), "dns.quad9.net"),       // Quad9
-        (SocketAddr::new(IpAddr::V4(Ipv4Addr::new(149, 112, 112, 112)), 853), "dns.quad9.net"), // Quad9
-        (SocketAddr::new(IpAddr::V4(Ipv4Addr::new(194, 242, 2, 2)), 853), "dns.mullvad.net"), // MullvadDNS
-        (SocketAddr::new(IpAddr::V4(Ipv4Addr::new(94, 140, 14, 14)), 853), "dns.adguard-dns.com"), // AdGuardDNS
-        (SocketAddr::new(IpAddr::V4(Ipv4Addr::new(94, 140, 15, 15)), 853), "dns.adguard-dns.com"), // AdGuardDNS
-    ]
-}
-
 #[derive(Debug, Clone)]
 pub struct TrustAnchor {
     pub zone: String,
     pub ds: Vec<DnsRecord>,
-}
-
-#[derive(Debug, Clone)]
-pub enum DnssecOutcome {
-    Exists(Vec<DnsRecord>),
-    NameError,
-    NoData,
-}
-
-pub fn well_known_root_trust_anchor() -> TrustAnchor {
-    let digest = vec![
-        0xE0, 0x6D, 0x44, 0x48, 0x0B, 0x8F, 0x1D, 0x39, 0xA9, 0x5C, 0x0B, 0x0D, 0x7C, 0x65,
-        0xD0, 0x84, 0x58, 0xE8, 0x80, 0x40, 0x9B, 0xBC, 0x68, 0x34, 0x57, 0x10, 0x42, 0x37,
-        0xC7, 0xF8, 0xEC, 0x8D,
-    ];
-
-    TrustAnchor {
-        zone: ".".to_string(),
-        ds: vec![DnsRecord::new(
-            ".".to_string(),
-            RecordType::DS,
-            super::record::RecordClass::IN,
-            0,
-            super::record::RecordData::DS { key_tag: 20326, algorithm: 8, digest_type: 2, digest },
-        )],
-    }
 }
 
 pub struct DnsResolver {
@@ -126,6 +47,18 @@ pub struct DnsResolver {
     pub accept_encoding: String,
     pub prefer_secure_queries: bool,
     pub secure_fallback_to_plain: bool,
+}
+
+#[derive(Debug, Clone)]
+pub enum DnssecOutcome {
+    Exists(Vec<DnsRecord>),
+    NameError,
+    NoData,
+}
+
+enum ChainStep {
+    Answer(Vec<DnsRecord>, Vec<DnsRecord>),
+    Cname(DnsRecord, Vec<DnsRecord>),
 }
 
 impl DnsResolver {
@@ -1048,6 +981,74 @@ impl Default for DnsResolver {
     fn default() -> Self {
         Self::new()
     }
+}
+
+pub fn well_known_dot_servers() -> Vec<(SocketAddr, &'static str)> {
+    vec![
+        (SocketAddr::new(IpAddr::V4(Ipv4Addr::new(91, 239, 100, 100)), 853), "anycast.uncensoreddns.org"), // UncensoredDNS
+        (SocketAddr::new(IpAddr::V4(Ipv4Addr::new(89, 233, 43, 71)), 853), "unicast.uncensoreddns.org"), // UncensoredDNS
+        (SocketAddr::new(IpAddr::V4(Ipv4Addr::new(9, 9, 9, 9)), 853), "dns.quad9.net"),       // Quad9
+        (SocketAddr::new(IpAddr::V4(Ipv4Addr::new(149, 112, 112, 112)), 853), "dns.quad9.net"), // Quad9
+        (SocketAddr::new(IpAddr::V4(Ipv4Addr::new(194, 242, 2, 2)), 853), "dns.mullvad.net"), // MullvadDNS
+        (SocketAddr::new(IpAddr::V4(Ipv4Addr::new(94, 140, 14, 14)), 853), "dns.adguard-dns.com"), // AdGuardDNS
+        (SocketAddr::new(IpAddr::V4(Ipv4Addr::new(94, 140, 15, 15)), 853), "dns.adguard-dns.com"), // AdGuardDNS
+    ]
+}
+
+pub fn well_known_root_trust_anchor() -> TrustAnchor {
+    let digest = vec![
+        0xE0, 0x6D, 0x44, 0x48, 0x0B, 0x8F, 0x1D, 0x39, 0xA9, 0x5C, 0x0B, 0x0D, 0x7C, 0x65,
+        0xD0, 0x84, 0x58, 0xE8, 0x80, 0x40, 0x9B, 0xBC, 0x68, 0x34, 0x57, 0x10, 0x42, 0x37,
+        0xC7, 0xF8, 0xEC, 0x8D,
+    ];
+
+    TrustAnchor {
+        zone: ".".to_string(),
+        ds: vec![DnsRecord::new(
+            ".".to_string(),
+            RecordType::DS,
+            super::record::RecordClass::IN,
+            0,
+            super::record::RecordData::DS { key_tag: 20326, algorithm: 8, digest_type: 2, digest },
+        )],
+    }
+}
+
+fn interleave_address_families(primary: Vec<IpAddr>, secondary: Vec<IpAddr>) -> Vec<IpAddr> {
+    let mut result = Vec::with_capacity(primary.len() + secondary.len());
+    let mut primary = primary.into_iter();
+    let mut secondary = secondary.into_iter();
+    loop {
+        match (primary.next(), secondary.next()) {
+            (Some(a), Some(b)) => {
+                result.push(a);
+                result.push(b);
+            }
+            (Some(a), None) => {
+                result.push(a);
+                result.extend(primary);
+                break;
+            }
+            (None, Some(b)) => {
+                result.push(b);
+                result.extend(secondary);
+                break;
+            }
+            (None, None) => break,
+        }
+    }
+
+    result
+}
+
+fn negative_ttl_from_response(response: &DnsResponse) -> u32 {
+    response.authority().iter().find_map(|record| {
+        if let super::record::RecordData::SOA { minimum, .. } = &record.data {
+            Some((*minimum).min(record.ttl))
+        } else {
+            None
+        }
+    }).unwrap_or(DEFAULT_NEGATIVE_TTL).min(MAX_NEGATIVE_TTL)
 }
 
 fn compute_resolver_profile_digest(nonce: &[u8], payload: &[u8]) -> [u8; 32] {

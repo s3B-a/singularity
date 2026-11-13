@@ -3,23 +3,12 @@
 
 use crate::crypto::{Error, Result};
 use crate::crypto::bignum::BigNum;
-use super::{ed25519, p256};
 use crate::crypto::hash::sha2::Sha256;
 use crate::crypto::hash::hmac::Hmac;
+use super::{ed25519, p256};
+
 use std::ops::{Add, Sub, Mul, Div};
 use std::cmp::Ordering;
-
-// SignatureScheme trait for signing messages
-pub trait SignatureScheme {
-    fn sign(&self, message: &[u8]) -> Result<Vec<u8>>;
-    fn public_bytes(&self) -> Vec<u8>;
-}
-
-// VerificationScheme trait for verifying signatures
-pub trait VerificationScheme {
-    fn verify(&self, message: &[u8], signature: &[u8]) -> Result<bool>;
-    fn to_bytes(&self) -> Vec<u8>;
-}
 
 // P-256 curve order in bytes
 const P256_ORDER_BYTES: [u8; 32] = [
@@ -28,6 +17,24 @@ const P256_ORDER_BYTES: [u8; 32] = [
     0xBC, 0xE6, 0xFA, 0xAD, 0xA7, 0x17, 0x9E, 0x84,
     0xF3, 0xB9, 0xCA, 0xC2, 0xFC, 0x63, 0x25, 0x51,
 ];
+
+// P-256 ECDSA Private Key structure
+pub struct P256EcdsaPrivateKey {
+    inner: p256::P256PrivateKey,
+}
+
+// P-256 ECDSA Public Key structure
+pub struct P256EcdsaPublicKey {
+    inner: p256::P256PublicKey,
+}
+
+// P-256 Point structure for elliptic curve point operations
+#[derive(Clone, Debug)]
+struct P256Point {
+    x: BigNum,
+    y: BigNum,
+    infinity: bool,
+}
 
 // Supported signature curves
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -54,22 +61,16 @@ pub enum Signature {
     P256Ecdsa(p256::P256Signature),
 }
 
-// P-256 ECDSA Private Key structure
-pub struct P256EcdsaPrivateKey {
-    inner: p256::P256PrivateKey,
+// SignatureScheme trait for signing messages
+pub trait SignatureScheme {
+    fn sign(&self, message: &[u8]) -> Result<Vec<u8>>;
+    fn public_bytes(&self) -> Vec<u8>;
 }
 
-// P-256 ECDSA Public Key structure
-pub struct P256EcdsaPublicKey {
-    inner: p256::P256PublicKey,
-}
-
-// P-256 Point structure for elliptic curve point operations
-#[derive(Clone, Debug)]
-struct P256Point {
-    x: BigNum,
-    y: BigNum,
-    infinity: bool,
+// VerificationScheme trait for verifying signatures
+pub trait VerificationScheme {
+    fn verify(&self, message: &[u8], signature: &[u8]) -> Result<bool>;
+    fn to_bytes(&self) -> Vec<u8>;
 }
 
 impl SigningKey {
@@ -472,6 +473,33 @@ impl P256EcdsaPublicKey {
     }
 }
 
+impl P256Point {
+
+    /**
+     * Retrieves the x-coordinate of the P256Point
+     * Args:
+     *    &self: The P256Point instance
+     * 
+     * Returns:
+     *    BigNum: The x-coordinate of the point
+     */
+    fn x_coordinate(&self) -> BigNum {
+        self.x.clone()
+    }
+    
+    /**
+     * Checks if the P256Point is the point at infinity
+     * Args:
+     *    &self: The P256Point instance
+     * 
+     * Returns:
+     *    bool: True if the point is at infinity, false otherwise
+     */
+    fn is_infinity(&self) -> bool {
+        self.infinity
+    }
+}
+
 impl SignatureScheme for SigningKey {
     
     /**
@@ -638,33 +666,6 @@ fn generate_k_rfc6979(private_key: &[u8; 32], hash: &[u8; 32], order: &[u8; 32])
         let mut hmac = Hmac::<Sha256>::new(&k_hmac);
         hmac.update(&v);
         v = hmac.finalize()[0..32].try_into().unwrap();
-    }
-}
-
-impl P256Point {
-
-    /**
-     * Retrieves the x-coordinate of the P256Point
-     * Args:
-     *    &self: The P256Point instance
-     * 
-     * Returns:
-     *    BigNum: The x-coordinate of the point
-     */
-    fn x_coordinate(&self) -> BigNum {
-        self.x.clone()
-    }
-    
-    /**
-     * Checks if the P256Point is the point at infinity
-     * Args:
-     *    &self: The P256Point instance
-     * 
-     * Returns:
-     *    bool: True if the point is at infinity, false otherwise
-     */
-    fn is_infinity(&self) -> bool {
-        self.infinity
     }
 }
 

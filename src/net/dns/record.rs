@@ -3,11 +3,30 @@ use crate::crypto::encoding::pem;
 use crate::crypto::hash::sha2::sha256;
 use crate::crypto::random;
 use crate::net::http::compression::{self, CompressionAlgorithm, CompressionLevel};
+
 use std::fmt;
 use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr};
 
 const DNS_RECORD_BLOB_MAGIC: &str = "SINGULARITY_DNS_RECORD_BLOB_V1";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SecureRecordBlobMeta {
+    pub algorithm: CompressionAlgorithm,
+    pub nonce_b64: String,
+    pub digest_b64: String,
+    pub raw_size: usize,
+    pub encoded_size: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct DnsRecord {
+    pub name: String,
+    pub record_type: RecordType,
+    pub record_class: RecordClass,
+    pub ttl: u32,
+    pub data: RecordData,
+}
 
 #[repr(u16)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -30,50 +49,6 @@ pub enum RecordType {
     Unknown(u16),
 }
 
-impl RecordType {
-    pub fn from_u16(value: u16) -> Self {
-        match value {
-            1 => RecordType::A,
-            2 => RecordType::NS,
-            5 => RecordType::CNAME,
-            6 => RecordType::SOA,
-            12 => RecordType::PTR,
-            15 => RecordType::MX,
-            16 => RecordType::TXT,
-            28 => RecordType::AAAA,
-            33 => RecordType::SRV,
-            41 => RecordType::OPT,
-            43 => RecordType::DS,
-            46 => RecordType::RRSIG,
-            47 => RecordType::NSEC,
-            48 => RecordType::DNSKEY,
-            50 => RecordType::NSEC3,
-            _ => RecordType::Unknown(value),
-        }
-    }
-
-    pub fn to_u16(self) -> u16 {
-        match self {
-            RecordType::A => 1,
-            RecordType::NS => 2,
-            RecordType::CNAME => 5,
-            RecordType::SOA => 6,
-            RecordType::PTR => 12,
-            RecordType::MX => 15,
-            RecordType::TXT => 16,
-            RecordType::AAAA => 28,
-            RecordType::SRV => 33,
-            RecordType::OPT => 41,
-            RecordType::DS => 43,
-            RecordType::RRSIG => 46,
-            RecordType::NSEC => 47,
-            RecordType::DNSKEY => 48,
-            RecordType::NSEC3 => 50,
-            RecordType::Unknown(v) => v,
-        }
-    }
-}
-
 #[repr(u16)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecordClass {
@@ -82,28 +57,6 @@ pub enum RecordClass {
     CH = 3,
     HS = 4,
     Unknown(u16),
-}
-
-impl RecordClass {
-    pub fn from_u16(value: u16) -> Self {
-        match value {
-            1 => RecordClass::IN,
-            2 => RecordClass::CS,
-            3 => RecordClass::CH,
-            4 => RecordClass::HS,
-            _ => RecordClass::Unknown(value),
-        }
-    }
-
-    pub fn to_u16(self) -> u16 {
-        match self {
-            RecordClass::IN => 1,
-            RecordClass::CS => 2,
-            RecordClass::CH => 3,
-            RecordClass::HS => 4,
-            RecordClass::Unknown(v) => v,
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -171,22 +124,70 @@ pub enum RecordData {
     Unknown(Vec<u8>),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SecureRecordBlobMeta {
-    pub algorithm: CompressionAlgorithm,
-    pub nonce_b64: String,
-    pub digest_b64: String,
-    pub raw_size: usize,
-    pub encoded_size: usize,
+impl RecordType {
+    pub fn from_u16(value: u16) -> Self {
+        match value {
+            1 => RecordType::A,
+            2 => RecordType::NS,
+            5 => RecordType::CNAME,
+            6 => RecordType::SOA,
+            12 => RecordType::PTR,
+            15 => RecordType::MX,
+            16 => RecordType::TXT,
+            28 => RecordType::AAAA,
+            33 => RecordType::SRV,
+            41 => RecordType::OPT,
+            43 => RecordType::DS,
+            46 => RecordType::RRSIG,
+            47 => RecordType::NSEC,
+            48 => RecordType::DNSKEY,
+            50 => RecordType::NSEC3,
+            _ => RecordType::Unknown(value),
+        }
+    }
+
+    pub fn to_u16(self) -> u16 {
+        match self {
+            RecordType::A => 1,
+            RecordType::NS => 2,
+            RecordType::CNAME => 5,
+            RecordType::SOA => 6,
+            RecordType::PTR => 12,
+            RecordType::MX => 15,
+            RecordType::TXT => 16,
+            RecordType::AAAA => 28,
+            RecordType::SRV => 33,
+            RecordType::OPT => 41,
+            RecordType::DS => 43,
+            RecordType::RRSIG => 46,
+            RecordType::NSEC => 47,
+            RecordType::DNSKEY => 48,
+            RecordType::NSEC3 => 50,
+            RecordType::Unknown(v) => v,
+        }
+    }
 }
 
-#[derive(Debug, Clone)]
-pub struct DnsRecord {
-    pub name: String,
-    pub record_type: RecordType,
-    pub record_class: RecordClass,
-    pub ttl: u32,
-    pub data: RecordData,
+impl RecordClass {
+    pub fn from_u16(value: u16) -> Self {
+        match value {
+            1 => RecordClass::IN,
+            2 => RecordClass::CS,
+            3 => RecordClass::CH,
+            4 => RecordClass::HS,
+            _ => RecordClass::Unknown(value),
+        }
+    }
+
+    pub fn to_u16(self) -> u16 {
+        match self {
+            RecordClass::IN => 1,
+            RecordClass::CS => 2,
+            RecordClass::CH => 3,
+            RecordClass::HS => 4,
+            RecordClass::Unknown(v) => v,
+        }
+    }
 }
 
 impl DnsRecord {

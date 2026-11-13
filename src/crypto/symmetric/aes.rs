@@ -189,42 +189,6 @@ const T3: [u32; 256] = [
     0xeb13f8f8, 0xe910f9f9, 0xef15fafa, 0xed16fbfb, 0xe31ffcfc, 0xe11cfdfd, 0xe719fefe, 0xe51affff,
 ];
 
-pub fn has_aes_ni() -> bool {
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))] {
-        #[cfg(target_feature = "aes")] {
-            return true;
-        }
-        
-        #[cfg(not(target_feature = "aes"))] {
-            unsafe {
-                #[cfg(target_arch = "x86_64")]
-                {
-                    let mut eax: u32;
-                    let mut ecx: u32;
-
-                    std::arch::x86_64::__cpuid(1);
-
-                    return false;
-                }
-            }
-        }
-    }
-
-    #[cfg(target_arch = "aarch64")] {
-        #[cfg(target_feature = "aes")]
-        {
-            return true;
-        }
-        
-        #[cfg(not(target_feature = "aes"))]
-        {
-            return false;
-        }
-    }
-
-    false
-}
-
 // Key expansion for AES-128
 #[derive(Debug, Clone)]
 pub struct Aes {
@@ -723,6 +687,42 @@ impl AesOptimized {
             _ => 0x00,
         }
     }
+}
+
+pub fn has_aes_ni() -> bool {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))] {
+        #[cfg(target_feature = "aes")] {
+            return true;
+        }
+        
+        #[cfg(not(target_feature = "aes"))] {
+            unsafe {
+                #[cfg(target_arch = "x86_64")]
+                {
+                    let mut eax: u32;
+                    let mut ecx: u32;
+
+                    std::arch::x86_64::__cpuid(1);
+
+                    return false;
+                }
+            }
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")] {
+        #[cfg(target_feature = "aes")]
+        {
+            return true;
+        }
+        
+        #[cfg(not(target_feature = "aes"))]
+        {
+            return false;
+        }
+    }
+
+    false
 }
 
 /**

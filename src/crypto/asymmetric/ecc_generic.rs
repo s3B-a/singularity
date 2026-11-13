@@ -4,15 +4,9 @@
 use crate::crypto::bignum::BigNum;
 use crate::crypto::encoding::asn1::DerDecoder;
 use crate::crypto::{Error, Result};
+
 use std::cmp::Ordering;
 use std::ops::{Add, Mul, Shr, Sub};
-
-// Represents the supported NIST curves for ECDSA and ECDH operations
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum NistCurve {
-    P384,
-    P521,
-}
 
 // Represents a point on an elliptic curve in affine coordinates (x, y)
 #[derive(Clone, Debug)]
@@ -20,6 +14,23 @@ struct AffinePoint {
     x: BigNum,
     y: BigNum,
     infinity: bool,
+}
+
+// Represents the parameters of an elliptic curve, including the prime field, coefficients, order, generator point, and field size
+struct CurveParams {
+    p: BigNum,
+    a: BigNum,
+    b: BigNum,
+    n: BigNum,
+    g: AffinePoint,
+    field_bytes: usize,
+}
+
+// Represents the supported NIST curves for ECDSA and ECDH operations
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NistCurve {
+    P384,
+    P521,
 }
 
 impl AffinePoint {
@@ -37,14 +48,68 @@ impl AffinePoint {
     }
 }
 
-// Represents the parameters of an elliptic curve, including the prime field, coefficients, order, generator point, and field size
-struct CurveParams {
-    p: BigNum,
-    a: BigNum,
-    b: BigNum,
-    n: BigNum,
-    g: AffinePoint,
-    field_bytes: usize,
+/**
+ * Converts a DER `ECDSA-Sig-Value` (`SEQUENCE { r INTEGER, s INTEGER }`, the form certificates
+ * actually carry) into fixed-width big-endian `r || s`, for feeding curve implementations that
+ * expect a raw fixed-length signature instead
+ * Args:
+ *    der - &[u8]: The DER-encoded signature
+ *    field_bytes - usize: The curve's coordinate width (32 for P-256)
+ *
+ * Returns:
+ *    Result<Vec<u8>>: The fixed-width `r || s` signature
+ */
+pub fn der_signature_to_fixed(der: &[u8], field_bytes: usize) -> Result<Vec<u8>> {
+    let (r, s) = parse_der_signature(der)?;
+    let mut out = vec![0u8; field_bytes * 2];
+    write_fixed_be(&r, &mut out[..field_bytes])?;
+    write_fixed_be(&s, &mut out[field_bytes..])?;
+    
+    Ok(out)
+}
+
+/**
+ * Verifies an ECDSA signature over a pre-computed message digest
+ * Args:
+ *    curve - NistCurve: Which NIST curve the public key is on
+ *    public_key_bytes - &[u8]: The SEC1 uncompressed public key point
+ *    digest - &[u8]: The message digest (already hashed per the certificate's signature
+ *      algorithm - e.g. SHA-384 for ecdsa-with-SHA384)
+ *    der_signature - &[u8]: The DER-encoded ECDSA-Sig-Value signature
+ *
+ * Returns:
+ *    Result<bool>: True if the signature is valid
+ */
+pub fn verify_prehashed(curve: NistCurve, public_key_bytes: &[u8], digest: &[u8], der_signature: &[u8]) -> Result<bool> {
+    let params = curve_params(curve);
+    let public_key = decode_uncompressed_point(public_key_bytes, &params)?;
+    if !is_on_curve(&public_key, &params) {
+        return Ok(false);
+    }
+
+    let (r, s) = parse_der_signature(der_signature)?;
+    if r.is_zero() || s.is_zero() || r.cmp(&params.n) != Ordering::Less || s.cmp(&params.n) != Ordering::Less {
+        return Ok(false);
+    }
+
+    let e = hash_to_int(digest, &params.n);
+    let w = match mod_inv(&s, &params.n) {
+        Ok(inv) => inv,
+        Err(_) => return Ok(false),
+    };
+
+    let u1 = mod_mul(&e, &w, &params.n);
+    let u2 = mod_mul(&r, &w, &params.n);
+
+    let p1 = scalar_mult(&u1, &params.g, &params)?;
+    let p2 = scalar_mult(&u2, &public_key, &params)?;
+    let point = point_add(&p1, &p2, &params)?;
+    if point.infinity {
+        return Ok(false);
+    }
+
+    let v = point.x.modulo(&params.n);
+    Ok(v == r)
 }
 
 /**
@@ -395,70 +460,6 @@ fn write_fixed_be(value: &BigNum, dest: &mut [u8]) -> Result<()> {
     let start = dest.len() - bytes.len();
     dest[start..].copy_from_slice(&bytes);
     Ok(())
-}
-
-/**
- * Converts a DER `ECDSA-Sig-Value` (`SEQUENCE { r INTEGER, s INTEGER }`, the form certificates
- * actually carry) into fixed-width big-endian `r || s`, for feeding curve implementations that
- * expect a raw fixed-length signature instead
- * Args:
- *    der - &[u8]: The DER-encoded signature
- *    field_bytes - usize: The curve's coordinate width (32 for P-256)
- *
- * Returns:
- *    Result<Vec<u8>>: The fixed-width `r || s` signature
- */
-pub fn der_signature_to_fixed(der: &[u8], field_bytes: usize) -> Result<Vec<u8>> {
-    let (r, s) = parse_der_signature(der)?;
-    let mut out = vec![0u8; field_bytes * 2];
-    write_fixed_be(&r, &mut out[..field_bytes])?;
-    write_fixed_be(&s, &mut out[field_bytes..])?;
-    
-    Ok(out)
-}
-
-/**
- * Verifies an ECDSA signature over a pre-computed message digest
- * Args:
- *    curve - NistCurve: Which NIST curve the public key is on
- *    public_key_bytes - &[u8]: The SEC1 uncompressed public key point
- *    digest - &[u8]: The message digest (already hashed per the certificate's signature
- *      algorithm - e.g. SHA-384 for ecdsa-with-SHA384)
- *    der_signature - &[u8]: The DER-encoded ECDSA-Sig-Value signature
- *
- * Returns:
- *    Result<bool>: True if the signature is valid
- */
-pub fn verify_prehashed(curve: NistCurve, public_key_bytes: &[u8], digest: &[u8], der_signature: &[u8]) -> Result<bool> {
-    let params = curve_params(curve);
-    let public_key = decode_uncompressed_point(public_key_bytes, &params)?;
-    if !is_on_curve(&public_key, &params) {
-        return Ok(false);
-    }
-
-    let (r, s) = parse_der_signature(der_signature)?;
-    if r.is_zero() || s.is_zero() || r.cmp(&params.n) != Ordering::Less || s.cmp(&params.n) != Ordering::Less {
-        return Ok(false);
-    }
-
-    let e = hash_to_int(digest, &params.n);
-    let w = match mod_inv(&s, &params.n) {
-        Ok(inv) => inv,
-        Err(_) => return Ok(false),
-    };
-
-    let u1 = mod_mul(&e, &w, &params.n);
-    let u2 = mod_mul(&r, &w, &params.n);
-
-    let p1 = scalar_mult(&u1, &params.g, &params)?;
-    let p2 = scalar_mult(&u2, &public_key, &params)?;
-    let point = point_add(&p1, &p2, &params)?;
-    if point.infinity {
-        return Ok(false);
-    }
-
-    let v = point.x.modulo(&params.n);
-    Ok(v == r)
 }
 
 /**

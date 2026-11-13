@@ -6,6 +6,7 @@
 // https://en.wikipedia.org/wiki/Arbitrary-precision_arithmetic
 
 use crate::crypto::{Error, Result};
+
 use std::cmp::Ordering;
 use std::fmt;
 use std::ops::{Add, Sub, Mul, Div, Rem, Shl, Shr, BitAnd, BitOr, BitXor};
@@ -1494,6 +1495,15 @@ impl MontgomeryContext {
     }
 }
 
+// Division with remainder implementation for BigNum
+impl BigNum {
+
+    // Division with remainder
+    fn div_rem(&self, divisor: &BigNum) -> (BigNum, BigNum) {
+        Self::div_rem_optimized(self, divisor)
+    }
+}
+
 // Debug implementation for BigNum
 impl fmt::Debug for BigNum {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
@@ -1638,7 +1648,6 @@ impl<'a> Sub<BigNum> for &'a BigNum {
     }
 }
 
-
 // Multiplication implementation for BigNum
 impl Mul for BigNum {
     type Output = BigNum;
@@ -1735,15 +1744,6 @@ impl<'a> Rem<BigNum> for &'a BigNum {
     type Output = BigNum;
     fn rem(self, other: BigNum) -> BigNum {
         self.clone().rem(other)
-    }
-}
-
-// Division with remainder implementation for BigNum
-impl BigNum {
-
-    // Division with remainder
-    fn div_rem(&self, divisor: &BigNum) -> (BigNum, BigNum) {
-        Self::div_rem_optimized(self, divisor)
     }
 }
 
@@ -1874,13 +1874,6 @@ impl BitXor for BigNum {
     }
 }
 
-// Helper for hex encoding/decoding
-mod hex {
-    pub fn encode(bytes: &[u8]) -> String {
-        bytes.iter().map(|b| format!("{:02x}", b)).collect()
-    }
-}
-
 /**
  * Helper function to count the number of trailing zero bits in a BigNum
  * (Find the highest power of 2 that divides n)
@@ -1916,6 +1909,13 @@ fn signed_sub(a: &BigNum, a_neg: bool, b: &BigNum, b_neg: bool) -> (BigNum, bool
         }
     } else {
         (a + b, a_neg)
+    }
+}
+
+// Helper for hex encoding/decoding
+mod hex {
+    pub fn encode(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{:02x}", b)).collect()
     }
 }
 

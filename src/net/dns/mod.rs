@@ -6,15 +6,6 @@ mod response;
 mod resolver;
 pub mod dnssec;
 
-use crate::crypto::constant_time_eq;
-use crate::crypto::encoding::pem;
-use crate::crypto::hash::hmac::hmac_sha256;
-use crate::crypto::hash::sha2::sha256;
-use crate::crypto::random;
-use crate::net::http::compression::{self, CompressionAlgorithm, CompressionLevel};
-use std::io;
-use std::time::{SystemTime, UNIX_EPOCH};
-
 pub use record::{RecordType, RecordClass, RecordData, DnsRecord};
 pub use packet::{DnsPacket, DnsHeader, DnsQuestion, OpCode, ResponseCode};
 pub use cache::{DnsCache, CacheStats};
@@ -22,6 +13,16 @@ pub use query::DnsQuery;
 pub use response::{DnsResponse, ValidationError};
 pub use resolver::{DnsResolver, TrustAnchor, DnssecOutcome, well_known_dot_servers, well_known_root_trust_anchor};
 pub use dnssec::DnssecError;
+
+use crate::crypto::constant_time_eq;
+use crate::crypto::encoding::pem;
+use crate::crypto::hash::hmac::hmac_sha256;
+use crate::crypto::hash::sha2::sha256;
+use crate::crypto::random;
+use crate::net::http::compression::{self, CompressionAlgorithm, CompressionLevel};
+
+use std::io;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const DNS_SECURE_ENVELOPE_MAGIC: &str = "SINGULARITY_DNS_SECURE_V1";
 const DNS_SECURE_ENVELOPE_CONTEXT: &str = "SINGULARITY_DNS_SECURE_BINDING_V1";

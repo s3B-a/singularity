@@ -5,6 +5,7 @@ use crate::crypto::hash::md5::md5_hex;
 use crate::crypto::hash::sha2::sha256;
 use crate::crypto::random;
 use crate::net::http::compression::{self, CompressionAlgorithm, CompressionLevel};
+
 use std::collections::HashMap;
 use std::fmt;
 use std::io;
@@ -18,12 +19,6 @@ pub struct Authenticator {
     nc_counter: u32,
     cnonce_cache: Option<String>,
     last_challenge: Option<(AuthChallenge, Instant)>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum AuthScheme {
-    Basic,
-    Digest,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -44,23 +39,6 @@ pub struct Credentials {
 }
 
 #[derive(Debug, Clone)]
-pub enum AuthError {
-    MissingCredentials,
-    InvalidChallenge(String),
-    UnsupportedScheme(String),
-    EncodingError(String),
-}
-
-impl Credentials {
-    pub fn new(username: impl Into<String>, password: impl Into<String>) -> Self {
-        Self {
-            username: username.into(),
-            password: password.into(),
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
 pub struct DigestChallenge {
     pub realm: String,
     pub nonce: String,
@@ -71,16 +49,39 @@ pub struct DigestChallenge {
     pub stale: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DigestAlgorithm {
-    Md5,
-    Sha256,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AuthScheme {
+    Basic,
+    Digest,
+}
+
+#[derive(Debug, Clone)]
+pub enum AuthError {
+    MissingCredentials,
+    InvalidChallenge(String),
+    UnsupportedScheme(String),
+    EncodingError(String),
 }
 
 #[derive(Debug, Clone)]
 pub enum AuthChallenge {
     Basic { realm: String },
     Digest(DigestChallenge),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DigestAlgorithm {
+    Md5,
+    Sha256,
+}
+
+impl Credentials {
+    pub fn new(username: impl Into<String>, password: impl Into<String>) -> Self {
+        Self {
+            username: username.into(),
+            password: password.into(),
+        }
+    }
 }
 
 impl AuthChallenge {
@@ -432,6 +433,51 @@ impl Authenticator {
         self.cnonce_cache = None;
     }
 }
+
+impl DigestAlgorithm {
+    fn parse(value: &str) -> Result<(Self, bool), AuthError> {
+        let value = value.trim();
+        match value.to_ascii_uppercase().as_str() {
+            "" | "MD5" => Ok((DigestAlgorithm::Md5, false)),
+            "MD5-SESS" => Ok((DigestAlgorithm::Md5, true)),
+            "SHA-256" => Ok((DigestAlgorithm::Sha256, false)),
+            "SHA-256-SESS" => Ok((DigestAlgorithm::Sha256, true)),
+            _ => Err(AuthError::UnsupportedScheme(format!("Unsupported algorithm: {}", value))),
+        }
+    }
+
+    fn hex_digest(self, input: &[u8]) -> String {
+        match self {
+            DigestAlgorithm::Md5 => md5_hex(input),
+            DigestAlgorithm::Sha256 => hex::encode(&sha256(input)),
+        }
+    }
+}
+
+impl Default for Authenticator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl fmt::Display for AuthError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            AuthError::MissingCredentials => {
+                write!(f, "No credentials provided for authentication")
+            }
+            AuthError::InvalidChallenge(msg) => {
+                write!(f, "Invalid authentication challenge: {}", msg)
+            }
+            AuthError::UnsupportedScheme(scheme) => {
+                write!(f, "Unsupported authentication scheme: {}", scheme)
+            }
+            AuthError::EncodingError(msg) => write!(f, "Encoding error: {}", msg),
+        }
+    }
+}
+
+impl std::error::Error for AuthError {}
 
 fn serialize_authenticator(auth: &Authenticator) -> Vec<u8> {
     let mut lines = Vec::new();
@@ -828,51 +874,6 @@ fn parse_secure_auth_blob_meta(header: &str, body_len: usize) -> io::Result<Secu
         encoded_size,
         issued_at_unix,
     })
-}
-
-impl Default for Authenticator {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl fmt::Display for AuthError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            AuthError::MissingCredentials => {
-                write!(f, "No credentials provided for authentication")
-            }
-            AuthError::InvalidChallenge(msg) => {
-                write!(f, "Invalid authentication challenge: {}", msg)
-            }
-            AuthError::UnsupportedScheme(scheme) => {
-                write!(f, "Unsupported authentication scheme: {}", scheme)
-            }
-            AuthError::EncodingError(msg) => write!(f, "Encoding error: {}", msg),
-        }
-    }
-}
-
-impl std::error::Error for AuthError {}
-
-impl DigestAlgorithm {
-    fn parse(value: &str) -> Result<(Self, bool), AuthError> {
-        let value = value.trim();
-        match value.to_ascii_uppercase().as_str() {
-            "" | "MD5" => Ok((DigestAlgorithm::Md5, false)),
-            "MD5-SESS" => Ok((DigestAlgorithm::Md5, true)),
-            "SHA-256" => Ok((DigestAlgorithm::Sha256, false)),
-            "SHA-256-SESS" => Ok((DigestAlgorithm::Sha256, true)),
-            _ => Err(AuthError::UnsupportedScheme(format!("Unsupported algorithm: {}", value))),
-        }
-    }
-
-    fn hex_digest(self, input: &[u8]) -> String {
-        match self {
-            DigestAlgorithm::Md5 => md5_hex(input),
-            DigestAlgorithm::Sha256 => hex::encode(&sha256(input)),
-        }
-    }
 }
 
 mod hex {

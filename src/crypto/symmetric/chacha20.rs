@@ -19,6 +19,12 @@ pub struct ChaCha20 {
     ks_index: usize,
 }
 
+// ChaCha20 Poly1305 AEAD construction
+#[derive(Clone)]
+pub struct ChaCha20Poly1305 {
+    key: [u8; 32],
+}
+
 impl ChaCha20 {
 
     /**
@@ -293,42 +299,6 @@ impl ChaCha20 {
     }
 }
 
-/**
- * Performs the quarter round operation on the state
- * Args:
- *    state - &mut [u32; 16]: The state array
- *    a - usize: Index a
- *    b - usize: Index b
- *    c - usize: Index c
- *    d - usize: Index d
- * 
- * Returns:
- *    (): Nothing
- */
-fn quarter_round(state: &mut [u32; 16], a: usize, b: usize, c: usize, d: usize) {
-    state[a] = state[a].wrapping_add(state[b]);
-    state[d] ^= state[a];
-    state[d] = state[d].rotate_left(16);
-
-    state[c] = state[c].wrapping_add(state[d]);
-    state[b] ^= state[c];
-    state[b] = state[b].rotate_left(12);
-
-    state[a] = state[a].wrapping_add(state[b]);
-    state[d] ^= state[a];
-    state[d] = state[d].rotate_left(8);
-
-    state[c] = state[c].wrapping_add(state[d]);
-    state[b] ^= state[c];
-    state[b] = state[b].rotate_left(7);
-}
-
-// ChaCha20 Poly1305 AEAD construction
-#[derive(Clone)]
-pub struct ChaCha20Poly1305 {
-    key: [u8; 32],
-}
-
 impl ChaCha20Poly1305 {
 
     /**
@@ -497,6 +467,36 @@ pub fn chacha20_decrypt(key: &[u8], nonce: &[u8], ciphertext: &[u8]) -> Result<V
     let mut data = ciphertext.to_vec();
 
     Ok(cipher.decrypt(&mut data))
+}
+
+/**
+ * Performs the quarter round operation on the state
+ * Args:
+ *    state - &mut [u32; 16]: The state array
+ *    a - usize: Index a
+ *    b - usize: Index b
+ *    c - usize: Index c
+ *    d - usize: Index d
+ * 
+ * Returns:
+ *    (): Nothing
+ */
+fn quarter_round(state: &mut [u32; 16], a: usize, b: usize, c: usize, d: usize) {
+    state[a] = state[a].wrapping_add(state[b]);
+    state[d] ^= state[a];
+    state[d] = state[d].rotate_left(16);
+
+    state[c] = state[c].wrapping_add(state[d]);
+    state[b] ^= state[c];
+    state[b] = state[b].rotate_left(12);
+
+    state[a] = state[a].wrapping_add(state[b]);
+    state[d] ^= state[a];
+    state[d] = state[d].rotate_left(8);
+
+    state[c] = state[c].wrapping_add(state[d]);
+    state[b] ^= state[c];
+    state[b] = state[b].rotate_left(7);
 }
 
 #[cfg(test)]

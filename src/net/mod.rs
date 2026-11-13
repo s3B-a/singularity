@@ -22,13 +22,25 @@ use crate::crypto::hash::hmac::hmac_sha256;
 use crate::crypto::hash::sha2::sha256;
 use crate::crypto::random;
 use crate::net::http::compression::{self, CompressionAlgorithm, CompressionLevel};
+
 use std::io;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub type NetResult<T> = Result<T, NetErr>;
-
 const NET_SECURE_ENVELOPE_MAGIC: &str = "SINGULARITY_NET_SECURE_ENVELOPE_V1";
 const NET_SECURE_ENVELOPE_CONTEXT: &str = "SINGULARITY_NET_SECURE_ENVELOPE_BINDING_V1";
+
+pub type NetResult<T> = Result<T, NetErr>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SecureNetEnvelopeMeta {
+    pub algorithm: CompressionAlgorithm,
+    pub nonce_b64: String,
+    pub digest_b64: String,
+    pub tag_b64: String,
+    pub raw_size: usize,
+    pub encoded_size: usize,
+    pub issued_at_unix: u64,
+}
 
 #[derive(Debug)]
 pub enum NetErr {
@@ -41,17 +53,6 @@ pub enum NetErr {
     ConnectionClosed,
     Http3Error(String),
     ProtocolError(String),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SecureNetEnvelopeMeta {
-    pub algorithm: CompressionAlgorithm,
-    pub nonce_b64: String,
-    pub digest_b64: String,
-    pub tag_b64: String,
-    pub raw_size: usize,
-    pub encoded_size: usize,
-    pub issued_at_unix: u64,
 }
 
 impl From<io::Error> for NetErr {

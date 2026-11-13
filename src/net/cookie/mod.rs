@@ -2,20 +2,22 @@ pub mod cookie;
 pub mod jar;
 pub mod parser;
 
+pub use cookie::{domain_match, Cookie, CookiePrefix, SameSite};
+pub use jar::CookieJar;
+pub use parser::{parse_cookie_header, parse_set_cookie, ParseError};
+
 use crate::crypto::constant_time_eq;
 use crate::crypto::encoding::pem;
 use crate::crypto::hash::hmac::hmac_sha256;
 use crate::crypto::hash::sha2::sha256;
 use crate::crypto::random;
 use crate::net::http::compression::{self, CompressionAlgorithm, CompressionLevel};
+
 use std::io;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub use cookie::{domain_match, Cookie, CookiePrefix, SameSite};
-pub use jar::CookieJar;
-pub use parser::{parse_cookie_header, parse_set_cookie, ParseError};
-
 pub const COOKIE_SECURE_ENVELOPE_MAGIC: &str = "SINGULARITY_COOKIE_SECURE_ENVELOPE_V1";
+
 const COOKIE_SECURE_ENVELOPE_CONTEXT: &str = "SINGULARITY_COOKIE_SECURE_ENVELOPE_BINDING_V1";
 
 #[derive(Debug, Clone, PartialEq, Eq)]

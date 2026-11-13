@@ -3,6 +3,7 @@ mod connection;
 mod error;
 mod flow_control;
 mod frame;
+pub mod h2c;
 pub mod hpack;
 mod priority;
 mod push;
@@ -10,26 +11,28 @@ mod settings;
 mod stream;
 mod scheduler;
 
-use crate::crypto::constant_time_eq;
-use crate::crypto::encoding::pem;
-use crate::crypto::hash::hmac::hmac_sha256;
-use crate::crypto::hash::sha2::sha256;
-use crate::crypto::random;
-use crate::net::http::compression::{self, CompressionAlgorithm, CompressionLevel};
-use std::io;
-use std::time::{SystemTime, UNIX_EPOCH};
-
 pub use alpn::{AlpnNegotiator, AlpnProtocol, NpnNegotiator, NpnProtocol};
 pub use connection::{Http2Connection, Http2Transport, Role};
 pub use error::{ErrorCode, Http2Error, Result};
 pub use flow_control::FlowControl;
-pub use frame::{Frame, FrameFlags, FrameHeader, FrameType};
+pub use frame::{Frame, FrameFlags, FrameHeader, FrameType, PaddingStrategy};
+pub use h2c::{H2cMode, H2cTransport, H2cUpgrade};
 pub use hpack::HpackCodec;
 pub use priority::{parse_priority_header, ExtensiblePriority, Priority, PriorityTree};
 pub use push::{PushManager, PushConfig, PushedResource, PushStatus, PushStats};
 pub use settings::{Settings, SettingId};
 pub use scheduler::{PriorityScheduler, DependencyTreeStats, StreamScheduleState};
 pub use stream::{Http2Stream, StreamState};
+
+use crate::crypto::constant_time_eq;
+use crate::crypto::encoding::pem;
+use crate::crypto::hash::hmac::hmac_sha256;
+use crate::crypto::hash::sha2::sha256;
+use crate::crypto::random;
+use crate::net::http::compression::{self, CompressionAlgorithm, CompressionLevel};
+
+use std::io;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const CLIENT_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 

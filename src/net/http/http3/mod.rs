@@ -29,6 +29,7 @@ use crate::crypto::hash::hmac::hmac_sha256;
 use crate::crypto::hash::sha2::sha256;
 use crate::crypto::random;
 use crate::net::http::compression::{self, CompressionAlgorithm, CompressionLevel};
+
 use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
@@ -85,30 +86,53 @@ pub struct Config {
     pub enable_retry_validation: bool,
 }
 
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            max_idle_timeout: DEFAULT_IDLE_TIMEOUT,
-            max_udp_payload_size: MAX_UDP_PAYLOAD_SIZE,
-            initial_max_data: INITIAL_MAX_DATA,
-            initial_max_stream_data_bidi_local: INITIAL_MAX_STREAM_DATA_BIDI_LOCAL,
-            initial_max_stream_data_bidi_remote: INITIAL_MAX_STREAM_DATA_BIDI_REMOTE,
-            initial_max_stream_data_uni: INITIAL_MAX_STREAM_DATA_UNI,
-            initial_max_streams_bidi: INITIAL_MAX_STREAMS_BIDI,
-            initial_max_streams_uni: INITIAL_MAX_STREAMS_UNI,
-            ack_delay_exponent: ACK_DELAY_EXPONENT,
-            max_ack_delay: Duration::from_millis(MAX_ACK_DELAY),
-            active_connection_id_limit: ACTIVE_CONNECTION_ID_LIMIT,
-            enable_early_data: false,
-            enable_migration: true,
-            congestion_control_algorithm: CongestionAlgorithm::Cubic,
-            enable_ecn: true,
-            max_send_burst: 10,
-            qpack_max_table_capacity: 4096,
-            qpack_blocked_streams: 100,
-            enable_retry_validation: false,
-        }
-    }
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ConnectionId {
+    data: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TransportParams {
+    pub original_destination_connection_id: Option<ConnectionId>,
+    pub max_idle_timeout: u64,
+    pub stateless_reset_token: Option<[u8; 16]>,
+    pub max_udp_payload_size: u64,
+    pub initial_max_data: u64,
+    pub initial_max_stream_data_bidi_local: u64,
+    pub initial_max_stream_data_bidi_remote: u64,
+    pub initial_max_stream_data_uni: u64,
+    pub initial_max_streams_bidi: u64,
+    pub initial_max_streams_uni: u64,
+    pub ack_delay_exponent: u64,
+    pub max_ack_delay: u64,
+    pub disable_active_migration: bool,
+    pub preferred_address: Option<PreferredAddress>,
+    pub active_conn_id_limit: u64,
+    pub initial_source_connection_id: Option<ConnectionId>,
+    pub retry_source_connection_id: Option<ConnectionId>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PreferredAddress {
+    pub ipv4_address: Option<SocketAddr>,
+    pub ipv6_address: Option<SocketAddr>,
+    pub connection_id: ConnectionId,
+    pub stateless_reset_token: [u8; 16],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Role {
+    Client,
+    Server,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectionState {
+    Handshake,
+    Active,
+    Closing,
+    Draining,
+    Closed,
 }
 
 impl Config {
@@ -246,26 +270,6 @@ impl Config {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Role {
-    Client,
-    Server,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ConnectionState {
-    Handshake,
-    Active,
-    Closing,
-    Draining,
-    Closed,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct ConnectionId {
-    data: Vec<u8>,
-}
-
 impl ConnectionId {
     pub fn new(data: Vec<u8>) -> Self {
         assert!(data.len() <= 20, "Connection ID too long");
@@ -291,6 +295,32 @@ impl ConnectionId {
     }
 }
 
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            max_idle_timeout: DEFAULT_IDLE_TIMEOUT,
+            max_udp_payload_size: MAX_UDP_PAYLOAD_SIZE,
+            initial_max_data: INITIAL_MAX_DATA,
+            initial_max_stream_data_bidi_local: INITIAL_MAX_STREAM_DATA_BIDI_LOCAL,
+            initial_max_stream_data_bidi_remote: INITIAL_MAX_STREAM_DATA_BIDI_REMOTE,
+            initial_max_stream_data_uni: INITIAL_MAX_STREAM_DATA_UNI,
+            initial_max_streams_bidi: INITIAL_MAX_STREAMS_BIDI,
+            initial_max_streams_uni: INITIAL_MAX_STREAMS_UNI,
+            ack_delay_exponent: ACK_DELAY_EXPONENT,
+            max_ack_delay: Duration::from_millis(MAX_ACK_DELAY),
+            active_connection_id_limit: ACTIVE_CONNECTION_ID_LIMIT,
+            enable_early_data: false,
+            enable_migration: true,
+            congestion_control_algorithm: CongestionAlgorithm::Cubic,
+            enable_ecn: true,
+            max_send_burst: 10,
+            qpack_max_table_capacity: 4096,
+            qpack_blocked_streams: 100,
+            enable_retry_validation: false,
+        }
+    }
+}
+
 impl std::fmt::Display for ConnectionId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         for byte in &self.data {
@@ -299,27 +329,6 @@ impl std::fmt::Display for ConnectionId {
 
         Ok(())
     }
-}
-
-#[derive(Debug, Clone)]
-pub struct TransportParams {
-    pub original_destination_connection_id: Option<ConnectionId>,
-    pub max_idle_timeout: u64,
-    pub stateless_reset_token: Option<[u8; 16]>,
-    pub max_udp_payload_size: u64,
-    pub initial_max_data: u64,
-    pub initial_max_stream_data_bidi_local: u64,
-    pub initial_max_stream_data_bidi_remote: u64,
-    pub initial_max_stream_data_uni: u64,
-    pub initial_max_streams_bidi: u64,
-    pub initial_max_streams_uni: u64,
-    pub ack_delay_exponent: u64,
-    pub max_ack_delay: u64,
-    pub disable_active_migration: bool,
-    pub preferred_address: Option<PreferredAddress>,
-    pub active_conn_id_limit: u64,
-    pub initial_source_connection_id: Option<ConnectionId>,
-    pub retry_source_connection_id: Option<ConnectionId>,
 }
 
 impl Default for TransportParams {
@@ -346,14 +355,6 @@ impl Default for TransportParams {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct PreferredAddress {
-    pub ipv4_address: Option<SocketAddr>,
-    pub ipv6_address: Option<SocketAddr>,
-    pub connection_id: ConnectionId,
-    pub stateless_reset_token: [u8; 16],
-}
-
 pub fn select_secure_http3_config_algorithm(accept_encoding: &str) -> CompressionAlgorithm {
     let accepted = compression::parse_accept_encoding(accept_encoding);
     for (algorithm, quality) in accepted {
@@ -375,6 +376,84 @@ pub fn encode_secure_http3_config_auto(config: &Config, accept_encoding: &str) -
 
 pub fn decode_secure_http3_config(data: &[u8]) -> io::Result<(SecureHttp3ConfigBlobMeta, Config)> {
     Config::from_secure_blob(data)
+}
+
+pub fn encode_varint(value: u64) -> Vec<u8> {
+    if value < 64 {
+        vec![value as u8]
+    } else if value < 16384 {
+        vec![
+            (0x40 | (value >> 8)) as u8,
+            (value & 0xFF) as u8,
+        ]
+    } else if value < 1073741824 {
+        vec![
+            (0x80 | (value >> 24)) as u8,
+            ((value >> 16) & 0xFF) as u8,
+            ((value >> 8) & 0xFF) as u8,
+            (value & 0xFF) as u8,
+        ]
+    } else {
+        vec![
+            (0xC0 | (value >> 56)) as u8,
+            ((value >> 48) & 0xFF) as u8,
+            ((value >> 40) & 0xFF) as u8,
+            ((value >> 32) & 0xFF) as u8,
+            ((value >> 24) & 0xFF) as u8,
+            ((value >> 16) & 0xFF) as u8,
+            ((value >> 8) & 0xFF) as u8,
+            (value & 0xFF) as u8,
+        ]
+    }
+}
+
+pub fn decode_varint(data: &[u8]) -> Result<(u64, usize)> {
+    if data.is_empty() {
+        return Err(Error::BufferTooShort);
+    }
+    
+    let first = data[0];
+    let prefix = first >> 6;
+    match prefix {
+        0 => {
+            Ok((first as u64, 1))
+        }
+        1 => {
+            if data.len() < 2 {
+                return Err(Error::BufferTooShort);
+            }
+
+            let value = (((first & 0x3F) as u64) << 8) | (data[1] as u64);
+            Ok((value, 2))
+        }
+        2 => {
+            if data.len() < 4 {
+                return Err(Error::BufferTooShort);
+            }
+
+            let value = (((first & 0x3F) as u64) << 24)
+                | ((data[1] as u64) << 16)
+                | ((data[2] as u64) << 8)
+                | (data[3] as u64);
+            Ok((value, 4))
+        }
+        3 => {
+            if data.len() < 8 {
+                return Err(Error::BufferTooShort);
+            }
+
+            let value = (((first & 0x3F) as u64) << 56)
+                | ((data[1] as u64) << 48)
+                | ((data[2] as u64) << 40)
+                | ((data[3] as u64) << 32)
+                | ((data[4] as u64) << 24)
+                | ((data[5] as u64) << 16)
+                | ((data[6] as u64) << 8)
+                | (data[7] as u64);
+            Ok((value, 8))
+        }
+        _ => unreachable!(),
+    }
 }
 
 fn serialize_http3_config(config: &Config) -> Vec<u8> {
@@ -712,84 +791,6 @@ fn parse_secure_http3_config_meta(header: &str, body_len: usize) -> io::Result<S
         encoded_size,
         issued_at_unix,
     })
-}
-
-pub fn encode_varint(value: u64) -> Vec<u8> {
-    if value < 64 {
-        vec![value as u8]
-    } else if value < 16384 {
-        vec![
-            (0x40 | (value >> 8)) as u8,
-            (value & 0xFF) as u8,
-        ]
-    } else if value < 1073741824 {
-        vec![
-            (0x80 | (value >> 24)) as u8,
-            ((value >> 16) & 0xFF) as u8,
-            ((value >> 8) & 0xFF) as u8,
-            (value & 0xFF) as u8,
-        ]
-    } else {
-        vec![
-            (0xC0 | (value >> 56)) as u8,
-            ((value >> 48) & 0xFF) as u8,
-            ((value >> 40) & 0xFF) as u8,
-            ((value >> 32) & 0xFF) as u8,
-            ((value >> 24) & 0xFF) as u8,
-            ((value >> 16) & 0xFF) as u8,
-            ((value >> 8) & 0xFF) as u8,
-            (value & 0xFF) as u8,
-        ]
-    }
-}
-
-pub fn decode_varint(data: &[u8]) -> Result<(u64, usize)> {
-    if data.is_empty() {
-        return Err(Error::BufferTooShort);
-    }
-    
-    let first = data[0];
-    let prefix = first >> 6;
-    match prefix {
-        0 => {
-            Ok((first as u64, 1))
-        }
-        1 => {
-            if data.len() < 2 {
-                return Err(Error::BufferTooShort);
-            }
-
-            let value = (((first & 0x3F) as u64) << 8) | (data[1] as u64);
-            Ok((value, 2))
-        }
-        2 => {
-            if data.len() < 4 {
-                return Err(Error::BufferTooShort);
-            }
-
-            let value = (((first & 0x3F) as u64) << 24)
-                | ((data[1] as u64) << 16)
-                | ((data[2] as u64) << 8)
-                | (data[3] as u64);
-            Ok((value, 4))
-        }
-        3 => {
-            if data.len() < 8 {
-                return Err(Error::BufferTooShort);
-            }
-
-            let value = (((first & 0x3F) as u64) << 56)
-                | ((data[1] as u64) << 48)
-                | ((data[2] as u64) << 40)
-                | ((data[3] as u64) << 32)
-                | ((data[4] as u64) << 24)
-                | ((data[5] as u64) << 16)
-                | ((data[6] as u64) << 8)
-                | (data[7] as u64);
-            Ok((value, 8))
-        }
-        _ => unreachable!(),
-    }
 }
 
 #[cfg(test)]

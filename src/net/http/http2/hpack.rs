@@ -4,6 +4,7 @@ use crate::crypto::hash::hmac::hmac_sha256;
 use crate::crypto::hash::sha2::sha256;
 use crate::crypto::random;
 use crate::net::http::compression::{self, CompressionAlgorithm, CompressionLevel};
+
 use std::collections::HashMap;
 use std::io;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -87,6 +88,16 @@ pub struct SecureHpackCodecBlobMeta {
     pub issued_at_unix: u64,
 }
 
+pub struct HpackCodec {
+    dynamic_table: Vec<(String, String)>,
+    max_dynamic_table_size: usize,
+    max_table_size_limit: usize,
+    pending_table_size_update: Option<usize>,
+    pending_table_size_minimum: Option<usize>,
+    huffman_root: HuffmanNode,
+    huffman_codes: Vec<(u32, u8)>,
+}
+
 #[derive(Debug, Clone)]
 struct HuffmanNode {
     symbol: Option<u16>,
@@ -110,16 +121,6 @@ impl HuffmanNode {
             right: None,
         }
     }
-}
-
-pub struct HpackCodec {
-    dynamic_table: Vec<(String, String)>,
-    max_dynamic_table_size: usize,
-    max_table_size_limit: usize,
-    pending_table_size_update: Option<usize>,
-    pending_table_size_minimum: Option<usize>,
-    huffman_root: HuffmanNode,
-    huffman_codes: Vec<(u32, u8)>,
 }
 
 impl HpackCodec {

@@ -1,12 +1,13 @@
-use super::chunked::ChunkedDecoder;
-use super::compression::{self, CompressionAlgorithm, CompressionLevel};
-use super::{Headers, HttpResponse, HttpVersion, StatusCode};
 use crate::crypto::constant_time_eq;
 use crate::crypto::encoding::pem;
 use crate::crypto::hash::hmac::hmac_sha256;
 use crate::crypto::hash::sha2::sha256;
 use crate::crypto::random;
 use crate::net::tcp::TcpStream;
+use super::chunked::ChunkedDecoder;
+use super::compression::{self, CompressionAlgorithm, CompressionLevel};
+use super::{Headers, HttpResponse, HttpVersion, StatusCode};
+
 use std::io;
 use std::time::{SystemTime, UNIX_EPOCH};
 

@@ -4,12 +4,26 @@ use crate::crypto::hash::hmac::hmac_sha256;
 use crate::crypto::hash::sha2::sha256;
 use crate::crypto::random;
 use crate::net::http::compression::{self, CompressionAlgorithm, CompressionLevel};
+
 use std::fmt;
 use std::io;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const HTTP2_ERROR_BLOB_MAGIC: &str = "SINGULARITY_HTTP2_ERROR_BLOB_V1";
 const HTTP2_ERROR_BLOB_CONTEXT: &str = "SINGULARITY_HTTP2_ERROR_BLOB_BINDING_V1";
+
+pub type Result<T> = std::result::Result<T, Http2Error>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SecureHttp2ErrorBlobMeta {
+    pub algorithm: CompressionAlgorithm,
+    pub nonce_b64: String,
+    pub digest_b64: String,
+    pub tag_b64: String,
+    pub raw_size: usize,
+    pub encoded_size: usize,
+    pub issued_at_unix: u64,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
@@ -28,6 +42,21 @@ pub enum ErrorCode {
     EnhanceYourCalm = 0xb,
     InadequateSecurity = 0xc,
     Http11Required = 0xd,
+}
+
+#[derive(Debug)]
+pub enum Http2Error {
+    Protocol(ErrorCode, String),
+    Stream(u32, ErrorCode, String),
+    Io(io::Error),
+    ConnectionClosed,
+    StreamNotFound(u32),
+    InvalidStreamId(u32),
+    InvalidFrameSize,
+    CompressionFailed,
+    DecompressionFailed,
+    StreamLimitReached(u32),
+    NotPermitted(String),
 }
 
 impl ErrorCode {
@@ -71,21 +100,6 @@ impl ErrorCode {
     }
 }
 
-#[derive(Debug)]
-pub enum Http2Error {
-    Protocol(ErrorCode, String),
-    Stream(u32, ErrorCode, String),
-    Io(io::Error),
-    ConnectionClosed,
-    StreamNotFound(u32),
-    InvalidStreamId(u32),
-    InvalidFrameSize,
-    CompressionFailed,
-    DecompressionFailed,
-    StreamLimitReached(u32),
-    NotPermitted(String),
-}
-
 impl Http2Error {
     pub fn is_stream_error(&self) -> bool {
         matches!(self, Self::Stream(_, _, _) | Self::StreamNotFound(_))
@@ -115,17 +129,6 @@ impl Http2Error {
             other => other,
         }
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SecureHttp2ErrorBlobMeta {
-    pub algorithm: CompressionAlgorithm,
-    pub nonce_b64: String,
-    pub digest_b64: String,
-    pub tag_b64: String,
-    pub raw_size: usize,
-    pub encoded_size: usize,
-    pub issued_at_unix: u64,
 }
 
 impl fmt::Display for Http2Error {
@@ -598,8 +601,6 @@ fn parse_secure_http2_error_meta(header: &str, body_len: usize) -> io::Result<Se
         issued_at_unix,
     })
 }
-
-pub type Result<T> = std::result::Result<T, Http2Error>;
 
 #[cfg(test)]
 mod tests {

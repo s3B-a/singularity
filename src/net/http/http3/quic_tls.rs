@@ -1,6 +1,3 @@
-use super::crypto::{CryptoKeys, CryptoState, EncryptionLevel};
-use super::error::{Error, Result};
-use super::packet::PacketNumberSpace;
 use crate::crypto::asymmetric::ecdh::{EcdhCurve, EcdhPrivateKey, EcdhPublicKey};
 use crate::crypto::asymmetric::rsa::RsaPublicKey;
 use crate::crypto::constant_time_eq;
@@ -11,6 +8,10 @@ use crate::crypto::hash::sha2::{sha256, sha384, sha512};
 use crate::crypto::kdf::hkdf::Hkdf;
 use crate::crypto::random;
 use crate::net::http::compression::{self, CompressionAlgorithm, CompressionLevel};
+use super::crypto::{CryptoKeys, CryptoState, EncryptionLevel};
+use super::error::{Error, Result};
+use super::packet::PacketNumberSpace;
+
 use std::collections::{BTreeMap, HashMap};
 use std::io;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -149,6 +150,81 @@ pub struct QuicTlsStateSnapshot {
     pub elapsed_ms: Option<u64>,
 }
 
+pub struct QuicTlsState {
+    state: HandshakeState,
+    is_client: bool,
+    cipher_suite: CipherSuite,
+    ecdh_private: Option<EcdhPrivateKey>,
+    ecdh_public: Option<EcdhPublicKey>,
+    server_public_key: Option<EcdhPublicKey>,
+    client_public_key: Option<EcdhPublicKey>,
+    crypto_recv_buffer: BTreeMap<u64, Vec<u8>>,
+    crypto_recv_offset: u64,
+    crypto_send_buffer: Vec<(PacketNumberSpace, Vec<u8>)>,
+    handshake_messages: Vec<u8>,
+    partial_message: Option<Vec<u8>>,
+    early_secret: Option<Vec<u8>>,
+    handshake_secret: Option<Vec<u8>>,
+    master_secret: Option<Vec<u8>>,
+    client_handshake_traffic_secret: Option<Vec<u8>>,
+    server_handshake_traffic_secret: Option<Vec<u8>>,
+    client_application_traffic_secret: Option<Vec<u8>>,
+    server_application_traffic_secret: Option<Vec<u8>>,
+    exporter_master_secret: Option<Vec<u8>>,
+    resumption_master_secret: Option<Vec<u8>>,
+    certificates: Vec<Certificate>,
+    peer_certificates: Vec<Certificate>,
+    verify_certificates: bool,
+    trusted_roots: Vec<Certificate>,
+    server_name: Option<String>,
+    alpn_protocols: Vec<String>,
+    negotiated_alpn: Option<String>,
+    local_transport_params: Vec<u8>,
+    peer_transport_params: Option<Vec<u8>>,
+    client_random: Option<[u8; 32]>,
+    server_random: Option<[u8; 32]>,
+    session_ticket: Option<Vec<u8>>,
+    psk: Option<Vec<u8>>,
+    cert_requested: bool,
+    signature_algorithms: Vec<u16>,
+    peer_signature_algorithms: Vec<u16>,
+    started_at: Option<Instant>,
+    key_update_generation: u64,
+    early_data_enabled: bool,
+    max_early_data_size: u32,
+    supported_versions: Vec<u16>,
+    supported_groups: Vec<u16>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HandshakeState {
+    Initial,
+    WaitServerHello,
+    WaitEncryptedExtensions,
+    WaitCertificateRequest,
+    WaitCertificate,
+    WaitCertificateVerify,
+    WaitFinished,
+    Connected,
+    Failed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CryptoAction {
+    InstallHandshakeKeys,
+    InstallApplicationKeys,
+    HandshakeComplete,
+    SendCryptoData,
+    UpdateKeys,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CipherSuite {
+    Aes128GcmSha256,
+    Aes256GcmSha384,
+    ChaCha20Poly1305Sha256,
+}
+
 impl QuicTlsStateSnapshot {
     pub fn to_secure_blob(&self, algorithm: CompressionAlgorithm) -> io::Result<(SecureQuicTlsStateBlobMeta, Vec<u8>)> {
         let mut selected_algorithm = algorithm;
@@ -279,26 +355,6 @@ impl QuicTlsStateSnapshot {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HandshakeState {
-    Initial,
-    WaitServerHello,
-    WaitEncryptedExtensions,
-    WaitCertificateRequest,
-    WaitCertificate,
-    WaitCertificateVerify,
-    WaitFinished,
-    Connected,
-    Failed,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CipherSuite {
-    Aes128GcmSha256,
-    Aes256GcmSha384,
-    ChaCha20Poly1305Sha256,
-}
-
 impl CipherSuite {
     fn from_u16(value: u16) -> Option<Self> {
         match value {
@@ -339,52 +395,6 @@ impl CipherSuite {
             CipherSuite::Aes256GcmSha384 => sha384(data).to_vec(),
         }
     }
-}
-
-pub struct QuicTlsState {
-    state: HandshakeState,
-    is_client: bool,
-    cipher_suite: CipherSuite,
-    ecdh_private: Option<EcdhPrivateKey>,
-    ecdh_public: Option<EcdhPublicKey>,
-    server_public_key: Option<EcdhPublicKey>,
-    client_public_key: Option<EcdhPublicKey>,
-    crypto_recv_buffer: BTreeMap<u64, Vec<u8>>,
-    crypto_recv_offset: u64,
-    crypto_send_buffer: Vec<(PacketNumberSpace, Vec<u8>)>,
-    handshake_messages: Vec<u8>,
-    partial_message: Option<Vec<u8>>,
-    early_secret: Option<Vec<u8>>,
-    handshake_secret: Option<Vec<u8>>,
-    master_secret: Option<Vec<u8>>,
-    client_handshake_traffic_secret: Option<Vec<u8>>,
-    server_handshake_traffic_secret: Option<Vec<u8>>,
-    client_application_traffic_secret: Option<Vec<u8>>,
-    server_application_traffic_secret: Option<Vec<u8>>,
-    exporter_master_secret: Option<Vec<u8>>,
-    resumption_master_secret: Option<Vec<u8>>,
-    certificates: Vec<Certificate>,
-    peer_certificates: Vec<Certificate>,
-    verify_certificates: bool,
-    trusted_roots: Vec<Certificate>,
-    server_name: Option<String>,
-    alpn_protocols: Vec<String>,
-    negotiated_alpn: Option<String>,
-    local_transport_params: Vec<u8>,
-    peer_transport_params: Option<Vec<u8>>,
-    client_random: Option<[u8; 32]>,
-    server_random: Option<[u8; 32]>,
-    session_ticket: Option<Vec<u8>>,
-    psk: Option<Vec<u8>>,
-    cert_requested: bool,
-    signature_algorithms: Vec<u16>,
-    peer_signature_algorithms: Vec<u16>,
-    started_at: Option<Instant>,
-    key_update_generation: u64,
-    early_data_enabled: bool,
-    max_early_data_size: u32,
-    supported_versions: Vec<u16>,
-    supported_groups: Vec<u16>,
 }
 
 impl QuicTlsState {
@@ -2080,15 +2090,6 @@ impl QuicTlsState {
     pub fn decode_secure_state_snapshot(data: &[u8]) -> io::Result<(SecureQuicTlsStateBlobMeta, QuicTlsStateSnapshot)> {
         QuicTlsStateSnapshot::from_secure_blob(data)
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CryptoAction {
-    InstallHandshakeKeys,
-    InstallApplicationKeys,
-    HandshakeComplete,
-    SendCryptoData,
-    UpdateKeys,
 }
 
 pub fn select_secure_quic_tls_state_algorithm(accept_encoding: &str) -> CompressionAlgorithm {

@@ -1,4 +1,5 @@
 use super::Url;
+
 use std::fmt;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -10,6 +11,21 @@ pub enum ParseError {
     MissingScheme,
     InvalidUrl(String),
 }
+
+impl fmt::Display for ParseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ParseError::EmptyUrl => write!(f, "URL is empty"),
+            ParseError::InvalidScheme => write!(f, "Invalid URL scheme"),
+            ParseError::InvalidHost => write!(f, "Invalid URL host"),
+            ParseError::InvalidPort => write!(f, "Invalid URL port"),
+            ParseError::MissingScheme => write!(f, "Missing URL scheme"),
+            ParseError::InvalidUrl(msg) => write!(f, "Invalid URL: {}", msg),
+        }
+    }
+}
+
+impl std::error::Error for ParseError {}
 
 pub fn parse_url(input: &str) -> Result<Url, ParseError> {
     if input.is_empty() {
@@ -57,6 +73,81 @@ pub fn parse_url(input: &str) -> Result<Url, ParseError> {
         query,
         fragment,
     })
+}
+
+pub fn join_urls(base: &Url, relative: &str) -> Result<Url, ParseError> {
+    if relative.contains("://") {
+        return parse_url(relative);
+    }
+
+    let mut result = base.clone();
+    if relative.starts_with("//") {
+        return parse_url(&format!("{}:{}", base.scheme(), relative));
+    } else if relative.starts_with('/') {
+        if let Some(query_pos) = relative.find('?') {
+            result.set_path(relative[..query_pos].to_string());
+            let after_query = &relative[query_pos + 1..];
+            if let Some(fragment_pos) = after_query.find('#') {
+                result.set_query(Some(after_query[..fragment_pos].to_string()));
+                result.set_fragment(Some(after_query[fragment_pos + 1..].to_string()));
+            } else {
+                result.set_query(Some(after_query.to_string()));
+                result.set_fragment(None::<String>);
+            }
+        } else if let Some(fragment_pos) = relative.find('#') {
+            result.set_path(relative[..fragment_pos].to_string());
+            result.set_query(None::<String>);
+            result.set_fragment(Some(relative[fragment_pos + 1..].to_string()));
+        } else {
+            result.set_path(relative.to_string());
+            result.set_query(None::<String>);
+            result.set_fragment(None::<String>);
+        }
+    } else if relative.starts_with('?') {
+        if let Some(fragment_pos) = relative.find('#') {
+            result.set_query(Some(relative[1..fragment_pos].to_string()));
+            result.set_fragment(Some(relative[fragment_pos + 1..].to_string()));
+        } else {
+            result.set_query(Some(relative[1..].to_string()));
+            result.set_fragment(None::<String>);
+        }
+    } else if relative.starts_with('#') {
+        result.set_fragment(Some(relative[1..].to_string()));
+    } else {
+        let base_path = base.path();
+        let new_path = if base_path.ends_with('/') {
+            format!("{}{}", base_path, relative)
+        } else {
+            if let Some(last_slash) = base_path.rfind('/') {
+                format!("{}/{}", &base_path[..last_slash], relative)
+            } else {
+                format!("/{}", relative)
+            }
+        };
+
+        let normalized = normalize_path(&new_path);
+        if let Some(query_pos) = normalized.find('?') {
+            result.set_path(normalized[..query_pos].to_string());
+            let after_query = &normalized[query_pos + 1..];
+            if let Some(fragment_pos) = after_query.find('#') {
+                result.set_query(Some(after_query[..fragment_pos].to_string()));
+                result.set_fragment(Some(after_query[fragment_pos + 1..].to_string()));
+            } else {
+                result.set_query(Some(after_query.to_string()));
+                result.set_fragment(None::<String>);
+            }
+        } else if let Some(fragment_pos) = normalized.find('#') {
+            result.set_path(normalized[..fragment_pos].to_string());
+            result.set_query(None::<String>);
+            result.set_fragment(Some(normalized[fragment_pos + 1..].to_string()));
+        } else {
+            result.set_path(normalized);
+            result.set_query(None::<String>);
+            result.set_fragment(None::<String>);
+        }
+    }
+
+    Ok(result)
 }
 
 fn parse_authority(authority: &str, scheme: &str) -> Result<(String, Option<String>, Option<String>, Option<u16>), ParseError> {
@@ -138,81 +229,6 @@ fn is_valid_scheme(scheme: &str) -> bool {
     chars.all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '-' || c == '.')
 }
 
-pub fn join_urls(base: &Url, relative: &str) -> Result<Url, ParseError> {
-    if relative.contains("://") {
-        return parse_url(relative);
-    }
-
-    let mut result = base.clone();
-    if relative.starts_with("//") {
-        return parse_url(&format!("{}:{}", base.scheme(), relative));
-    } else if relative.starts_with('/') {
-        if let Some(query_pos) = relative.find('?') {
-            result.set_path(relative[..query_pos].to_string());
-            let after_query = &relative[query_pos + 1..];
-            if let Some(fragment_pos) = after_query.find('#') {
-                result.set_query(Some(after_query[..fragment_pos].to_string()));
-                result.set_fragment(Some(after_query[fragment_pos + 1..].to_string()));
-            } else {
-                result.set_query(Some(after_query.to_string()));
-                result.set_fragment(None::<String>);
-            }
-        } else if let Some(fragment_pos) = relative.find('#') {
-            result.set_path(relative[..fragment_pos].to_string());
-            result.set_query(None::<String>);
-            result.set_fragment(Some(relative[fragment_pos + 1..].to_string()));
-        } else {
-            result.set_path(relative.to_string());
-            result.set_query(None::<String>);
-            result.set_fragment(None::<String>);
-        }
-    } else if relative.starts_with('?') {
-        if let Some(fragment_pos) = relative.find('#') {
-            result.set_query(Some(relative[1..fragment_pos].to_string()));
-            result.set_fragment(Some(relative[fragment_pos + 1..].to_string()));
-        } else {
-            result.set_query(Some(relative[1..].to_string()));
-            result.set_fragment(None::<String>);
-        }
-    } else if relative.starts_with('#') {
-        result.set_fragment(Some(relative[1..].to_string()));
-    } else {
-        let base_path = base.path();
-        let new_path = if base_path.ends_with('/') {
-            format!("{}{}", base_path, relative)
-        } else {
-            if let Some(last_slash) = base_path.rfind('/') {
-                format!("{}/{}", &base_path[..last_slash], relative)
-            } else {
-                format!("/{}", relative)
-            }
-        };
-
-        let normalized = normalize_path(&new_path);
-        if let Some(query_pos) = normalized.find('?') {
-            result.set_path(normalized[..query_pos].to_string());
-            let after_query = &normalized[query_pos + 1..];
-            if let Some(fragment_pos) = after_query.find('#') {
-                result.set_query(Some(after_query[..fragment_pos].to_string()));
-                result.set_fragment(Some(after_query[fragment_pos + 1..].to_string()));
-            } else {
-                result.set_query(Some(after_query.to_string()));
-                result.set_fragment(None::<String>);
-            }
-        } else if let Some(fragment_pos) = normalized.find('#') {
-            result.set_path(normalized[..fragment_pos].to_string());
-            result.set_query(None::<String>);
-            result.set_fragment(Some(normalized[fragment_pos + 1..].to_string()));
-        } else {
-            result.set_path(normalized);
-            result.set_query(None::<String>);
-            result.set_fragment(None::<String>);
-        }
-    }
-
-    Ok(result)
-}
-
 fn normalize_path(path: &str) -> String {
     let mut segments: Vec<&str> = Vec::new();
     for segment in path.split('/') {
@@ -237,21 +253,6 @@ fn normalize_path(path: &str) -> String {
         segments.join("/")
     }
 }
-
-impl fmt::Display for ParseError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            ParseError::EmptyUrl => write!(f, "URL is empty"),
-            ParseError::InvalidScheme => write!(f, "Invalid URL scheme"),
-            ParseError::InvalidHost => write!(f, "Invalid URL host"),
-            ParseError::InvalidPort => write!(f, "Invalid URL port"),
-            ParseError::MissingScheme => write!(f, "Missing URL scheme"),
-            ParseError::InvalidUrl(msg) => write!(f, "Invalid URL: {}", msg),
-        }
-    }
-}
-
-impl std::error::Error for ParseError {}
 
 #[cfg(test)]
 mod tests {

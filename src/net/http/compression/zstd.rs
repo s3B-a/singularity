@@ -1,10 +1,11 @@
-use super::utils::SlidingWindow;
-use super::{CompressionAlgorithm, CompressionLevel, Compressor, Decompressor};
 use crate::crypto::constant_time_eq;
 use crate::crypto::encoding::pem;
 use crate::crypto::hash::hmac::hmac_sha256;
 use crate::crypto::hash::sha2::sha256;
 use crate::crypto::random;
+use super::utils::SlidingWindow;
+use super::{CompressionAlgorithm, CompressionLevel, Compressor, Decompressor};
+
 use std::io;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -27,6 +28,15 @@ pub struct SecureZstdBlobMeta {
     pub raw_size: usize,
     pub encoded_size: usize,
     pub issued_at_unix: u64,
+}
+
+pub struct ZstdCompressor {
+    level: CompressionLevel,
+    window: SlidingWindow,
+}
+
+pub struct ZstdDecompressor {
+    window: SlidingWindow,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -212,11 +222,6 @@ impl FrameHeader {
     }
 }
 
-pub struct ZstdCompressor {
-    level: CompressionLevel,
-    window: SlidingWindow,
-}
-
 impl ZstdCompressor {
     pub fn new(level: CompressionLevel) -> Self {
         Self {
@@ -255,10 +260,6 @@ impl ZstdCompressor {
 
         Ok(output)
     }
-}
-
-pub struct ZstdDecompressor {
-    window: SlidingWindow,
 }
 
 impl ZstdDecompressor {
@@ -386,6 +387,101 @@ impl ZstdDecompressor {
         }
 
         Ok(output)
+    }
+}
+
+impl Compressor for ZstdCompressor {
+    fn compress(&mut self, input: &[u8]) -> io::Result<Vec<u8>> {
+        self.window.clear();
+        let _ = self.level;
+        let _ = ZSTD_MIN_MATCH_LENGTH;
+        let _ = ZSTD_MAX_MATCH_LENGTH;
+        let mut output = Vec::new();
+        output.extend_from_slice(&ZSTD_MAGIC.to_le_bytes());
+        let frame_header = FrameHeader {
+            checksum_flag: false,
+            unused_flag: false,
+            single_segment_flag: input.len() < 256 * 1024,
+            content_size_flag: true,
+            content_checksum_flag: false,
+            reserved_flag: false,
+            version: 0,
+            window_size: ZSTD_DEFAULT_BLOCK_SIZE as u32,
+            content_size: Some(input.len() as u64),
+            dictionary_id: None,
+        };
+
+        output.extend_from_slice(&frame_header.serialize());
+
+        let compressed_data = self.compress_block(input)?;
+        output.extend_from_slice(&compressed_data);
+
+        Ok(output)
+    }
+
+    fn compress_stream(&mut self, input: &[u8], output: &mut Vec<u8>) -> io::Result<()> {
+        let compressed = self.compress_block(input)?;
+        output.extend_from_slice(&compressed);
+        self.window.push_slice(input);
+
+        Ok(())
+    }
+
+    fn finish(&mut self) -> io::Result<Vec<u8>> {
+        Ok(Vec::new())
+    }
+
+    fn reset(&mut self) {
+        self.window.clear();
+    }
+}
+
+impl Decompressor for ZstdDecompressor {
+    fn decompress(&mut self, input: &[u8]) -> io::Result<Vec<u8>> {
+        if input.len() < 5 {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "Input too short for ZSTD frame"));
+        }
+
+        let magic = u32::from_le_bytes([input[0], input[1], input[2], input[3]]);
+        if magic != ZSTD_MAGIC {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid ZSTD magic number"));
+        }
+
+        self.window.clear();
+
+        let (frame_header, header_size) = FrameHeader::parse(&input[4..])?;
+        let _ = frame_header.version;
+        let data_start = 4 + header_size;
+        if data_start > input.len() {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "Frame header exceeds input"));
+        }
+
+        if data_start == input.len() {
+            return Ok(Vec::new());
+        }
+
+        self.decompress_blocks(input, data_start)
+    }
+
+    fn decompress_stream(&mut self, input: &[u8], output: &mut Vec<u8>) -> io::Result<()> {
+        let decompressed = self.decompress(input)?;
+        output.extend_from_slice(&decompressed);
+        
+        Ok(())
+    }
+
+    fn finish(&mut self) -> io::Result<Vec<u8>> {
+        Ok(Vec::new())
+    }
+
+    fn reset(&mut self) {
+        self.window.clear();
+    }
+}
+
+impl Default for ZstdDecompressor {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -567,99 +663,6 @@ pub fn decompress_bounded(data: &[u8], max_output_size: usize) -> io::Result<Vec
 
     let output = decompressor.decompress_blocks_bounded(data, data_start, max_output_size)?;
     Ok(output)
-}
-
-impl Compressor for ZstdCompressor {
-    fn compress(&mut self, input: &[u8]) -> io::Result<Vec<u8>> {
-        self.window.clear();
-        let _ = self.level;
-        let _ = ZSTD_MIN_MATCH_LENGTH;
-        let _ = ZSTD_MAX_MATCH_LENGTH;
-        let mut output = Vec::new();
-        output.extend_from_slice(&ZSTD_MAGIC.to_le_bytes());
-        let frame_header = FrameHeader {
-            checksum_flag: false,
-            unused_flag: false,
-            single_segment_flag: input.len() < 256 * 1024,
-            content_size_flag: true,
-            content_checksum_flag: false,
-            reserved_flag: false,
-            version: 0,
-            window_size: ZSTD_DEFAULT_BLOCK_SIZE as u32,
-            content_size: Some(input.len() as u64),
-            dictionary_id: None,
-        };
-
-        output.extend_from_slice(&frame_header.serialize());
-
-        let compressed_data = self.compress_block(input)?;
-        output.extend_from_slice(&compressed_data);
-
-        Ok(output)
-    }
-
-    fn compress_stream(&mut self, input: &[u8], output: &mut Vec<u8>) -> io::Result<()> {
-        let compressed = self.compress_block(input)?;
-        output.extend_from_slice(&compressed);
-        self.window.push_slice(input);
-        Ok(())
-    }
-
-    fn finish(&mut self) -> io::Result<Vec<u8>> {
-        Ok(Vec::new())
-    }
-
-    fn reset(&mut self) {
-        self.window.clear();
-    }
-}
-
-impl Decompressor for ZstdDecompressor {
-    fn decompress(&mut self, input: &[u8]) -> io::Result<Vec<u8>> {
-        if input.len() < 5 {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "Input too short for ZSTD frame"));
-        }
-
-        let magic = u32::from_le_bytes([input[0], input[1], input[2], input[3]]);
-        if magic != ZSTD_MAGIC {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid ZSTD magic number"));
-        }
-
-        self.window.clear();
-
-        let (frame_header, header_size) = FrameHeader::parse(&input[4..])?;
-        let _ = frame_header.version;
-        let data_start = 4 + header_size;
-        if data_start > input.len() {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "Frame header exceeds input"));
-        }
-
-        if data_start == input.len() {
-            return Ok(Vec::new());
-        }
-
-        self.decompress_blocks(input, data_start)
-    }
-
-    fn decompress_stream(&mut self, input: &[u8], output: &mut Vec<u8>) -> io::Result<()> {
-        let decompressed = self.decompress(input)?;
-        output.extend_from_slice(&decompressed);
-        Ok(())
-    }
-
-    fn finish(&mut self) -> io::Result<Vec<u8>> {
-        Ok(Vec::new())
-    }
-
-    fn reset(&mut self) {
-        self.window.clear();
-    }
-}
-
-impl Default for ZstdDecompressor {
-    fn default() -> Self {
-        Self::new()
-    }
 }
 
 fn compute_zstd_blob_tag(nonce: &[u8], algorithm: CompressionAlgorithm, raw_size: usize, encoded_payload: &[u8]) -> [u8; 32] {

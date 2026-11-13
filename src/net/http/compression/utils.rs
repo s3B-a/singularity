@@ -4,6 +4,7 @@ use crate::crypto::encoding::pem;
 use crate::crypto::hash::hmac::hmac_sha256;
 use crate::crypto::hash::sha2::sha256;
 use crate::crypto::random;
+
 use std::io;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -23,27 +24,239 @@ pub struct SecureCompressionUtilBlobMeta {
     pub issued_at_unix: u64,
 }
 
-const fn generate_crc32_table() -> [u32; 256] {
-    let mut table = [0u32; 256];
-    let mut i = 0;
-    while i < 256 {
-        let mut crc = i as u32;
-        let mut j = 0;
-        while j < 8 {
-            if crc & 1 != 0 {
-                crc = 0xedb88320 ^ (crc >> 1);
-            } else {
-                crc >>= 1;
-            }
+pub struct BitReader<'a> {
+    data: &'a [u8],
+    byte_pos: usize,
+    bit_pos: u8,
+}
 
-            j += 1;
+pub struct BitWriter {
+    data: Vec<u8>,
+    current_byte: u8,
+    bit_pos: u8,
+}
+
+pub struct SlidingWindow {
+    buffer: Vec<u8>,
+    size: usize,
+    pub pos: usize,
+}
+
+impl<'a> BitReader<'a> {
+    pub fn new(data: &'a [u8]) -> Self {
+        Self {
+            data,
+            byte_pos: 0,
+            bit_pos: 0,
+        }
+    }
+
+    pub fn read_bits(&mut self, n: u8) -> Option<u32> {
+        if n > 32 {
+            return None;
         }
 
-        table[i] = crc;
-        i += 1;
+        let mut result = 0u32;
+        let mut bits_read = 0u8;
+        while bits_read < n {
+            if self.byte_pos >= self.data.len() {
+                return None;
+            }
+
+            let bits_available = 8 - self.bit_pos;
+            let bits_to_read = (n - bits_read).min(bits_available);
+            let byte = self.data[self.byte_pos];
+            let shift = bits_available - bits_to_read;
+            let mask = if bits_to_read == 8 {
+                0xffu32
+            } else {
+                (1u32 << bits_to_read) - 1
+            };
+
+            let bits = (byte as u32 >> shift) & mask;
+            result = (result << bits_to_read) | bits;
+            bits_read += bits_to_read;
+            self.bit_pos += bits_to_read;
+
+            if self.bit_pos >= 8 {
+                self.bit_pos = 0;
+                self.byte_pos += 1;
+            }
+        }
+
+        Some(result)
     }
-    
-    table
+
+    pub fn align_to_byte(&mut self) {
+        if self.bit_pos != 0 {
+            self.bit_pos = 0;
+            self.byte_pos += 1;
+        }
+    }
+
+    pub fn position(&self) -> usize {
+        self.byte_pos
+    }
+
+    pub fn has_more(&self) -> bool {
+        self.byte_pos < self.data.len()
+    }
+
+    pub fn peek_bits(&self, n: u8) -> Option<u32> {
+        let mut temp = self.clone();
+        temp.read_bits(n)
+    }
+}
+
+impl BitWriter {
+    pub fn new() -> Self {
+        Self {
+            data: Vec::new(),
+            current_byte: 0,
+            bit_pos: 0,
+        }
+    }
+
+    pub fn write_bits(&mut self, value: u32, n: u8) {
+        if n == 0 || n > 32 {
+            return;
+        }
+
+        for i in (0..n).rev() {
+            let bit = ((value >> i) & 1) as u8;
+            self.current_byte = (self.current_byte << 1) | bit;
+            self.bit_pos += 1;
+            if self.bit_pos >= 8 {
+                self.data.push(self.current_byte);
+                self.current_byte = 0;
+                self.bit_pos = 0;
+            }
+        }
+    }
+
+    pub fn write_bits_reverse(&mut self, value: u32, n: u8) {
+        for i in 0..n {
+            let bit = ((value >> i) & 1) as u8;
+            self.current_byte = (self.current_byte << 1) | bit;
+            self.bit_pos += 1;
+            if self.bit_pos >= 8 {
+                self.data.push(self.current_byte);
+                self.current_byte = 0;
+                self.bit_pos = 0;
+            }
+        }
+    }
+
+    pub fn align_to_byte(&mut self) {
+        if self.bit_pos != 0 {
+            self.current_byte <<= 8 - self.bit_pos;
+            self.data.push(self.current_byte);
+            self.current_byte = 0;
+            self.bit_pos = 0;
+        }
+    }
+
+    pub fn finish(mut self) -> Vec<u8> {
+        if self.bit_pos != 0 {
+            self.current_byte <<= 8 - self.bit_pos;
+            self.data.push(self.current_byte);
+        }
+        
+        self.data
+    }
+
+    pub fn len(&self) -> usize {
+        self.data.len() + if self.bit_pos > 0 { 1 } else { 0 }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.data.is_empty() && self.bit_pos == 0
+    }
+}
+
+impl SlidingWindow {
+    pub fn new(size: usize) -> Self {
+        Self {
+            buffer: vec![0; size],
+            size,
+            pos: 0,
+        }
+    }
+
+    pub fn push(&mut self, byte: u8) {
+        self.buffer[self.pos] = byte;
+        self.pos = (self.pos + 1) % self.size;
+    }
+
+    pub fn push_slice(&mut self, data: &[u8]) {
+        for &byte in data {
+            self.push(byte);
+        }
+    }
+
+    pub fn get(&self, offset: usize) -> Option<u8> {
+        if offset > self.size || offset == 0 {
+            return None;
+        }
+
+        let idx = (self.pos + self.size - offset) % self.size;
+        Some(self.buffer[idx])
+    }
+
+    pub fn find_match(&self, data: &[u8], max_length: usize) -> Option<(usize, usize)> {
+        if data.is_empty() || max_length == 0 {
+            return None;
+        }
+
+        let mut best_match: Option<(usize, usize)> = None;
+        let max_length = max_length.min(data.len()).min(258);
+        for offset in 1..=self.size.min(self.pos) {
+            let idx = (self.pos + self.size - offset) % self.size;
+            let mut match_len = 0;
+            while match_len < max_length && match_len < data.len() {
+                let window_byte = self.buffer[(idx + match_len) % self.size];
+                let data_byte = data[match_len];
+                if window_byte != data_byte {
+                    break;
+                }
+
+                match_len += 1;
+            }
+            
+            if match_len > 0 {
+                if let Some((_, best_len)) = best_match {
+                    if match_len > best_len {
+                        best_match = Some((offset, match_len));
+                    }
+                } else {
+                    best_match = Some((offset, match_len));
+                }
+            }
+        }
+
+        best_match
+    }
+
+    pub fn clear(&mut self) {
+        self.buffer.fill(0);
+        self.pos = 0;
+    }
+}
+
+impl<'a> Clone for BitReader<'a> {
+    fn clone(&self) -> Self {
+        Self {
+            data: self.data,
+            byte_pos: self.byte_pos,
+            bit_pos: self.bit_pos,
+        }
+    }
+}
+
+impl Default for BitWriter {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 pub fn crc32(data: &[u8]) -> u32 {
@@ -125,225 +338,6 @@ pub fn reverse_bits_u16(value: u16, num_bits: u8) -> u16 {
     }
 
     result
-}
-
-pub struct BitReader<'a> {
-    data: &'a [u8],
-    byte_pos: usize,
-    bit_pos: u8,
-}
-
-impl<'a> BitReader<'a> {
-    pub fn new(data: &'a [u8]) -> Self {
-        Self {
-            data,
-            byte_pos: 0,
-            bit_pos: 0,
-        }
-    }
-
-    pub fn read_bits(&mut self, n: u8) -> Option<u32> {
-        if n > 32 {
-            return None;
-        }
-
-        let mut result = 0u32;
-        let mut bits_read = 0u8;
-        while bits_read < n {
-            if self.byte_pos >= self.data.len() {
-                return None;
-            }
-
-            let bits_available = 8 - self.bit_pos;
-            let bits_to_read = (n - bits_read).min(bits_available);
-            let byte = self.data[self.byte_pos];
-            let shift = bits_available - bits_to_read;
-            let mask = if bits_to_read == 8 {
-                0xffu32
-            } else {
-                (1u32 << bits_to_read) - 1
-            };
-
-            let bits = (byte as u32 >> shift) & mask;
-            result = (result << bits_to_read) | bits;
-            bits_read += bits_to_read;
-            self.bit_pos += bits_to_read;
-
-            if self.bit_pos >= 8 {
-                self.bit_pos = 0;
-                self.byte_pos += 1;
-            }
-        }
-
-        Some(result)
-    }
-
-    pub fn align_to_byte(&mut self) {
-        if self.bit_pos != 0 {
-            self.bit_pos = 0;
-            self.byte_pos += 1;
-        }
-    }
-
-    pub fn position(&self) -> usize {
-        self.byte_pos
-    }
-
-    pub fn has_more(&self) -> bool {
-        self.byte_pos < self.data.len()
-    }
-
-    pub fn peek_bits(&self, n: u8) -> Option<u32> {
-        let mut temp = self.clone();
-        temp.read_bits(n)
-    }
-}
-
-pub struct BitWriter {
-    data: Vec<u8>,
-    current_byte: u8,
-    bit_pos: u8,
-}
-
-impl BitWriter {
-    pub fn new() -> Self {
-        Self {
-            data: Vec::new(),
-            current_byte: 0,
-            bit_pos: 0,
-        }
-    }
-
-    pub fn write_bits(&mut self, value: u32, n: u8) {
-        if n == 0 || n > 32 {
-            return;
-        }
-
-        for i in (0..n).rev() {
-            let bit = ((value >> i) & 1) as u8;
-            self.current_byte = (self.current_byte << 1) | bit;
-            self.bit_pos += 1;
-            if self.bit_pos >= 8 {
-                self.data.push(self.current_byte);
-                self.current_byte = 0;
-                self.bit_pos = 0;
-            }
-        }
-    }
-
-    pub fn write_bits_reverse(&mut self, value: u32, n: u8) {
-        for i in 0..n {
-            let bit = ((value >> i) & 1) as u8;
-            self.current_byte = (self.current_byte << 1) | bit;
-            self.bit_pos += 1;
-            if self.bit_pos >= 8 {
-                self.data.push(self.current_byte);
-                self.current_byte = 0;
-                self.bit_pos = 0;
-            }
-        }
-    }
-
-    pub fn align_to_byte(&mut self) {
-        if self.bit_pos != 0 {
-            self.current_byte <<= 8 - self.bit_pos;
-            self.data.push(self.current_byte);
-            self.current_byte = 0;
-            self.bit_pos = 0;
-        }
-    }
-
-    pub fn finish(mut self) -> Vec<u8> {
-        if self.bit_pos != 0 {
-            self.current_byte <<= 8 - self.bit_pos;
-            self.data.push(self.current_byte);
-        }
-        
-        self.data
-    }
-
-    pub fn len(&self) -> usize {
-        self.data.len() + if self.bit_pos > 0 { 1 } else { 0 }
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.data.is_empty() && self.bit_pos == 0
-    }
-}
-
-pub struct SlidingWindow {
-    buffer: Vec<u8>,
-    size: usize,
-    pub pos: usize,
-}
-
-impl SlidingWindow {
-    pub fn new(size: usize) -> Self {
-        Self {
-            buffer: vec![0; size],
-            size,
-            pos: 0,
-        }
-    }
-
-    pub fn push(&mut self, byte: u8) {
-        self.buffer[self.pos] = byte;
-        self.pos = (self.pos + 1) % self.size;
-    }
-
-    pub fn push_slice(&mut self, data: &[u8]) {
-        for &byte in data {
-            self.push(byte);
-        }
-    }
-
-    pub fn get(&self, offset: usize) -> Option<u8> {
-        if offset > self.size || offset == 0 {
-            return None;
-        }
-
-        let idx = (self.pos + self.size - offset) % self.size;
-        Some(self.buffer[idx])
-    }
-
-    pub fn find_match(&self, data: &[u8], max_length: usize) -> Option<(usize, usize)> {
-        if data.is_empty() || max_length == 0 {
-            return None;
-        }
-
-        let mut best_match: Option<(usize, usize)> = None;
-        let max_length = max_length.min(data.len()).min(258);
-        for offset in 1..=self.size.min(self.pos) {
-            let idx = (self.pos + self.size - offset) % self.size;
-            let mut match_len = 0;
-            while match_len < max_length && match_len < data.len() {
-                let window_byte = self.buffer[(idx + match_len) % self.size];
-                let data_byte = data[match_len];
-                if window_byte != data_byte {
-                    break;
-                }
-
-                match_len += 1;
-            }
-            
-            if match_len > 0 {
-                if let Some((_, best_len)) = best_match {
-                    if match_len > best_len {
-                        best_match = Some((offset, match_len));
-                    }
-                } else {
-                    best_match = Some((offset, match_len));
-                }
-            }
-        }
-
-        best_match
-    }
-
-    pub fn clear(&mut self) {
-        self.buffer.fill(0);
-        self.pos = 0;
-    }
 }
 
 pub fn select_secure_compression_util_algorithm(accept_encoding: &str) -> CompressionAlgorithm {
@@ -487,6 +481,29 @@ pub fn decode_secure_compression_util_payload(data: &[u8]) -> io::Result<(Secure
     }
 
     Ok((meta, raw_payload))
+}
+
+const fn generate_crc32_table() -> [u32; 256] {
+    let mut table = [0u32; 256];
+    let mut i = 0;
+    while i < 256 {
+        let mut crc = i as u32;
+        let mut j = 0;
+        while j < 8 {
+            if crc & 1 != 0 {
+                crc = 0xedb88320 ^ (crc >> 1);
+            } else {
+                crc >>= 1;
+            }
+
+            j += 1;
+        }
+
+        table[i] = crc;
+        i += 1;
+    }
+    
+    table
 }
 
 fn compute_compression_util_blob_tag(nonce: &[u8], algorithm: CompressionAlgorithm, raw_size: usize, encoded_payload: &[u8]) -> [u8; 32] {
@@ -661,22 +678,6 @@ fn parse_secure_compression_util_blob_meta(header: &str, body_len: usize) -> io:
         encoded_size,
         issued_at_unix,
     })
-}
-
-impl<'a> Clone for BitReader<'a> {
-    fn clone(&self) -> Self {
-        Self {
-            data: self.data,
-            byte_pos: self.byte_pos,
-            bit_pos: self.bit_pos,
-        }
-    }
-}
-
-impl Default for BitWriter {
-    fn default() -> Self {
-        Self::new()
-    }
 }
 
 #[cfg(test)]

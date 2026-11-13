@@ -4,16 +4,17 @@ use crate::crypto::hash::hmac::hmac_sha256;
 use crate::crypto::hash::sha2::sha256;
 use crate::crypto::random;
 use crate::net::http::compression::{self, CompressionAlgorithm, CompressionLevel};
+
 use std::collections::HashMap;
 use std::fmt;
 use std::io;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const COOKIE_BLOB_MAGIC: &str = "SINGULARITY_COOKIE_BLOB_V1";
-const COOKIE_BLOB_CONTEXT: &str = "SINGULARITY_COOKIE_BLOB_BINDING_V1";
-
 pub const SECURE_PREFIX: &str = "__Secure-";
 pub const HOST_PREFIX: &str = "__Host-";
+
+const COOKIE_BLOB_MAGIC: &str = "SINGULARITY_COOKIE_BLOB_V1";
+const COOKIE_BLOB_CONTEXT: &str = "SINGULARITY_COOKIE_BLOB_BINDING_V1";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SecureCookieBlobMeta {
@@ -24,13 +25,6 @@ pub struct SecureCookieBlobMeta {
     pub raw_size: usize,
     pub encoded_size: usize,
     pub issued_at_unix: u64,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum SameSite {
-    Strict,
-    Lax,
-    None,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -45,6 +39,13 @@ pub struct Cookie {
     http_only: bool,
     same_site: Option<SameSite>,
     host_only: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum SameSite {
+    Strict,
+    Lax,
+    None,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -350,6 +351,58 @@ impl Cookie {
     }
 }
 
+impl fmt::Display for Cookie {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}={}", self.name, self.value)?;
+        if let Some(domain) = self.domain.as_ref().filter(|_| !self.host_only) {
+            write!(f, "; Domain={}", domain)?;
+        }
+
+        if let Some(path) = &self.path {
+            write!(f, "; Path={}", path)?;
+        }
+
+        if let Some(expires) = self.expires {
+            write!(f, "; Expires={}", expires)?;
+        }
+
+        if let Some(max_age) = self.max_age {
+            write!(f, "; Max-Age={}", max_age)?;
+        }
+
+        if self.secure {
+            write!(f, "; Secure")?;
+        }
+
+        if self.http_only {
+            write!(f, "; HttpOnly")?;
+        }
+
+        if let Some(same_site) = self.same_site.clone() {
+            write!(f, "; SameSite={}", same_site)?;
+        }
+
+        Ok(())
+    }
+}
+
+impl fmt::Display for SameSite {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SameSite::Strict => write!(f, "Strict"),
+            SameSite::Lax => write!(f, "Lax"),
+            SameSite::None => write!(f, "None"),
+        }
+    }
+}
+
+pub fn domain_match(host: &str, domain: &str) -> bool {
+    let (host, domain) = (host.as_bytes(), domain.as_bytes());
+    host.eq_ignore_ascii_case(domain) || (host.len() > domain.len() 
+        && host[host.len() - domain.len() - 1] == b'.'
+        && host[host.len() - domain.len()..].eq_ignore_ascii_case(domain))
+}
+
 fn serialize_cookie(cookie: &Cookie) -> Vec<u8> {
     let domain_b64 = cookie.domain.as_ref().map(|v| pem::encode(v.as_bytes())).unwrap_or_default();
     let path_b64 = cookie.path.as_ref().map(|v| pem::encode(v.as_bytes())).unwrap_or_default();
@@ -649,58 +702,6 @@ fn parse_secure_cookie_meta(header: &str, body_len: usize) -> io::Result<SecureC
         encoded_size,
         issued_at_unix,
     })
-}
-
-pub fn domain_match(host: &str, domain: &str) -> bool {
-    let (host, domain) = (host.as_bytes(), domain.as_bytes());
-    host.eq_ignore_ascii_case(domain) || (host.len() > domain.len() 
-        && host[host.len() - domain.len() - 1] == b'.'
-        && host[host.len() - domain.len()..].eq_ignore_ascii_case(domain))
-}
-
-impl fmt::Display for Cookie {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}={}", self.name, self.value)?;
-        if let Some(domain) = self.domain.as_ref().filter(|_| !self.host_only) {
-            write!(f, "; Domain={}", domain)?;
-        }
-
-        if let Some(path) = &self.path {
-            write!(f, "; Path={}", path)?;
-        }
-
-        if let Some(expires) = self.expires {
-            write!(f, "; Expires={}", expires)?;
-        }
-
-        if let Some(max_age) = self.max_age {
-            write!(f, "; Max-Age={}", max_age)?;
-        }
-
-        if self.secure {
-            write!(f, "; Secure")?;
-        }
-
-        if self.http_only {
-            write!(f, "; HttpOnly")?;
-        }
-
-        if let Some(same_site) = self.same_site.clone() {
-            write!(f, "; SameSite={}", same_site)?;
-        }
-
-        Ok(())
-    }
-}
-
-impl fmt::Display for SameSite {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            SameSite::Strict => write!(f, "Strict"),
-            SameSite::Lax => write!(f, "Lax"),
-            SameSite::None => write!(f, "None"),
-        }
-    }
 }
 
 #[cfg(test)]

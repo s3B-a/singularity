@@ -1,10 +1,11 @@
-use super::error::{ErrorCode, Http2Error, Result};
 use crate::crypto::constant_time_eq;
 use crate::crypto::encoding::pem;
 use crate::crypto::hash::hmac::hmac_sha256;
 use crate::crypto::hash::sha2::sha256;
 use crate::crypto::random;
 use crate::net::http::compression::{self, CompressionAlgorithm, CompressionLevel};
+use super::error::{ErrorCode, Http2Error, Result};
+
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -23,15 +24,6 @@ pub struct SecurePushManagerBlobMeta {
     pub issued_at_unix: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PushStatus {
-    Pending,
-    Received,
-    Complete,
-    Rejected,
-    Failed,
-}
-
 #[derive(Debug, Clone)]
 pub struct PushedResource {
     pub stream_id: u32,
@@ -43,6 +35,43 @@ pub struct PushedResource {
     pub received_at: Instant,
     pub cache_key: String,
     pub used: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct PushConfig {
+    pub enabled: bool,
+    pub max_concurrent_pushes: usize,
+    pub max_push_age: Duration,
+    pub max_cache_size: usize,
+    pub reject_content_types: HashSet<String>,
+    pub same_origin_only: bool,
+}
+
+pub struct PushManager {
+    config: PushConfig,
+    pushed_resources: HashMap<u32, PushedResource>,
+    push_cache: HashMap<String, u32>,
+    pending_promises: HashMap<u32, u32>,
+    connection_origin: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct PushStats {
+    pub total: usize,
+    pub complete: usize,
+    pub pending: usize,
+    pub used: usize,
+    pub rejected: usize,
+    pub cache_size: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PushStatus {
+    Pending,
+    Received,
+    Complete,
+    Rejected,
+    Failed,
 }
 
 impl PushedResource {
@@ -147,41 +176,6 @@ impl PushedResource {
             name == ":status"
         }).and_then(|(_, value)| value.parse().ok())
     }
-}
-
-#[derive(Debug, Clone)]
-pub struct PushConfig {
-    pub enabled: bool,
-    pub max_concurrent_pushes: usize,
-    pub max_push_age: Duration,
-    pub max_cache_size: usize,
-    pub reject_content_types: HashSet<String>,
-    pub same_origin_only: bool,
-}
-
-impl Default for PushConfig {
-    fn default() -> Self {
-        let mut reject_content_types = HashSet::new();
-        reject_content_types.insert("video/".to_string());
-        reject_content_types.insert("audio/".to_string());
-
-        Self {
-            enabled: true,
-            max_concurrent_pushes: 10,
-            max_push_age: Duration::from_secs(300),
-            max_cache_size: 50,
-            reject_content_types,
-            same_origin_only: true,
-        }
-    }
-}
-
-pub struct PushManager {
-    config: PushConfig,
-    pushed_resources: HashMap<u32, PushedResource>,
-    push_cache: HashMap<String, u32>,
-    pending_promises: HashMap<u32, u32>,
-    connection_origin: Option<String>,
 }
 
 impl PushManager {
@@ -479,14 +473,21 @@ impl PushManager {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-pub struct PushStats {
-    pub total: usize,
-    pub complete: usize,
-    pub pending: usize,
-    pub used: usize,
-    pub rejected: usize,
-    pub cache_size: usize,
+impl Default for PushConfig {
+    fn default() -> Self {
+        let mut reject_content_types = HashSet::new();
+        reject_content_types.insert("video/".to_string());
+        reject_content_types.insert("audio/".to_string());
+
+        Self {
+            enabled: true,
+            max_concurrent_pushes: 10,
+            max_push_age: Duration::from_secs(300),
+            max_cache_size: 50,
+            reject_content_types,
+            same_origin_only: true,
+        }
+    }
 }
 
 pub fn select_secure_push_manager_algorithm(accept_encoding: &str) -> CompressionAlgorithm {

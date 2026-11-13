@@ -1,10 +1,11 @@
-use super::error::Result;
 use crate::crypto::constant_time_eq;
 use crate::crypto::encoding::pem;
 use crate::crypto::hash::hmac::hmac_sha256;
 use crate::crypto::hash::sha2::sha256;
 use crate::crypto::random;
 use crate::net::http::compression::{self, CompressionAlgorithm, CompressionLevel};
+use super::error::Result;
+
 use std::collections::HashMap;
 use std::io;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -23,11 +24,85 @@ pub struct SecureCongestionStatusBlobMeta {
     pub issued_at_unix: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CongestionStatus {
+    pub algorithm: CongestionAlgorithm,
+    pub cwnd: u64,
+    pub ssthresh: u64,
+    pub bytes_in_flight: u64,
+    pub state: CongestionState,
+    pub max_datagram_size: u64,
+    pub min_cwnd: u64,
+    pub max_cwnd: u64,
+    pub initial_cwnd: u64,
+    pub smoothed_rtt: Option<Duration>,
+    pub rttvar: Duration,
+    pub min_rtt: Option<Duration>,
+    pub last_rtt: Option<Duration>,
+    pub bytes_acked_since_increase: u64,
+}
+
+pub struct CongestionController {
+    algorithm: CongestionAlgorithm,
+    cwnd: u64,
+    ssthresh: u64,
+    bytes_in_flight: u64,
+    state: CongestionState,
+    max_datagram_size: u64,
+    min_cwnd: u64,
+    max_cwnd: u64,
+    initial_cwnd: u64,
+    smoothed_rtt: Option<Duration>,
+    rttvar: Duration,
+    min_rtt: Option<Duration>,
+    last_rtt: Option<Duration>,
+    last_congestion_time: Option<Instant>,
+    recovery_start_time: Option<Instant>,
+    bytes_acked_since_increase: u64,
+    cubic: CubicState,
+    bbr: BbrState,
+}
+
+#[derive(Debug, Clone)]
+struct CubicState {
+    epoch_start: Option<Instant>,
+    w_max: f64,
+    k: f64,
+    w_cubic: f64,
+    c: f64,
+    beta: f64,
+}
+
+#[derive(Debug, Clone)]
+struct BbrState {
+    max_bandwidth: u64,
+    min_rtt: Duration,
+    pacing_rate: u64,
+    mode: BbrMode,
+    cycle_index: usize,
+    cycle_start: Option<Instant>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CongestionAlgorithm {
     Cubic,
     Reno,
     Bbr,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CongestionState {
+    SlowStart,
+    CongestionAvoidance,
+    Recovery,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BbrMode {
+    Startup,
+    Drain,
+    ProbeBW,
+    ProbeRTT,
 }
 
 impl CongestionAlgorithm {
@@ -52,13 +127,6 @@ impl CongestionAlgorithm {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CongestionState {
-    SlowStart,
-    CongestionAvoidance,
-    Recovery,
-}
-
 impl CongestionState {
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -79,24 +147,6 @@ impl CongestionState {
             )),
         }
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CongestionStatus {
-    pub algorithm: CongestionAlgorithm,
-    pub cwnd: u64,
-    pub ssthresh: u64,
-    pub bytes_in_flight: u64,
-    pub state: CongestionState,
-    pub max_datagram_size: u64,
-    pub min_cwnd: u64,
-    pub max_cwnd: u64,
-    pub initial_cwnd: u64,
-    pub smoothed_rtt: Option<Duration>,
-    pub rttvar: Duration,
-    pub min_rtt: Option<Duration>,
-    pub last_rtt: Option<Duration>,
-    pub bytes_acked_since_increase: u64,
 }
 
 impl CongestionStatus {
@@ -254,55 +304,6 @@ impl CongestionStatus {
         let status = deserialize_congestion_status(&raw_payload)?;
         Ok((meta, status))
     }
-}
-
-#[derive(Debug, Clone)]
-struct CubicState {
-    epoch_start: Option<Instant>,
-    w_max: f64,
-    k: f64,
-    w_cubic: f64,
-    c: f64,
-    beta: f64,
-}
-
-#[derive(Debug, Clone)]
-struct BbrState {
-    max_bandwidth: u64,
-    min_rtt: Duration,
-    pacing_rate: u64,
-    mode: BbrMode,
-    cycle_index: usize,
-    cycle_start: Option<Instant>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BbrMode {
-    Startup,
-    Drain,
-    ProbeBW,
-    ProbeRTT,
-}
-
-pub struct CongestionController {
-    algorithm: CongestionAlgorithm,
-    cwnd: u64,
-    ssthresh: u64,
-    bytes_in_flight: u64,
-    state: CongestionState,
-    max_datagram_size: u64,
-    min_cwnd: u64,
-    max_cwnd: u64,
-    initial_cwnd: u64,
-    smoothed_rtt: Option<Duration>,
-    rttvar: Duration,
-    min_rtt: Option<Duration>,
-    last_rtt: Option<Duration>,
-    last_congestion_time: Option<Instant>,
-    recovery_start_time: Option<Instant>,
-    bytes_acked_since_increase: u64,
-    cubic: CubicState,
-    bbr: BbrState,
 }
 
 impl CongestionController {
@@ -603,6 +604,32 @@ impl CongestionController {
         self.bbr = BbrState::default();
         if let Some(min_rtt) = self.min_rtt {
             self.bbr.min_rtt = min_rtt;
+        }
+    }
+}
+
+impl Default for CubicState {
+    fn default() -> Self {
+        Self {
+            epoch_start: None,
+            w_max: 0.0,
+            k: 0.0,
+            w_cubic: 0.0,
+            c: 0.4,
+            beta: 0.7,
+        }
+    }
+}
+
+impl Default for BbrState {
+    fn default() -> Self {
+        Self {
+            max_bandwidth: 0,
+            min_rtt: Duration::from_millis(10),
+            pacing_rate: 0,
+            mode: BbrMode::Startup,
+            cycle_index: 0,
+            cycle_start: None,
         }
     }
 }
@@ -940,32 +967,6 @@ fn parse_secure_congestion_status_meta(header: &str, body_len: usize) -> io::Res
     }
 
     Ok(meta)
-}
-
-impl Default for CubicState {
-    fn default() -> Self {
-        Self {
-            epoch_start: None,
-            w_max: 0.0,
-            k: 0.0,
-            w_cubic: 0.0,
-            c: 0.4,
-            beta: 0.7,
-        }
-    }
-}
-
-impl Default for BbrState {
-    fn default() -> Self {
-        Self {
-            max_bandwidth: 0,
-            min_rtt: Duration::from_millis(10),
-            pacing_rate: 0,
-            mode: BbrMode::Startup,
-            cycle_index: 0,
-            cycle_start: None,
-        }
-    }
 }
 
 #[cfg(test)]

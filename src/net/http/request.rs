@@ -7,6 +7,7 @@ use crate::net::http::compression::{self, CompressionAlgorithm, CompressionLevel
 use crate::net::http::headers::Headers;
 use crate::net::http::method::HttpMethod;
 use crate::net::http::version::HttpVersion;
+
 use std::fmt;
 use std::io;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -32,6 +33,10 @@ pub struct HttpRequest {
     version: HttpVersion,
     headers: Headers,
     body: Vec<u8>,
+}
+
+pub struct RequestBuilder {
+    request: HttpRequest,
 }
 
 impl HttpRequest {
@@ -352,6 +357,57 @@ impl HttpRequest {
         }
 
         out
+    }
+}
+
+impl RequestBuilder {
+    pub fn new(method: HttpMethod, path: impl Into<String>) -> Self {
+        Self {
+            request: HttpRequest::new(method, path),
+        }
+    }
+
+    pub fn header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.request = self.request.header(name, value);
+        self
+    }
+
+    pub fn body(mut self, body: impl Into<Vec<u8>>) -> Self {
+        self.request = self.request.body(body);
+        self
+    }
+
+    pub fn build(self) -> HttpRequest {
+        self.request
+    }
+
+    pub fn keep_alive(mut self, enable: bool) -> Self {
+        if enable {
+            self.request.headers_mut().insert("Connection", "keep-alive");
+        } else {
+            self.request.headers_mut().insert("Connection", "close");
+        }
+
+        self
+    }
+
+    pub fn connection(mut self, connection_type: impl Into<String>) -> Self {
+        self.request
+            .headers_mut()
+            .insert("Connection", connection_type);
+        self
+    }
+}
+
+impl fmt::Debug for HttpRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HttpRequest")
+            .field("method", &self.method)
+            .field("path", &self.path)
+            .field("version", &self.version)
+            .field("headers", &self.headers)
+            .field("body_length", &self.body.len())
+            .finish()
     }
 }
 
@@ -762,61 +818,6 @@ fn parse_secure_http_request_meta(header: &str, body_len: usize) -> io::Result<S
         encoded_size,
         issued_at_unix,
     })
-}
-
-impl fmt::Debug for HttpRequest {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("HttpRequest")
-            .field("method", &self.method)
-            .field("path", &self.path)
-            .field("version", &self.version)
-            .field("headers", &self.headers)
-            .field("body_length", &self.body.len())
-            .finish()
-    }
-}
-
-pub struct RequestBuilder {
-    request: HttpRequest,
-}
-
-impl RequestBuilder {
-    pub fn new(method: HttpMethod, path: impl Into<String>) -> Self {
-        Self {
-            request: HttpRequest::new(method, path),
-        }
-    }
-
-    pub fn header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
-        self.request = self.request.header(name, value);
-        self
-    }
-
-    pub fn body(mut self, body: impl Into<Vec<u8>>) -> Self {
-        self.request = self.request.body(body);
-        self
-    }
-
-    pub fn build(self) -> HttpRequest {
-        self.request
-    }
-
-    pub fn keep_alive(mut self, enable: bool) -> Self {
-        if enable {
-            self.request.headers_mut().insert("Connection", "keep-alive");
-        } else {
-            self.request.headers_mut().insert("Connection", "close");
-        }
-
-        self
-    }
-
-    pub fn connection(mut self, connection_type: impl Into<String>) -> Self {
-        self.request
-            .headers_mut()
-            .insert("Connection", connection_type);
-        self
-    }
 }
 
 #[cfg(test)]

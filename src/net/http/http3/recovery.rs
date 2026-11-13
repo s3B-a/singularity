@@ -1,12 +1,13 @@
-use super::congestion::{CongestionAlgorithm, CongestionController};
-use super::error::Result;
-use super::packet::PacketNumberSpace;
 use crate::crypto::constant_time_eq;
 use crate::crypto::encoding::pem;
 use crate::crypto::hash::hmac::hmac_sha256;
 use crate::crypto::hash::sha2::sha256;
 use crate::crypto::random;
 use crate::net::http::compression::{self, CompressionAlgorithm, CompressionLevel};
+use super::congestion::{CongestionAlgorithm, CongestionController};
+use super::error::Result;
+use super::packet::PacketNumberSpace;
+
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -25,13 +26,6 @@ pub struct SecureRecoveryStatusBlobMeta {
     pub issued_at_unix: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LossTimerType {
-    Probe,
-    LossDetection,
-    ProbeTimeout,
-}
-
 #[derive(Debug, Clone)]
 pub struct SentPacket {
     pub packet_number: u64,
@@ -42,6 +36,47 @@ pub struct SentPacket {
     pub pn_space: PacketNumberSpace,
     pub declared_lost: bool,
     pub acknowledged: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct RecoveryStatus {
+    pub bytes_sent: u64,
+    pub bytes_acked: u64,
+    pub bytes_lost: u64,
+    pub packets_in_flight: usize,
+    pub probe_timeout_count: u32,
+    pub smoothed_rtt: Option<Duration>,
+    pub min_rtt: Option<Duration>,
+    pub cwnd: u64,
+}
+
+pub struct RecoveryManager {
+    sent_packets: BTreeMap<PacketNumberSpace, BTreeMap<u64, SentPacket>>,
+    largest_acked: BTreeMap<PacketNumberSpace, u64>,
+    latest_rtt: Option<Duration>,
+    smoothed_rtt: Option<Duration>,
+    rttvar: Duration,
+    min_rtt: Option<Duration>,
+    max_ack_delay: Duration,
+    loss_time: BTreeMap<PacketNumberSpace, Option<Instant>>,
+    probe_timeout_count: u32,
+    time_of_last_ack_eliciting: BTreeMap<PacketNumberSpace, Option<Instant>>,
+    cc: CongestionController,
+    loss_threshold: f64,
+    time_threshold: f64,
+    initial_rtt: Duration,
+    crypto_count: u32,
+    bytes_sent: u64,
+    bytes_acked: u64,
+    bytes_lost: u64,
+    lost_packets: VecDeque<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LossTimerType {
+    Probe,
+    LossDetection,
+    ProbeTimeout,
 }
 
 impl SentPacket {
@@ -57,18 +92,6 @@ impl SentPacket {
             acknowledged: false,
         }
     }
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct RecoveryStatus {
-    pub bytes_sent: u64,
-    pub bytes_acked: u64,
-    pub bytes_lost: u64,
-    pub packets_in_flight: usize,
-    pub probe_timeout_count: u32,
-    pub smoothed_rtt: Option<Duration>,
-    pub min_rtt: Option<Duration>,
-    pub cwnd: u64,
 }
 
 impl RecoveryStatus {
@@ -199,28 +222,6 @@ impl RecoveryStatus {
         let status = deserialize_recovery_status(&raw_payload)?;
         Ok((meta, status))
     }
-}
-
-pub struct RecoveryManager {
-    sent_packets: BTreeMap<PacketNumberSpace, BTreeMap<u64, SentPacket>>,
-    largest_acked: BTreeMap<PacketNumberSpace, u64>,
-    latest_rtt: Option<Duration>,
-    smoothed_rtt: Option<Duration>,
-    rttvar: Duration,
-    min_rtt: Option<Duration>,
-    max_ack_delay: Duration,
-    loss_time: BTreeMap<PacketNumberSpace, Option<Instant>>,
-    probe_timeout_count: u32,
-    time_of_last_ack_eliciting: BTreeMap<PacketNumberSpace, Option<Instant>>,
-    cc: CongestionController,
-    loss_threshold: f64,
-    time_threshold: f64,
-    initial_rtt: Duration,
-    crypto_count: u32,
-    bytes_sent: u64,
-    bytes_acked: u64,
-    bytes_lost: u64,
-    lost_packets: VecDeque<u64>,
 }
 
 impl RecoveryManager {

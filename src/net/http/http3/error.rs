@@ -4,6 +4,7 @@ use crate::crypto::hash::hmac::hmac_sha256;
 use crate::crypto::hash::sha2::sha256;
 use crate::crypto::random;
 use crate::net::http::compression::{self, CompressionAlgorithm, CompressionLevel};
+
 use std::collections::HashMap;
 use std::fmt;
 use std::io;
@@ -47,6 +48,58 @@ pub enum Http3Error {
     QpackDecompressionFailure,
     QpackEncoderStreamError,
     QpackDecoderStreamError,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u64)]
+pub enum ErrorCode {
+    NoError = 0x00,
+    InternalError = 0x01,
+    ConnectionRefused = 0x02,
+    FlowControlError = 0x03,
+    StreamLimitError = 0x04,
+    StreamStateError = 0x05,
+    FinalSizeError = 0x06,
+    FrameEncodingError = 0x07,
+    TransportParameterError = 0x08,
+    ConnectionIdLimitError = 0x09,
+    ProtocolViolation = 0x0a,
+    InvalidToken = 0x0b,
+    ApplicationError = 0x0c,
+    CryptoBufferExceeded = 0x0d,
+    KeyUpdateError = 0x0e,
+    AeadLimitReached = 0x0f,
+    NoViablePath = 0x10,
+    CryptoError(u8),
+}
+
+#[derive(Debug)]
+pub enum Error {
+    Io(io::Error),
+    Transport(ErrorCode, String),
+    Http3(Http3Error, String),
+    BufferTooShort,
+    InvalidPacket,
+    InvalidFrame,
+    InvalidStreamState,
+    StreamNotFound,
+    ConnectionClosed,
+    Timeout,
+    Tls(String),
+    Crypto(String),
+    FlowControl(String),
+    StreamLimit,
+    Done,
+    WouldBlock,
+    InvalidOperation(String),
+    Config(String),
+    ProtocolViolation(String),
+    VersionNegotiation,
+    StatelessReset,
+    KeyUnavailable,
+    UnknownConnectionId,
+    Qpack(String),
+    CryptoError,
 }
 
 impl Http3Error {
@@ -100,29 +153,6 @@ impl Http3Error {
             _ => None,
         }
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u64)]
-pub enum ErrorCode {
-    NoError = 0x00,
-    InternalError = 0x01,
-    ConnectionRefused = 0x02,
-    FlowControlError = 0x03,
-    StreamLimitError = 0x04,
-    StreamStateError = 0x05,
-    FinalSizeError = 0x06,
-    FrameEncodingError = 0x07,
-    TransportParameterError = 0x08,
-    ConnectionIdLimitError = 0x09,
-    ProtocolViolation = 0x0a,
-    InvalidToken = 0x0b,
-    ApplicationError = 0x0c,
-    CryptoBufferExceeded = 0x0d,
-    KeyUpdateError = 0x0e,
-    AeadLimitReached = 0x0f,
-    NoViablePath = 0x10,
-    CryptoError(u8),
 }
 
 impl ErrorCode {
@@ -185,35 +215,6 @@ impl ErrorCode {
     }
 }
 
-#[derive(Debug)]
-pub enum Error {
-    Io(io::Error),
-    Transport(ErrorCode, String),
-    Http3(Http3Error, String),
-    BufferTooShort,
-    InvalidPacket,
-    InvalidFrame,
-    InvalidStreamState,
-    StreamNotFound,
-    ConnectionClosed,
-    Timeout,
-    Tls(String),
-    Crypto(String),
-    FlowControl(String),
-    StreamLimit,
-    Done,
-    WouldBlock,
-    InvalidOperation(String),
-    Config(String),
-    ProtocolViolation(String),
-    VersionNegotiation,
-    StatelessReset,
-    KeyUnavailable,
-    UnknownConnectionId,
-    Qpack(String),
-    CryptoError,
-}
-
 impl Error {
     pub fn transport(code: ErrorCode, msg: impl Into<String>) -> Self {
         Error::Transport(code, msg.into())
@@ -266,6 +267,98 @@ impl Error {
 
     pub fn is_recoverable(&self) -> bool {
         matches!(self, Error::WouldBlock | Error::Done)
+    }
+}
+
+impl fmt::Display for Http3Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Http3Error::NoError => write!(f, "No error"),
+            Http3Error::GeneralProtocolError => write!(f, "General protocol error"),
+            Http3Error::InternalError => write!(f, "Internal error"),
+            Http3Error::StreamCreationError => write!(f, "Stream creation error"),
+            Http3Error::ClosedCriticalStream => write!(f, "Closed critical stream"),
+            Http3Error::FrameUnexpected => write!(f, "Frame unexpected"),
+            Http3Error::FrameError => write!(f, "Frame error"),
+            Http3Error::ExcessiveLoad => write!(f, "Excessive load"),
+            Http3Error::IdError => write!(f, "ID error"),
+            Http3Error::SettingsError => write!(f, "Settings error"),
+            Http3Error::MissingSettings => write!(f, "Missing settings"),
+            Http3Error::RequestRejected => write!(f, "Request rejected"),
+            Http3Error::RequestCancelled => write!(f, "Request cancelled"),
+            Http3Error::RequestIncomplete => write!(f, "Request incomplete"),
+            Http3Error::MessageError => write!(f, "Message error"),
+            Http3Error::ConnectError => write!(f, "Connect error"),
+            Http3Error::VersionFallback => write!(f, "Version fallback"),
+            Http3Error::QpackDecompressionFailure => write!(f, "QPACK decompression failed"),
+            Http3Error::QpackEncoderStreamError => write!(f, "QPACK encoder stream error"),
+            Http3Error::QpackDecoderStreamError => write!(f, "QPACK decoder stream error"),
+        }
+    }
+}
+
+impl fmt::Display for ErrorCode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ErrorCode::NoError => write!(f, "No error"),
+            ErrorCode::InternalError => write!(f, "Internal error"),
+            ErrorCode::ConnectionRefused => write!(f, "Connection refused"),
+            ErrorCode::FlowControlError => write!(f, "Flow control error"),
+            ErrorCode::StreamLimitError => write!(f, "Stream limit error"),
+            ErrorCode::StreamStateError => write!(f, "Stream state error"),
+            ErrorCode::FinalSizeError => write!(f, "Final size error"),
+            ErrorCode::FrameEncodingError => write!(f, "Frame encoding error"),
+            ErrorCode::TransportParameterError => write!(f, "Transport parameter error"),
+            ErrorCode::ConnectionIdLimitError => write!(f, "Connection ID limit error"),
+            ErrorCode::ProtocolViolation => write!(f, "Protocol violation"),
+            ErrorCode::InvalidToken => write!(f, "Invalid token"),
+            ErrorCode::ApplicationError => write!(f, "Application error"),
+            ErrorCode::CryptoBufferExceeded => write!(f, "Crypto buffer exceeded"),
+            ErrorCode::KeyUpdateError => write!(f, "Key update error"),
+            ErrorCode::AeadLimitReached => write!(f, "AEAD limit reached"),
+            ErrorCode::NoViablePath => write!(f, "No viable path"),
+            ErrorCode::CryptoError(alert) => write!(f, "Crypto error (TLS alert: {})", alert),
+        }
+    }
+}
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Error::Io(e) => write!(f, "I/O error: {}", e),
+            Error::Transport(code, msg) => write!(f, "Transport error {}: {}", code, msg),
+            Error::Http3(code, msg) => write!(f, "HTTP/3 error {}: {}", code, msg),
+            Error::BufferTooShort => write!(f, "Buffer too short"),
+            Error::InvalidPacket => write!(f, "Invalid packet"),
+            Error::InvalidFrame => write!(f, "Invalid frame"),
+            Error::InvalidStreamState => write!(f, "Invalid stream state"),
+            Error::StreamNotFound => write!(f, "Stream not found"),
+            Error::ConnectionClosed => write!(f, "Connection closed"),
+            Error::Timeout => write!(f, "Connection timeout"),
+            Error::Tls(msg) => write!(f, "TLS error: {}", msg),
+            Error::Crypto(msg) => write!(f, "Crypto error: {}", msg),
+            Error::FlowControl(msg) => write!(f, "Flow control error: {}", msg),
+            Error::StreamLimit => write!(f, "Stream limit exceeded"),
+            Error::Done => write!(f, "Done"),
+            Error::WouldBlock => write!(f, "Would block"),
+            Error::InvalidOperation(msg) => write!(f, "Invalid operation: {}", msg),
+            Error::Config(msg) => write!(f, "Configuration error: {}", msg),
+            Error::ProtocolViolation(msg) => write!(f, "Protocol violation: {}", msg),
+            Error::VersionNegotiation => write!(f, "Version negotiation failed"),
+            Error::StatelessReset => write!(f, "Stateless reset"),
+            Error::KeyUnavailable => write!(f, "Encryption key unavailable"),
+            Error::UnknownConnectionId => write!(f, "Unknown connection ID"),
+            Error::Qpack(msg) => write!(f, "QPACK error: {}", msg),
+            Error::CryptoError => write!(f, "Cryptographic error"),
+        }
+    }
+}
+
+impl std::error::Error for Error {}
+
+impl From<io::Error> for Error {
+    fn from(err: io::Error) -> Self {
+        Error::Io(err)
     }
 }
 
@@ -837,98 +930,6 @@ fn parse_secure_http3_error_meta(header: &str, body_len: usize) -> io::Result<Se
         encoded_size,
         issued_at_unix,
     })
-}
-
-impl fmt::Display for Http3Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Http3Error::NoError => write!(f, "No error"),
-            Http3Error::GeneralProtocolError => write!(f, "General protocol error"),
-            Http3Error::InternalError => write!(f, "Internal error"),
-            Http3Error::StreamCreationError => write!(f, "Stream creation error"),
-            Http3Error::ClosedCriticalStream => write!(f, "Closed critical stream"),
-            Http3Error::FrameUnexpected => write!(f, "Frame unexpected"),
-            Http3Error::FrameError => write!(f, "Frame error"),
-            Http3Error::ExcessiveLoad => write!(f, "Excessive load"),
-            Http3Error::IdError => write!(f, "ID error"),
-            Http3Error::SettingsError => write!(f, "Settings error"),
-            Http3Error::MissingSettings => write!(f, "Missing settings"),
-            Http3Error::RequestRejected => write!(f, "Request rejected"),
-            Http3Error::RequestCancelled => write!(f, "Request cancelled"),
-            Http3Error::RequestIncomplete => write!(f, "Request incomplete"),
-            Http3Error::MessageError => write!(f, "Message error"),
-            Http3Error::ConnectError => write!(f, "Connect error"),
-            Http3Error::VersionFallback => write!(f, "Version fallback"),
-            Http3Error::QpackDecompressionFailure => write!(f, "QPACK decompression failed"),
-            Http3Error::QpackEncoderStreamError => write!(f, "QPACK encoder stream error"),
-            Http3Error::QpackDecoderStreamError => write!(f, "QPACK decoder stream error"),
-        }
-    }
-}
-
-impl fmt::Display for ErrorCode {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            ErrorCode::NoError => write!(f, "No error"),
-            ErrorCode::InternalError => write!(f, "Internal error"),
-            ErrorCode::ConnectionRefused => write!(f, "Connection refused"),
-            ErrorCode::FlowControlError => write!(f, "Flow control error"),
-            ErrorCode::StreamLimitError => write!(f, "Stream limit error"),
-            ErrorCode::StreamStateError => write!(f, "Stream state error"),
-            ErrorCode::FinalSizeError => write!(f, "Final size error"),
-            ErrorCode::FrameEncodingError => write!(f, "Frame encoding error"),
-            ErrorCode::TransportParameterError => write!(f, "Transport parameter error"),
-            ErrorCode::ConnectionIdLimitError => write!(f, "Connection ID limit error"),
-            ErrorCode::ProtocolViolation => write!(f, "Protocol violation"),
-            ErrorCode::InvalidToken => write!(f, "Invalid token"),
-            ErrorCode::ApplicationError => write!(f, "Application error"),
-            ErrorCode::CryptoBufferExceeded => write!(f, "Crypto buffer exceeded"),
-            ErrorCode::KeyUpdateError => write!(f, "Key update error"),
-            ErrorCode::AeadLimitReached => write!(f, "AEAD limit reached"),
-            ErrorCode::NoViablePath => write!(f, "No viable path"),
-            ErrorCode::CryptoError(alert) => write!(f, "Crypto error (TLS alert: {})", alert),
-        }
-    }
-}
-
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Error::Io(e) => write!(f, "I/O error: {}", e),
-            Error::Transport(code, msg) => write!(f, "Transport error {}: {}", code, msg),
-            Error::Http3(code, msg) => write!(f, "HTTP/3 error {}: {}", code, msg),
-            Error::BufferTooShort => write!(f, "Buffer too short"),
-            Error::InvalidPacket => write!(f, "Invalid packet"),
-            Error::InvalidFrame => write!(f, "Invalid frame"),
-            Error::InvalidStreamState => write!(f, "Invalid stream state"),
-            Error::StreamNotFound => write!(f, "Stream not found"),
-            Error::ConnectionClosed => write!(f, "Connection closed"),
-            Error::Timeout => write!(f, "Connection timeout"),
-            Error::Tls(msg) => write!(f, "TLS error: {}", msg),
-            Error::Crypto(msg) => write!(f, "Crypto error: {}", msg),
-            Error::FlowControl(msg) => write!(f, "Flow control error: {}", msg),
-            Error::StreamLimit => write!(f, "Stream limit exceeded"),
-            Error::Done => write!(f, "Done"),
-            Error::WouldBlock => write!(f, "Would block"),
-            Error::InvalidOperation(msg) => write!(f, "Invalid operation: {}", msg),
-            Error::Config(msg) => write!(f, "Configuration error: {}", msg),
-            Error::ProtocolViolation(msg) => write!(f, "Protocol violation: {}", msg),
-            Error::VersionNegotiation => write!(f, "Version negotiation failed"),
-            Error::StatelessReset => write!(f, "Stateless reset"),
-            Error::KeyUnavailable => write!(f, "Encryption key unavailable"),
-            Error::UnknownConnectionId => write!(f, "Unknown connection ID"),
-            Error::Qpack(msg) => write!(f, "QPACK error: {}", msg),
-            Error::CryptoError => write!(f, "Cryptographic error"),
-        }
-    }
-}
-
-impl std::error::Error for Error {}
-
-impl From<io::Error> for Error {
-    fn from(err: io::Error) -> Self {
-        Error::Io(err)
-    }
 }
 
 #[cfg(test)]

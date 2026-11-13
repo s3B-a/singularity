@@ -1,10 +1,11 @@
-use super::utils::{BitReader, BitWriter, SlidingWindow};
-use super::{CompressionAlgorithm, CompressionLevel, Compressor, Decompressor};
 use crate::crypto::constant_time_eq;
 use crate::crypto::encoding::pem;
 use crate::crypto::hash::hmac::hmac_sha256;
 use crate::crypto::hash::sha2::sha256;
 use crate::crypto::random;
+use super::utils::{BitReader, BitWriter, SlidingWindow};
+use super::{CompressionAlgorithm, CompressionLevel, Compressor, Decompressor};
+
 use std::io;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -29,6 +30,19 @@ pub struct SecureBrotliBlobMeta {
     pub issued_at_unix: u64,
 }
 
+pub struct BrotliCompressor {
+    level: CompressionLevel,
+    window: SlidingWindow,
+    dictionary: BrotliDict,
+    quality: u32,
+    mode: u32,
+}
+
+pub struct BrotliDecompressor {
+    window: SlidingWindow,
+    dictionary: BrotliDict,
+}
+
 #[derive(Debug, Clone)]
 struct HuffmanCode {
     symbol: u16,
@@ -39,6 +53,26 @@ struct HuffmanCode {
 #[derive(Debug, Clone)]
 struct HuffmanTree {
     codes: Vec<HuffmanCode>,
+}
+
+#[derive(Debug, Clone)]
+struct HuffmanSymbol {
+    symbol: u16,
+    code: u32,
+    length: u8,
+}
+
+#[derive(Debug)]
+struct BrotliDict {
+    words: Vec<Vec<u8>>,
+}
+
+#[derive(Debug)]
+struct BrotliMetablock {
+    data: Vec<u8>,
+    meta_type: u8,
+    last_metablock: bool,
+    is_uncompressed: bool,
 }
 
 impl HuffmanTree {
@@ -94,18 +128,6 @@ impl HuffmanTree {
     }
 }
 
-#[derive(Debug, Clone)]
-struct HuffmanSymbol {
-    symbol: u16,
-    code: u32,
-    length: u8,
-}
-
-#[derive(Debug)]
-struct BrotliDict {
-    words: Vec<Vec<u8>>,
-}
-
 impl BrotliDict {
     fn new() -> Self {
         Self {
@@ -120,22 +142,6 @@ impl BrotliDict {
             None
         }
     }
-}
-
-#[derive(Debug)]
-struct BrotliMetablock {
-    data: Vec<u8>,
-    meta_type: u8,
-    last_metablock: bool,
-    is_uncompressed: bool,
-}
-
-pub struct BrotliCompressor {
-    level: CompressionLevel,
-    window: SlidingWindow,
-    dictionary: BrotliDict,
-    quality: u32,
-    mode: u32,
 }
 
 impl BrotliCompressor {
@@ -258,11 +264,6 @@ impl BrotliCompressor {
     }
 }
 
-pub struct BrotliDecompressor {
-    window: SlidingWindow,
-    dictionary: BrotliDict,
-}
-
 impl BrotliDecompressor {
     pub fn new() -> Self {
         Self {
@@ -322,6 +323,96 @@ impl BrotliDecompressor {
         }
 
         Ok((Vec::new(), islast_flag))
+    }
+}
+
+impl Compressor for BrotliCompressor {
+    fn compress(&mut self, input: &[u8]) -> io::Result<Vec<u8>> {
+        self.window.clear();
+        let mut output = Vec::new();
+        output.extend_from_slice(&[0xce, 0xb2, 0xcf, 0x81]);
+        let block_size = match self.quality {
+            1..=3 => 8 * 1024,
+            4..=8 => 16 * 1024,
+            _ => 32 * 1024,
+        };
+
+        let chunks: Vec<_> = input.chunks(block_size).collect();
+        for (i, chunk) in chunks.iter().enumerate() {
+            let is_last = i == chunks.len() - 1;
+            let metablock = self.compress_metablock(chunk, is_last)?;
+            output.extend_from_slice(&metablock);
+        }
+
+        Ok(output)
+    }
+
+    fn compress_stream(&mut self, input: &[u8], output: &mut Vec<u8>) -> io::Result<()> {
+        let compressed = self.compress_metablock(input, false)?;
+        output.extend_from_slice(&compressed);
+        self.window.push_slice(input);
+        Ok(())
+    }
+
+    fn finish(&mut self) -> io::Result<Vec<u8>> {
+        let mut writer = BitWriter::new();
+        writer.write_bits(1, 1);
+        writer.write_bits(0, 2);
+        Ok(writer.finish())
+    }
+
+    fn reset(&mut self) {
+        self.window.clear();
+    }
+}
+
+impl Decompressor for BrotliDecompressor {
+    fn decompress(&mut self, input: &[u8]) -> io::Result<Vec<u8>> {
+        if input.len() < 4 || &input[0..4] != [0xce, 0xb2, 0xcf, 0x81] {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Invalid Brotli magic number",
+            ));
+        }
+
+        self.window.clear();
+        let mut output = Vec::new();
+        let mut offset = 4;
+        loop {
+            if offset >= input.len() {
+                break;
+            }
+
+            let (metablock_output, islast) = self.decompress_metablock(input, &mut offset)?;
+            output.extend_from_slice(&metablock_output);
+
+            if islast {
+                break;
+            }
+        }
+
+        Ok(output)
+    }
+
+    fn decompress_stream(&mut self, input: &[u8], output: &mut Vec<u8>) -> io::Result<()> {
+        let mut offset = 0;
+        let (metablock, _) = self.decompress_metablock(input, &mut offset)?;
+        output.extend_from_slice(&metablock);
+        Ok(())
+    }
+
+    fn finish(&mut self) -> io::Result<Vec<u8>> {
+        Ok(Vec::new())
+    }
+
+    fn reset(&mut self) {
+        self.window.clear();
+    }
+}
+
+impl Default for BrotliDecompressor {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -467,96 +558,6 @@ pub fn decode_secure_brotli_payload(data: &[u8]) -> io::Result<(SecureBrotliBlob
     }
 
     Ok((meta, raw_payload))
-}
-
-impl Compressor for BrotliCompressor {
-    fn compress(&mut self, input: &[u8]) -> io::Result<Vec<u8>> {
-        self.window.clear();
-        let mut output = Vec::new();
-        output.extend_from_slice(&[0xce, 0xb2, 0xcf, 0x81]);
-        let block_size = match self.quality {
-            1..=3 => 8 * 1024,
-            4..=8 => 16 * 1024,
-            _ => 32 * 1024,
-        };
-
-        let chunks: Vec<_> = input.chunks(block_size).collect();
-        for (i, chunk) in chunks.iter().enumerate() {
-            let is_last = i == chunks.len() - 1;
-            let metablock = self.compress_metablock(chunk, is_last)?;
-            output.extend_from_slice(&metablock);
-        }
-
-        Ok(output)
-    }
-
-    fn compress_stream(&mut self, input: &[u8], output: &mut Vec<u8>) -> io::Result<()> {
-        let compressed = self.compress_metablock(input, false)?;
-        output.extend_from_slice(&compressed);
-        self.window.push_slice(input);
-        Ok(())
-    }
-
-    fn finish(&mut self) -> io::Result<Vec<u8>> {
-        let mut writer = BitWriter::new();
-        writer.write_bits(1, 1);
-        writer.write_bits(0, 2);
-        Ok(writer.finish())
-    }
-
-    fn reset(&mut self) {
-        self.window.clear();
-    }
-}
-
-impl Decompressor for BrotliDecompressor {
-    fn decompress(&mut self, input: &[u8]) -> io::Result<Vec<u8>> {
-        if input.len() < 4 || &input[0..4] != [0xce, 0xb2, 0xcf, 0x81] {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Invalid Brotli magic number",
-            ));
-        }
-
-        self.window.clear();
-        let mut output = Vec::new();
-        let mut offset = 4;
-        loop {
-            if offset >= input.len() {
-                break;
-            }
-
-            let (metablock_output, islast) = self.decompress_metablock(input, &mut offset)?;
-            output.extend_from_slice(&metablock_output);
-
-            if islast {
-                break;
-            }
-        }
-
-        Ok(output)
-    }
-
-    fn decompress_stream(&mut self, input: &[u8], output: &mut Vec<u8>) -> io::Result<()> {
-        let mut offset = 0;
-        let (metablock, _) = self.decompress_metablock(input, &mut offset)?;
-        output.extend_from_slice(&metablock);
-        Ok(())
-    }
-
-    fn finish(&mut self) -> io::Result<Vec<u8>> {
-        Ok(Vec::new())
-    }
-
-    fn reset(&mut self) {
-        self.window.clear();
-    }
-}
-
-impl Default for BrotliDecompressor {
-    fn default() -> Self {
-        Self::new()
-    }
 }
 
 pub fn compress(data: &[u8], level: CompressionLevel) -> io::Result<Vec<u8>> {

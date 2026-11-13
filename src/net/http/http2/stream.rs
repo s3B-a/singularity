@@ -1,12 +1,13 @@
-use super::error::{ErrorCode, Http2Error, Result};
-use super::flow_control::FlowControl;
-use super::priority::Priority;
 use crate::crypto::constant_time_eq;
 use crate::crypto::encoding::pem;
 use crate::crypto::hash::hmac::hmac_sha256;
 use crate::crypto::hash::sha2::sha256;
 use crate::crypto::random;
 use crate::net::http::compression::{self, CompressionAlgorithm, CompressionLevel};
+use super::error::{ErrorCode, Http2Error, Result};
+use super::flow_control::FlowControl;
+use super::priority::Priority;
+
 use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -25,17 +26,6 @@ pub struct SecureHttp2StreamBlobMeta {
     pub issued_at_unix: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StreamState {
-    Idle,
-    ReservedLocal,
-    ReservedRemote,
-    Open,
-    HalfClosedLocal,
-    HalfClosedRemote,
-    Closed,
-}
-
 #[derive(Debug)]
 pub struct Http2Stream {
     id: u32,
@@ -51,6 +41,17 @@ pub struct Http2Stream {
     headers_sent: bool,
     end_stream_received: bool,
     pub end_stream_sent: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamState {
+    Idle,
+    ReservedLocal,
+    ReservedRemote,
+    Open,
+    HalfClosedLocal,
+    HalfClosedRemote,
+    Closed,
 }
 
 impl Http2Stream {

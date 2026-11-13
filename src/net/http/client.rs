@@ -1,11 +1,3 @@
-use super::auth::{AuthChallenge, Authenticator, Credentials};
-use super::http2::Http2Connection;
-use super::http3::Config as Http3Config;
-use super::http3_client::Http3Client;
-use super::method::HttpMethod;
-use super::request::HttpRequest;
-use super::response::HttpResponse;
-use super::version::HttpVersion;
 use crate::crypto::constant_time_eq;
 use crate::crypto::encoding::pem;
 use crate::crypto::hash::hmac::hmac_sha256;
@@ -19,7 +11,16 @@ use crate::net::http::conditional::{format_http_date, EntityTag};
 use crate::net::http::range::{format_range_header, ByteRangeSpec};
 use crate::net::http::compression::{self, CompressionAlgorithm, CompressionLevel};
 use crate::net::tcp::TcpStream;
-use std::collections::{HashMap, VecDeque};
+use super::auth::{AuthChallenge, Authenticator, Credentials};
+use super::http2::{h2c, H2cMode, H2cTransport, Http2Connection, Http2Error, Role, StreamState};
+use super::http3::Config as Http3Config;
+use super::http3_client::Http3Client;
+use super::method::HttpMethod;
+use super::request::HttpRequest;
+use super::response::HttpResponse;
+use super::version::HttpVersion;
+
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{self, BufRead, BufReader, Write};
 use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -43,13 +44,6 @@ pub struct SecureHttpClientProfileMeta {
 }
 
 #[derive(Debug, Clone)]
-struct StreamInfo {
-    stream_id: u32,
-    created_at: Instant,
-    request_url: String,
-}
-
-#[derive(Debug, Clone)]
 pub struct ConnectionInfo {
     pub host: String,
     pub port: u16,
@@ -60,6 +54,51 @@ pub struct ConnectionInfo {
     pub age: Duration,
     pub is_http2: bool,
     pub requests_made: usize,
+}
+
+pub struct HttpClientBuilder {
+    client: HttpClient,
+}
+
+pub struct HttpClient {
+    default_headers: HashMap<String, String>,
+    timeout: Option<Duration>,
+    follow_redirects: bool,
+    max_redirects: usize,
+    user_agent: String,
+    preferred_version: HttpVersion,
+    http1_connections: HashMap<String, Http1ConnectionEntry>,
+    http2_connections: HashMap<String, Http2ConnectionEntry>,
+    max_connections_per_host: usize,
+    connection_timeout: Duration,
+    stream_timeout: Duration,
+    idle_timeout: Duration,
+    enable_pipelining: bool,
+    expect_100_continue_threshold: usize,
+    cookie_jar: CookieJar,
+    enable_cookies: bool,
+    dns_resolver: DnsResolver,
+    connection_pool: ConnectionPool,
+    next_request_id: u64,
+    pipeline_requests: HashMap<String, VecDeque<(u64, HttpRequest)>>,
+    version_cache: HashMap<String, HttpVersion>,
+    alt_svc_cache: HashMap<String, Vec<(HttpVersion, String, u16)>>,
+    enable_version_negotiation: bool,
+    authenticator: Authenticator,
+    auto_auth: bool,
+    challenge_cache: HashMap<String, CachedChallenge>,
+    challenge_cache_ttl: Duration,
+    enable_http3: bool,
+    http3_client: Option<Http3Client>,
+    h2c_mode: H2cMode,
+    h2c_declined: HashSet<String>,
+}
+
+#[derive(Debug, Clone)]
+struct StreamInfo {
+    stream_id: u32,
+    created_at: Instant,
+    request_url: String,
 }
 
 #[derive(Clone)]
@@ -91,6 +130,16 @@ struct Http1ConnectionEntry {
     pipeline_depth: usize,
     max_pipeline_depth: usize,
     response_buffer: Vec<u8>,
+}
+
+struct Http2ConnectionEntry {
+    connection: Http2Connection,
+    host: String,
+    port: u16,
+    last_used: Instant,
+    active_streams: HashMap<u32, StreamInfo>,
+    next_stream_id: u32,
+    max_concurrent_streams: usize,
 }
 
 impl Http1ConnectionEntry {
@@ -413,16 +462,6 @@ impl Http1ConnectionEntry {
     }
 }
 
-struct Http2ConnectionEntry {
-    connection: Http2Connection,
-    host: String,
-    port: u16,
-    last_used: Instant,
-    active_streams: HashMap<u32, StreamInfo>,
-    next_stream_id: u32,
-    max_concurrent_streams: usize,
-}
-
 impl Http2ConnectionEntry {
     fn new(connection: Http2Connection, host: String, port: u16) -> Self {
         Self {
@@ -585,10 +624,6 @@ impl Http2ConnectionEntry {
     }
 }
 
-pub struct HttpClientBuilder {
-    client: HttpClient,
-}
-
 impl HttpClientBuilder {
     pub fn new() -> Self {
         Self {
@@ -663,6 +698,11 @@ impl HttpClientBuilder {
         self
     }
 
+    pub fn h2c(mut self, mode: H2cMode) -> Self {
+        self.client.h2c_mode = mode;
+        self
+    }
+
     pub fn build(self) -> HttpClient {
         self.client
     }
@@ -732,38 +772,6 @@ impl HttpClientBuilder {
     }
 }
 
-pub struct HttpClient {
-    default_headers: HashMap<String, String>,
-    timeout: Option<Duration>,
-    follow_redirects: bool,
-    max_redirects: usize,
-    user_agent: String,
-    preferred_version: HttpVersion,
-    http1_connections: HashMap<String, Http1ConnectionEntry>,
-    http2_connections: HashMap<String, Http2ConnectionEntry>,
-    max_connections_per_host: usize,
-    connection_timeout: Duration,
-    stream_timeout: Duration,
-    idle_timeout: Duration,
-    enable_pipelining: bool,
-    expect_100_continue_threshold: usize,
-    cookie_jar: CookieJar,
-    enable_cookies: bool,
-    dns_resolver: DnsResolver,
-    connection_pool: ConnectionPool,
-    next_request_id: u64,
-    pipeline_requests: HashMap<String, VecDeque<(u64, HttpRequest)>>,
-    version_cache: HashMap<String, HttpVersion>,
-    alt_svc_cache: HashMap<String, Vec<(HttpVersion, String, u16)>>,
-    enable_version_negotiation: bool,
-    authenticator: Authenticator,
-    auto_auth: bool,
-    challenge_cache: HashMap<String, CachedChallenge>,
-    challenge_cache_ttl: Duration,
-    enable_http3: bool,
-    http3_client: Option<Http3Client>,
-}
-
 impl HttpClient {
     pub fn new() -> Self {
         Self {
@@ -796,11 +804,22 @@ impl HttpClient {
             challenge_cache_ttl: Duration::from_secs(300),
             enable_http3: false,
             http3_client: None,
+            h2c_mode: H2cMode::Disabled,
+            h2c_declined: HashSet::new(),
         }
     }
 
     pub fn builder() -> HttpClientBuilder {
         HttpClientBuilder::new()
+    }
+
+    pub fn set_h2c_mode(&mut self, mode: H2cMode) {
+        self.h2c_mode = mode;
+        self.h2c_declined.clear();
+    }
+
+    pub fn h2c_mode(&self) -> H2cMode {
+        self.h2c_mode
     }
 
     pub fn set_timeout(&mut self, timeout: Duration) {
@@ -1698,10 +1717,13 @@ impl HttpClient {
 
     fn execute_internal(&mut self, request: HttpRequest) -> Result<HttpResponse, io::Error> {
         let url = request.path().to_string();
-        let (scheme, _host, _port, _path) = parse_url(&url)?;
+        let (scheme, host, port, _path) = parse_url(&url)?;
         let negotiated_version = self.negotiate_version(&url, &scheme);
         let use_http2 = negotiated_version == HttpVersion::Http2 && scheme == "https";
-        let response = if use_http2 {
+        let use_h2c = scheme == "http" && self.h2c_mode != H2cMode::Disabled && !self.h2c_declined.contains(&format!("{}:{}", host, port));
+        let response = if use_h2c {
+            self.execute_h2c(request)
+        } else if use_http2 {
             self.execute_http2(request)
         } else {
             self.execute_http1(request)
@@ -1870,6 +1892,85 @@ impl HttpClient {
         }
 
         let response = Self::extract_http2_response(entry, stream_id)?;
+
+        Ok(response)
+    }
+
+    fn execute_h2c(&mut self, request: HttpRequest) -> io::Result<HttpResponse> {
+        let url = request.path().to_string();
+        let (_scheme, host, port, path) = parse_url(&url)?;
+        let authority = format!("{}:{}", host, port);
+        let key = format!("h2c://{}", authority);
+        let timeout = self.timeout.unwrap_or(Duration::from_secs(30));
+        if self.http2_connections.get(&key).is_some_and(|entry| entry.connection.goaway_received) {
+            self.http2_connections.remove(&key);
+        }
+
+        if !self.http2_connections.contains_key(&key) {
+            let stream = self.connect_to_host(&host, port)?;
+            stream.set_read_timeout(Some(timeout))?;
+            stream.set_write_timeout(Some(timeout))?;
+            stream.set_nodelay(true)?;
+            if self.h2c_mode == H2cMode::Upgrade {
+                return self.h2c_upgrade(stream, &request, &host, port, &path, key, timeout);
+            }
+
+            let transport = H2cTransport::new(BufReader::new(stream.try_clone()?), stream);
+            let mut connection = Http2Connection::with_transport(transport, Role::Client).map_err(h2_to_io)?;
+            connection.handshake().map_err(h2_to_io)?;
+            self.http2_connections.insert(key.clone(), Http2ConnectionEntry::new(connection, host.clone(), port));
+        }
+
+        let entry = self.http2_connections.get_mut(&key).expect("h2c connection was just ensured");
+        let stream_id = entry.create_tracked_stream(url)?;
+        let result = entry.connection.send_request(stream_id, h2c_request_headers(&request, &authority, &path), Some(request.body_bytes().to_vec()))
+            .map_err(h2_to_io)
+            .and_then(|_| await_h2_response(&mut entry.connection, stream_id, timeout));
+        entry.remove_stream(stream_id);
+        entry.last_used = Instant::now();
+        if result.is_err() {
+            self.http2_connections.remove(&key);
+        }
+
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn h2c_upgrade(&mut self, stream: TcpStream, request: &HttpRequest, host: &str, port: u16, path: &str, key: String, timeout: Duration) -> io::Result<HttpResponse> {
+        let settings = Http2Connection::default_settings_entries(Role::Client).map_err(h2_to_io)?;
+        let mut head = format!("{} {} HTTP/1.1\r\nHost: {}:{}\r\n", request.method().as_str(), path, host, port);
+        for (name, values) in request.headers().iter() {
+            if !h2c::is_hop_by_hop(name) && !name.eq_ignore_ascii_case("content-length") {
+                head.push_str(&format!("{}: {}\r\n", name, values.join(", ")));
+            }
+        }
+
+        for (name, value) in h2c::upgrade_request_fields(&settings) {
+            head.push_str(&format!("{}: {}\r\n", name, value));
+        }
+
+        let body = request.body_bytes();
+        if !body.is_empty() {
+            head.push_str(&format!("Content-Length: {}\r\n", body.len()));
+        }
+
+        head.push_str("\r\n");
+        let mut writer = stream.try_clone()?;
+        writer.write_all(head.as_bytes())?;
+        writer.write_all(body)?;
+        writer.flush()?;
+
+        let mut reader = BufReader::new(stream.try_clone()?);
+        let response = read_http1_response_from(&mut reader, None, request.method() == HttpMethod::HEAD)?;
+        if !h2c::is_switching_to_h2c(response.status_code(), response.header_fields()) {
+            self.h2c_declined.insert(format!("{}:{}", host, port));
+            return Ok(response);
+        }
+
+        let mut connection = Http2Connection::upgrade_client(H2cTransport::new(reader, stream)).map_err(h2_to_io)?;
+        connection.handshake().map_err(h2_to_io)?;
+        let response = await_h2_response(&mut connection, 1, timeout)?;
+        self.http2_connections.insert(key, Http2ConnectionEntry::new(connection, host.to_string(), port));
 
         Ok(response)
     }
@@ -2300,6 +2401,11 @@ fn serialize_http_client_profile(client: &HttpClient) -> Vec<u8> {
     lines.push(format!("auto-auth={}", client.auto_auth));
     lines.push(format!("challenge-cache-ttl-ms={}", client.challenge_cache_ttl.as_millis()));
     lines.push(format!("enable-http3={}", client.enable_http3));
+    lines.push(format!("h2c-mode={}", match client.h2c_mode {
+        H2cMode::Disabled => "disabled",
+        H2cMode::Upgrade => "upgrade",
+        H2cMode::PriorKnowledge => "prior-knowledge",
+    }));
     let mut headers: Vec<(&String, &String)> = client.default_headers.iter().collect();
     headers.sort_by(|a, b| a.0.cmp(b.0));
     for (k, v) in headers {
@@ -2432,6 +2538,14 @@ fn deserialize_http_client_profile(raw_payload: &[u8]) -> io::Result<HttpClient>
                 if client.enable_http3 && client.http3_client.is_none() {
                     client.http3_client = Some(Http3Client::new());
                 }
+            }
+            "h2c-mode" => {
+                client.h2c_mode = match v {
+                    "disabled" => H2cMode::Disabled,
+                    "upgrade" => H2cMode::Upgrade,
+                    "prior-knowledge" => H2cMode::PriorKnowledge,
+                    _ => return Err(io::Error::new(io::ErrorKind::InvalidData, format!("invalid h2c-mode '{}'", v))),
+                };
             }
             "header" => {
                 let (k_b64, v_b64) = v.split_once('|').ok_or_else(|| {
@@ -2819,6 +2933,62 @@ fn read_http1_response_from<R: BufRead>(reader: &mut R, mut status_line: Option<
 
 fn status_code_of(status_line: &str) -> Option<u16> {
     status_line.split(' ').nth(1).and_then(|code| code.trim().parse().ok())
+}
+
+fn h2c_request_headers(request: &HttpRequest, authority: &str, path: &str) -> Vec<(String, String)> {
+    let mut headers = vec![
+        (":method".to_string(), request.method().as_str().to_string()),
+        (":scheme".to_string(), "http".to_string()),
+        (":authority".to_string(), authority.to_string()),
+        (":path".to_string(), path.to_string()),
+    ];
+
+    for (name, values) in request.headers().iter() {
+        if !h2c::is_hop_by_hop(name) && !name.eq_ignore_ascii_case("content-length") {
+            headers.extend(values.iter().map(|value| (name.to_ascii_lowercase(), value.clone())));
+        }
+    }
+
+    headers
+}
+
+fn await_h2_response(connection: &mut Http2Connection, stream_id: u32, timeout: Duration) -> io::Result<HttpResponse> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match connection.get_stream(stream_id).map(|stream| stream.state()) {
+            Some(StreamState::Closed | StreamState::HalfClosedRemote) => break,
+            Some(_) => {}
+            None => return Err(io::Error::new(io::ErrorKind::ConnectionReset, format!("HTTP/2 stream {} was reset", stream_id))),
+        }
+
+        if Instant::now() > deadline {
+            return Err(io::Error::new(io::ErrorKind::TimedOut, format!("Response timeout for stream {}", stream_id)));
+        }
+
+        connection.receive_frame().map_err(h2_to_io)?;
+        connection.send_pending_data().map_err(h2_to_io)?;
+    }
+
+    let stream = connection.get_stream_mut(stream_id).ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "HTTP/2 stream vanished"))?;
+    let headers = stream.response_headers().to_vec();
+    let body = stream.take_received_data();
+    let _ = connection.close_stream(stream_id);
+    connection.streams.remove(&stream_id);
+
+    let status = headers.iter()
+        .find(|(name, _)| name == ":status")
+        .and_then(|(_, value)| value.parse::<u16>().ok())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::ConnectionReset, format!("HTTP/2 stream {} ended without a response", stream_id)))?;
+    let fields = headers.into_iter().filter(|(name, _)| !name.starts_with(':')).collect();
+
+    Ok(HttpResponse::with_fields(status, HttpResponse::default_reason_phrase(status), HttpVersion::Http2, fields, body))
+}
+
+fn h2_to_io(err: Http2Error) -> io::Error {
+    match err {
+        Http2Error::Io(e) => e,
+        e => io::Error::new(io::ErrorKind::Other, format!("HTTP/2 error: {}", e)),
+    }
 }
 
 #[cfg(test)]
