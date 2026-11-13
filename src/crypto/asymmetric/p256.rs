@@ -4,9 +4,6 @@
 use crate::crypto::{Error, Result};
 use crate::crypto::random;
 
-// Field element represented as 4 u64 limbs (256 bits)
-type FieldElement = [u64; 4];
-
 // P-256 curve parameters
 const P: FieldElement = [
     0xFFFFFFFFFFFFFFFF,
@@ -54,6 +51,9 @@ const GY: FieldElement = [
     0x8EE7EB4A7C0F9E16,
     0x4FE342E2FE1A7F9B,
 ];
+
+// Field element represented as 4 u64 limbs (256 bits)
+type FieldElement = [u64; 4];
 
 // P-256 Private Key structure
 #[derive(Clone)]

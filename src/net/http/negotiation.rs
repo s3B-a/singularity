@@ -4,6 +4,7 @@ use crate::crypto::hash::hmac::hmac_sha256;
 use crate::crypto::hash::sha2::sha256;
 use crate::crypto::random;
 use crate::net::http::compression::{self, CompressionAlgorithm, CompressionLevel};
+
 use std::cmp::Ordering;
 use std::io;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -323,6 +324,76 @@ impl ContentNegotiator {
         encodings.sort();
 
         encodings
+    }
+}
+
+impl PartialEq for MediaType {
+    fn eq(&self, other: &Self) -> bool {
+        self.type_ == other.type_ && self.subtype == other.subtype
+    }
+}
+
+impl Eq for MediaType {}
+
+impl PartialOrd for MediaType {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for MediaType {
+    fn cmp(&self, other: &Self) -> Ordering {
+        let quality_cmp = other.quality.partial_cmp(&self.quality).unwrap_or(Ordering::Equal);
+        if quality_cmp != Ordering::Equal {
+            return quality_cmp;
+        }
+
+        other.specificity().cmp(&self.specificity())
+    }
+}
+
+impl PartialEq for LanguageTag {
+    fn eq(&self, other: &Self) -> bool {
+        self.language == other.language && self.region == other.region
+    }
+}
+
+impl Eq for LanguageTag {}
+
+impl PartialOrd for LanguageTag {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for LanguageTag {
+    fn cmp(&self, other: &Self) -> Ordering {
+        other.quality.partial_cmp(&self.quality).unwrap_or(Ordering::Equal)
+    }
+}
+
+impl PartialEq for EncodingPreference {
+    fn eq(&self, other: &Self) -> bool {
+        self.encoding.eq_ignore_ascii_case(&other.encoding)
+    }
+}
+
+impl Eq for EncodingPreference {}
+
+impl PartialOrd for EncodingPreference {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for EncodingPreference {
+    fn cmp(&self, other: &Self) -> Ordering {
+        let quality_cmp = other.quality.partial_cmp(&self.quality).unwrap_or(Ordering::Equal);
+        if quality_cmp != Ordering::Equal {
+            return quality_cmp;
+        }
+
+        other.specificity().cmp(&self.specificity())
     }
 }
 
@@ -715,76 +786,6 @@ fn parse_secure_content_negotiation_meta(header: &str, body_len: usize) -> io::R
         encoded_size,
         issued_at_unix,
     })
-}
-
-impl PartialEq for MediaType {
-    fn eq(&self, other: &Self) -> bool {
-        self.type_ == other.type_ && self.subtype == other.subtype
-    }
-}
-
-impl Eq for MediaType {}
-
-impl PartialOrd for MediaType {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for MediaType {
-    fn cmp(&self, other: &Self) -> Ordering {
-        let quality_cmp = other.quality.partial_cmp(&self.quality).unwrap_or(Ordering::Equal);
-        if quality_cmp != Ordering::Equal {
-            return quality_cmp;
-        }
-
-        other.specificity().cmp(&self.specificity())
-    }
-}
-
-impl PartialEq for LanguageTag {
-    fn eq(&self, other: &Self) -> bool {
-        self.language == other.language && self.region == other.region
-    }
-}
-
-impl Eq for LanguageTag {}
-
-impl PartialOrd for LanguageTag {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for LanguageTag {
-    fn cmp(&self, other: &Self) -> Ordering {
-        other.quality.partial_cmp(&self.quality).unwrap_or(Ordering::Equal)
-    }
-}
-
-impl PartialEq for EncodingPreference {
-    fn eq(&self, other: &Self) -> bool {
-        self.encoding.eq_ignore_ascii_case(&other.encoding)
-    }
-}
-
-impl Eq for EncodingPreference {}
-
-impl PartialOrd for EncodingPreference {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for EncodingPreference {
-    fn cmp(&self, other: &Self) -> Ordering {
-        let quality_cmp = other.quality.partial_cmp(&self.quality).unwrap_or(Ordering::Equal);
-        if quality_cmp != Ordering::Equal {
-            return quality_cmp;
-        }
-
-        other.specificity().cmp(&self.specificity())
-    }
 }
 
 #[cfg(test)]

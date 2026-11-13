@@ -2,14 +2,8 @@
 // https://datatracker.ietf.org/doc/html/rfc8032#section-5.1
 
 use crate::crypto::{Error, Result};
-use super::x25519::{fe_from_bytes, fe_to_bytes, fe_add, fe_sub, fe_mul, fe_square, fe_invert};
 use crate::crypto::hash::sha2::Sha512;
-
-// Extended coordinates representation
-type ExtendedPoint = ([i64; 10], [i64; 10], [i64; 10], [i64; 10]);
-
-// Field element representation
-type Fe = [i64; 10];
+use super::x25519::{fe_from_bytes, fe_to_bytes, fe_add, fe_sub, fe_mul, fe_square, fe_invert};
 
 // Order of the Ed25519 curve
 const L: [u8; 32] = [
@@ -18,6 +12,12 @@ const L: [u8; 32] = [
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10,
 ];
+
+// Extended coordinates representation
+type ExtendedPoint = ([i64; 10], [i64; 10], [i64; 10], [i64; 10]);
+
+// Field element representation
+type Fe = [i64; 10];
 
 // Ed25519 Private Key structure
 #[derive(Clone)]

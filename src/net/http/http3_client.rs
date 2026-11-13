@@ -1,11 +1,12 @@
-use super::http3::{Config, Error, QuicClient};
-use super::{HttpRequest, HttpResponse, HttpVersion};
 use crate::crypto::constant_time_eq;
 use crate::crypto::encoding::pem;
 use crate::crypto::hash::hmac::hmac_sha256;
 use crate::crypto::hash::sha2::sha256;
 use crate::crypto::random;
 use crate::net::http::compression::{self, CompressionAlgorithm, CompressionLevel};
+use super::http3::{Config, Error, QuicClient};
+use super::{HttpRequest, HttpResponse, HttpVersion};
+
 use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;

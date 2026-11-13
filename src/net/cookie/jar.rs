@@ -1,11 +1,12 @@
-use super::cookie::{domain_match, Cookie};
-use super::parser::{parse_set_cookie, ParseError};
 use crate::crypto::constant_time_eq;
 use crate::crypto::encoding::pem;
 use crate::crypto::hash::hmac::hmac_sha256;
 use crate::crypto::hash::sha2::sha256;
 use crate::crypto::random;
 use crate::net::http::compression::{self, CompressionAlgorithm, CompressionLevel};
+use super::cookie::{domain_match, Cookie};
+use super::parser::{parse_set_cookie, ParseError};
+
 use std::collections::HashMap;
 use std::io;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -13,18 +14,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const COOKIE_JAR_SNAPSHOT_MAGIC: &str = "SINGULARITY_COOKIE_JAR_SNAPSHOT_V2";
 const COOKIE_JAR_SNAPSHOT_CONTEXT: &str = "SINGULARITY_COOKIE_JAR_SNAPSHOT_BINDING_V2";
 const SNAPSHOT_HOST_ONLY_ATTRIBUTE: &str = "X-Singularity-Host-Only";
-
-fn default_cookie_path(request_path: &str) -> String {
-    let path = request_path.split(['?', '#']).next().unwrap_or("");
-    if !path.starts_with('/') {
-        return "/".to_string();
-    }
-
-    match path.rfind('/') {
-        Some(0) | None => "/".to_string(),
-        Some(idx) => path[..idx].to_string(),
-    }
-}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CookieJarSnapshotMeta {
@@ -394,6 +383,42 @@ impl CookieJar {
     }
 }
 
+impl Default for CookieJar {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl FromIterator<Cookie> for CookieJar {
+    fn from_iter<T: IntoIterator<Item = Cookie>>(iter: T) -> Self {
+        let mut jar = CookieJar::new();
+        for cookie in iter {
+            jar.add(cookie);
+        }
+        jar
+    }
+}
+
+impl Extend<Cookie> for CookieJar {
+    fn extend<T: IntoIterator<Item = Cookie>>(&mut self, iter: T) {
+        for cookie in iter {
+            self.add(cookie);
+        }
+    }
+}
+
+fn default_cookie_path(request_path: &str) -> String {
+    let path = request_path.split(['?', '#']).next().unwrap_or("");
+    if !path.starts_with('/') {
+        return "/".to_string();
+    }
+
+    match path.rfind('/') {
+        Some(0) | None => "/".to_string(),
+        Some(idx) => path[..idx].to_string(),
+    }
+}
+
 fn compute_snapshot_tag(nonce: &[u8], algorithm: CompressionAlgorithm, raw_size: usize, encoded_payload: &[u8]) -> [u8; 32] {
     let mut key_material = Vec::new();
     key_material.extend_from_slice(COOKIE_JAR_SNAPSHOT_CONTEXT.as_bytes());
@@ -559,30 +584,6 @@ fn parse_secure_snapshot_meta(header: &str, body_len: usize) -> io::Result<Cooki
         encoded_size,
         cookie_count,
     })
-}
-
-impl Default for CookieJar {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl FromIterator<Cookie> for CookieJar {
-    fn from_iter<T: IntoIterator<Item = Cookie>>(iter: T) -> Self {
-        let mut jar = CookieJar::new();
-        for cookie in iter {
-            jar.add(cookie);
-        }
-        jar
-    }
-}
-
-impl Extend<Cookie> for CookieJar {
-    fn extend<T: IntoIterator<Item = Cookie>>(&mut self, iter: T) {
-        for cookie in iter {
-            self.add(cookie);
-        }
-    }
 }
 
 #[cfg(test)]

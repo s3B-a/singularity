@@ -1,19 +1,20 @@
-use super::priority::{ExtensiblePriority, Priority, DEFAULT_URGENCY};
 use crate::crypto::constant_time_eq;
 use crate::crypto::encoding::pem;
 use crate::crypto::hash::hmac::hmac_sha256;
 use crate::crypto::hash::sha2::sha256;
 use crate::crypto::random;
 use crate::net::http::compression::{self, CompressionAlgorithm, CompressionLevel};
+use super::priority::{ExtensiblePriority, Priority, DEFAULT_URGENCY};
+
 use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const PRIORITY_SCHEDULER_BLOB_MAGIC: &str = "SINGULARITY_HTTP2_PRIORITY_SCHEDULER_BLOB_V1";
-const PRIORITY_SCHEDULER_BLOB_CONTEXT: &str = "SINGULARITY_HTTP2_PRIORITY_SCHEDULER_BLOB_BINDING_V1";
-
 pub const DEFAULT_MAX_CLOSED_RETAINED: usize = 32;
 pub const MAX_BUFFERED_PRIORITY_UPDATES: usize = 128;
+
+const PRIORITY_SCHEDULER_BLOB_MAGIC: &str = "SINGULARITY_HTTP2_PRIORITY_SCHEDULER_BLOB_V1";
+const PRIORITY_SCHEDULER_BLOB_CONTEXT: &str = "SINGULARITY_HTTP2_PRIORITY_SCHEDULER_BLOB_BINDING_V1";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SecurePrioritySchedulerBlobMeta {
@@ -26,12 +27,26 @@ pub struct SecurePrioritySchedulerBlobMeta {
     pub issued_at_unix: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StreamScheduleState {
-    Ready,
-    Blocked,
-    Idle,
-    Closed,
+pub struct PriorityScheduler {
+    streams: HashMap<u32, ScheduleStream>,
+    dependencies: HashMap<u32, DependencyNode>,
+    root_stream_id: u32,
+    active_queue: VecDeque<u32>,
+    blocked_streams: Vec<u32>,
+    total_pending: usize,
+    extensible_priorities: HashMap<u32, ExtensiblePriority>,
+    closed_streams: VecDeque<u32>,
+    max_closed_retained: usize,
+    extensible_mode: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct DependencyTreeStats {
+    pub total_streams: usize,
+    pub active_streams: usize,
+    pub blocked_streams: usize,
+    pub tree_depth: usize,
+    pub total_pending_bytes: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -42,6 +57,22 @@ struct ScheduleStream {
     pending_bytes: usize,
     quantum: usize, // Weighted fair queuing ( calculated from weight )
     deficit: i64,
+}
+
+#[derive(Debug, Clone)]
+struct DependencyNode {
+    stream_id: u32,
+    parent_id: u32,
+    children: Vec<u32>,
+    exclusive: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamScheduleState {
+    Ready,
+    Blocked,
+    Idle,
+    Closed,
 }
 
 impl ScheduleStream {
@@ -67,14 +98,6 @@ impl ScheduleStream {
     }
 }
 
-#[derive(Debug, Clone)]
-struct DependencyNode {
-    stream_id: u32,
-    parent_id: u32,
-    children: Vec<u32>,
-    exclusive: bool,
-}
-
 impl DependencyNode {
     fn new(stream_id: u32, parent_id: u32, exclusive: bool) -> Self {
         Self {
@@ -84,19 +107,6 @@ impl DependencyNode {
             exclusive,
         }
     }
-}
-
-pub struct PriorityScheduler {
-    streams: HashMap<u32, ScheduleStream>,
-    dependencies: HashMap<u32, DependencyNode>,
-    root_stream_id: u32,
-    active_queue: VecDeque<u32>,
-    blocked_streams: Vec<u32>,
-    total_pending: usize,
-    extensible_priorities: HashMap<u32, ExtensiblePriority>,
-    closed_streams: VecDeque<u32>,
-    max_closed_retained: usize,
-    extensible_mode: bool,
 }
 
 impl PriorityScheduler {
@@ -459,6 +469,12 @@ impl PriorityScheduler {
 
     pub fn from_secure_blob(data: &[u8]) -> io::Result<(SecurePrioritySchedulerBlobMeta, Self)> {
         decode_secure_priority_scheduler(data)
+    }
+}
+
+impl Default for PriorityScheduler {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -1138,21 +1154,6 @@ fn parse_secure_priority_scheduler_meta(header: &str, body_len: usize) -> io::Re
         encoded_size,
         issued_at_unix,
     })
-}
-
-impl Default for PriorityScheduler {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct DependencyTreeStats {
-    pub total_streams: usize,
-    pub active_streams: usize,
-    pub blocked_streams: usize,
-    pub tree_depth: usize,
-    pub total_pending_bytes: usize,
 }
 
 #[cfg(test)]

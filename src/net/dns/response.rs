@@ -1,10 +1,11 @@
-use super::packet::{DnsPacket, ResponseCode};
-use super::record::{DnsRecord, RecordType};
 use crate::crypto::constant_time_eq;
 use crate::crypto::encoding::pem;
 use crate::crypto::hash::sha2::sha256;
 use crate::crypto::random;
 use crate::net::http::compression::{self, CompressionAlgorithm, CompressionLevel};
+use super::packet::{DnsPacket, ResponseCode};
+use super::record::{DnsRecord, RecordType};
+
 use std::fmt;
 use std::io;
 
@@ -22,6 +23,14 @@ pub struct SecureDnsResponseBlobMeta {
 #[derive(Debug, Clone)]
 pub struct DnsResponse {
     pub packet: DnsPacket,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ValidationError {
+    NotAResponse,
+    Truncated,
+    ErrorResponse(ResponseCode),
+    NoQuestions,
 }
 
 impl DnsResponse {
@@ -313,14 +322,6 @@ impl DnsResponse {
         let packet = DnsPacket::read(&decoded)?;
         Ok(DnsResponse::new(packet))
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ValidationError {
-    NotAResponse,
-    Truncated,
-    ErrorResponse(ResponseCode),
-    NoQuestions,
 }
 
 impl fmt::Display for ValidationError {

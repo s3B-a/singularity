@@ -38,6 +38,24 @@ pub enum Error {
     InvalidData(String),
 }
 
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Error::InvalidKeySize => write!(f, "Invalid key size"),
+            Error::InvalidLength => write!(f, "Invalid input length"),
+            Error::InvalidPadding => write!(f, "Invalid padding"),
+            Error::VerificationFailed => write!(f, "Verification failed"),
+            Error::InvalidSignature => write!(f, "Invalid signature"),
+            Error::InvalidCertificate => write!(f, "Invalid certificate"),
+            Error::InsufficientEntropy => write!(f, "Insufficient entropy"),
+            Error::CryptoError(msg) => write!(f, "Cryptographic error: {}", msg),
+            Error::InvalidData(msg) => write!(f, "Invalid data: {}", msg),
+        }
+    }
+}
+
+impl std::error::Error for Error {}
+
 /**
  * Constant-time comparison of two byte slices to prevent timing attacks
  * Args:
@@ -75,24 +93,6 @@ pub fn secure_zero(data: &mut [u8]) {
         }
     }
 }
-
-impl std::fmt::Display for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Error::InvalidKeySize => write!(f, "Invalid key size"),
-            Error::InvalidLength => write!(f, "Invalid input length"),
-            Error::InvalidPadding => write!(f, "Invalid padding"),
-            Error::VerificationFailed => write!(f, "Verification failed"),
-            Error::InvalidSignature => write!(f, "Invalid signature"),
-            Error::InvalidCertificate => write!(f, "Invalid certificate"),
-            Error::InsufficientEntropy => write!(f, "Insufficient entropy"),
-            Error::CryptoError(msg) => write!(f, "Cryptographic error: {}", msg),
-            Error::InvalidData(msg) => write!(f, "Invalid data: {}", msg),
-        }
-    }
-}
-
-impl std::error::Error for Error {}
 
 #[cfg(test)]
 mod tests {

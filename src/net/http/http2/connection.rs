@@ -1,13 +1,3 @@
-use super::alpn::AlpnProtocol;
-use super::error::{ErrorCode, Http2Error, Result};
-use super::flow_control::{decode_secure_flow_control, encode_secure_flow_control, FlowControl};
-use super::frame::{Frame, FrameFlags, FrameType};
-use super::hpack::{decode_secure_hpack_codec, encode_secure_hpack_codec, HpackCodec};
-use super::priority::{decode_secure_priority_tree, encode_secure_priority_tree, parse_priority_header, ExtensiblePriority, Priority, PriorityTree};
-use super::push::{decode_secure_push_manager, encode_secure_push_manager, PushConfig, PushManager};
-use super::scheduler::{decode_secure_priority_scheduler, encode_secure_priority_scheduler, DependencyTreeStats, PriorityScheduler};
-use super::settings::{decode_secure_settings, encode_secure_settings, SettingId, Settings};
-use super::stream::{decode_secure_http2_stream, encode_secure_http2_stream, Http2Stream, StreamState};
 use crate::crypto::constant_time_eq;
 use crate::crypto::encoding::pem;
 use crate::crypto::hash::hmac::hmac_sha256;
@@ -15,6 +5,18 @@ use crate::crypto::hash::sha2::sha256;
 use crate::crypto::random;
 use crate::net::http::compression::{self, CompressionAlgorithm, CompressionLevel};
 use crate::net::tcp::TcpStream;
+use super::alpn::AlpnProtocol;
+use super::error::{ErrorCode, Http2Error, Result};
+use super::flow_control::{decode_secure_flow_control, encode_secure_flow_control, FlowControl};
+use super::frame::{Frame, FrameFlags, FrameType, PaddingStrategy};
+use super::h2c;
+use super::hpack::{decode_secure_hpack_codec, encode_secure_hpack_codec, HpackCodec};
+use super::priority::{decode_secure_priority_tree, encode_secure_priority_tree, parse_priority_header, ExtensiblePriority, Priority, PriorityTree};
+use super::push::{decode_secure_push_manager, encode_secure_push_manager, PushConfig, PushManager};
+use super::scheduler::{decode_secure_priority_scheduler, encode_secure_priority_scheduler, DependencyTreeStats, PriorityScheduler};
+use super::settings::{decode_secure_settings, encode_secure_settings, SettingId, Settings};
+use super::stream::{decode_secure_http2_stream, encode_secure_http2_stream, Http2Stream, StreamState};
+
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{self, Read, Write};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -41,40 +43,6 @@ pub struct SecureHttp2ConnectionBlobMeta {
     pub raw_size: usize,
     pub encoded_size: usize,
     pub issued_at_unix: u64,
-}
-
-pub trait Http2Transport: Read + Write + Send {}
-
-impl<T: Read + Write + Send> Http2Transport for T {}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Role {
-    Client,
-    Server,
-}
-
-impl Role {
-    fn as_str(&self) -> &'static str {
-        match self {
-            Role::Client => "client",
-            Role::Server => "server",
-        }
-    }
-
-    fn from_str(value: &str) -> Option<Self> {
-        match value {
-            "client" => Some(Role::Client),
-            "server" => Some(Role::Server),
-            _ => None,
-        }
-    }
-
-    fn first_stream_id(&self) -> u32 {
-        match self {
-            Role::Client => 1,
-            Role::Server => 2,
-        }
-    }
 }
 
 pub struct Http2Connection {
@@ -114,6 +82,7 @@ pub struct Http2Connection {
     recent_resets: VecDeque<Instant>,
     max_resets_per_window: usize,
     reset_window: Duration,
+    padding: PaddingStrategy,
 }
 
 #[derive(Debug)]
@@ -126,6 +95,45 @@ struct ContinuationState {
     priority: Option<Priority>,
     promised_stream_id: Option<u32>,
     frame_count: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Role {
+    Client,
+    Server,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HeaderBlockKind {
+    Request,
+    Response,
+    Trailers,
+}
+
+pub trait Http2Transport: Read + Write + Send {}
+
+impl Role {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Role::Client => "client",
+            Role::Server => "server",
+        }
+    }
+
+    fn from_str(value: &str) -> Option<Self> {
+        match value {
+            "client" => Some(Role::Client),
+            "server" => Some(Role::Server),
+            _ => None,
+        }
+    }
+
+    fn first_stream_id(&self) -> u32 {
+        match self {
+            Role::Client => 1,
+            Role::Server => 2,
+        }
+    }
 }
 
 impl ContinuationState {
@@ -141,13 +149,6 @@ impl ContinuationState {
             frame_count: 1,
         }
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum HeaderBlockKind {
-    Request,
-    Response,
-    Trailers,
 }
 
 impl Http2Connection {
@@ -171,12 +172,42 @@ impl Http2Connection {
         Self::from_boxed_transport(Box::new(transport), role)
     }
 
-    fn from_boxed_transport(stream: Box<dyn Http2Transport>, role: Role) -> Result<Self> {
-        let mut local_settings = Settings::local_defaults();
-        if role == Role::Server {
-            local_settings.set(SettingId::EnablePush, 0).map_err(Http2Error::NotPermitted)?;
+    pub fn upgrade_server<T: Http2Transport + 'static>(transport: T, http2_settings: &[(u16, u32)], request_headers: Vec<(String, String)>, request_body: Vec<u8>) -> Result<Self> {
+        let mut conn = Self::with_transport(transport, Role::Server)?;
+        conn.apply_peer_settings(&h2c::settings_payload(http2_settings))?;
+
+        let mut stream = Http2Stream::new(1, conn.remote_settings.initial_window_size());
+        stream.receive_headers()?;
+        stream.add_response_headers(request_headers);
+        if !request_body.is_empty() {
+            stream.receive_data(request_body)?;
         }
 
+        stream.receive_end_stream()?;
+        conn.streams.insert(1, stream);
+        conn.peer_initiated_streams.insert(1);
+        conn.highest_peer_stream_id = 1;
+        conn.scheduler.add_stream(1, Priority::default());
+
+        Ok(conn)
+    }
+
+    pub fn upgrade_client<T: Http2Transport + 'static>(transport: T) -> Result<Self> {
+        let mut conn = Self::with_transport(transport, Role::Client)?;
+        let stream_id = conn.open_local_stream(Priority::default())?;
+        let stream = conn.streams.get_mut(&stream_id).ok_or(Http2Error::StreamNotFound(stream_id))?;
+        stream.send_headers()?;
+        stream.send_end_stream()?;
+
+        Ok(conn)
+    }
+
+    pub fn default_settings_entries(role: Role) -> Result<Vec<(u16, u32)>> {
+        Ok(settings_entries(&default_local_settings(role)?))
+    }
+
+    fn from_boxed_transport(stream: Box<dyn Http2Transport>, role: Role) -> Result<Self> {
+        let local_settings = default_local_settings(role)?;
         let remote_settings = Settings::default();
         let connection_flow_control = FlowControl::new(remote_settings.initial_window_size());
 
@@ -217,7 +248,16 @@ impl Http2Connection {
             recent_resets: VecDeque::new(),
             max_resets_per_window: DEFAULT_MAX_RESETS_PER_WINDOW,
             reset_window: DEFAULT_RESET_WINDOW,
+            padding: PaddingStrategy::None,
         })
+    }
+
+    pub fn set_padding_strategy(&mut self, padding: PaddingStrategy) {
+        self.padding = padding;
+    }
+
+    pub fn padding_strategy(&self) -> PaddingStrategy {
+        self.padding
     }
 
     pub fn handshake(&mut self) -> Result<()> {
@@ -250,42 +290,25 @@ impl Http2Connection {
     }
 
     fn initial_settings(&self) -> Vec<(u16, u32)> {
-        let mut settings = vec![
-            (SettingId::HeaderTableSize as u16, self.local_settings.header_table_size()),
-            (SettingId::EnablePush as u16, if self.local_settings.enable_push() { 1 } else { 0 }),
-            (SettingId::MaxConcurrentStreams as u16, self.local_settings.max_concurrent_streams()),
-            (SettingId::InitialWindowSize as u16, self.local_settings.initial_window_size()),
-            (SettingId::MaxFrameSize as u16, self.local_settings.max_frame_size()),
-            (SettingId::MaxHeaderListSize as u16, self.local_settings.max_header_list_size()),
-        ];
-        
-        if self.local_settings.enable_connect_protocol() {
-            settings.push((SettingId::EnableConnectProtocol as u16, 1));
-        }
-        
-        if self.local_settings.no_rfc7540_priorities() {
-            settings.push((SettingId::NoRfc7540Priorities as u16, 1));
-        }
-        
-        settings
+        settings_entries(&self.local_settings)
     }
-
+    
     fn send_preface(&mut self) -> Result<()> {
-        match self.role {
-            Role::Client => self.stream.write_all(CLIENT_PREFACE)?,
-            Role::Server => {
-                let mut preface = [0u8; CLIENT_PREFACE.len()];
-                self.stream.read_exact(&mut preface)?;
-                if preface != CLIENT_PREFACE {
-                    return Err(Http2Error::Protocol(ErrorCode::ProtocolError, "invalid client connection preface".to_string()));
-                }
-            }
+        if self.role == Role::Client {
+            self.stream.write_all(CLIENT_PREFACE)?;
         }
-
+        
         Frame::settings(self.initial_settings()).write(&mut self.stream)?;
         self.stream.flush()?;
         self.local_settings_sent = true;
         self.pending_settings_acks.push_back(Instant::now());
+        if self.role == Role::Server {
+            let mut preface = [0u8; CLIENT_PREFACE.len()];
+            self.stream.read_exact(&mut preface)?;
+            if preface != CLIENT_PREFACE {
+                return Err(Http2Error::Protocol(ErrorCode::ProtocolError, "invalid client connection preface".to_string()));
+            }
+        }
 
         let frame = match Frame::read_limited(&mut self.stream, self.local_settings.max_frame_size()) {
             Ok(frame) => frame,
@@ -560,7 +583,9 @@ impl Http2Connection {
             }
             
             let conn_window = self.connection_flow_control.window_size() as usize;
-            let max_send = conn_window.min(stream_window as usize).min(self.max_frame_size as usize);
+            let max_payload = conn_window.min(stream_window as usize).min(self.max_frame_size as usize);
+            let pad = self.padding.is_enabled() && max_payload > 1;
+            let max_send = if pad { max_payload - 1 } else { max_payload };
             
             let data = stream.get_send_data(max_send);
             if data.is_empty() {
@@ -576,11 +601,16 @@ impl Http2Connection {
                 0
             };
 
-            let frame = Frame::new(FrameType::Data, flags, stream_id, data);
+            let mut frame = Frame::new(FrameType::Data, flags, stream_id, data);
+            if pad {
+                frame = frame.with_padding(self.padding.padding_for(data_len, max_payload - 1 - data_len))?;
+            }
+            
+            let flow_len = frame.payload.len();
             frame.write(&mut self.stream)?;
             
-            self.connection_flow_control.consume(data_len)?;
-            stream.flow_control_mut().consume(data_len)?;
+            self.connection_flow_control.consume(flow_len)?;
+            stream.flow_control_mut().consume(flow_len)?;
             if ends_stream {
                 stream.send_end_stream()?;
             }
@@ -599,21 +629,30 @@ impl Http2Connection {
 
     fn send_headers_with_continuation(&mut self, stream_id: u32, mut headers_data: Vec<u8>, end_stream: bool) -> Result<()> {
         let max_frame_size = self.remote_settings.max_frame_size() as usize;
-        if headers_data.len() <= max_frame_size {
-            let frame = Frame::headers(stream_id, headers_data, true, end_stream);
-            frame.write(&mut self.stream)?;
+        let total = headers_data.len();
+        let (first_len, pad_length) = if !self.padding.is_enabled() {
+            (total.min(max_frame_size), None)
+        } else if total < max_frame_size {
+            (total, Some(self.padding.padding_for(total, max_frame_size - 1 - total)))
         } else {
-            let first_chunk: Vec<u8> = headers_data.drain(..max_frame_size).collect();
-            let frame = Frame::headers(stream_id, first_chunk, false, end_stream);
-            frame.write(&mut self.stream)?;
-            while !headers_data.is_empty() {
-                let chunk_size = headers_data.len().min(max_frame_size);
-                let chunk: Vec<u8> = headers_data.drain(..chunk_size).collect();
-                let is_last = headers_data.is_empty();
-                
-                let continuation = Frame::continuation(stream_id, chunk, is_last);
-                continuation.write(&mut self.stream)?;
-            }
+            let pad_length = self.padding.padding_for(total, u8::MAX as usize);
+            (max_frame_size - 1 - pad_length as usize, Some(pad_length))
+        };
+        
+        let first_chunk: Vec<u8> = headers_data.drain(..first_len).collect();
+        let mut frame = Frame::headers(stream_id, first_chunk, headers_data.is_empty(), end_stream);
+        if let Some(pad_length) = pad_length {
+            frame = frame.with_padding(pad_length)?;
+        }
+        
+        frame.write(&mut self.stream)?;
+        while !headers_data.is_empty() {
+            let chunk_size = headers_data.len().min(max_frame_size);
+            let chunk: Vec<u8> = headers_data.drain(..chunk_size).collect();
+            let is_last = headers_data.is_empty();
+            
+            let continuation = Frame::continuation(stream_id, chunk, is_last);
+            continuation.write(&mut self.stream)?;
         }
         
         Ok(())
@@ -1109,7 +1148,15 @@ impl Http2Connection {
             return Ok(());
         }
 
-        if frame.payload.len() % 6 != 0 {
+        self.apply_peer_settings(&frame.payload)?;
+        Frame::settings_ack().write(&mut self.stream)?;
+        self.stream.flush()?;
+        
+        Ok(())
+    }
+    
+    fn apply_peer_settings(&mut self, payload: &[u8]) -> Result<()> {
+        if payload.len() % 6 != 0 {
             return Err(Http2Error::Protocol(
                 ErrorCode::FrameSizeError,
                 "Invalid SETTINGS frame size".to_string(),
@@ -1117,7 +1164,7 @@ impl Http2Connection {
         }
 
         if self.role == Role::Client {
-            let enables_push = frame.payload.chunks_exact(6).any(|entry| {
+            let enables_push = payload.chunks_exact(6).any(|entry| {
                 u16::from_be_bytes([entry[0], entry[1]]) == SettingId::EnablePush as u16 && entry[2..] != [0, 0, 0, 0]
             });
             if enables_push {
@@ -1128,7 +1175,7 @@ impl Http2Connection {
         let old_initial_window = self.remote_settings.initial_window_size();
         let old_table_size = self.remote_settings.header_table_size();
         let is_first = !self.peer_settings_received;
-        self.remote_settings.apply_update(&frame.payload, is_first).map_err(|(id, msg)| {
+        self.remote_settings.apply_update(payload, is_first).map_err(|(id, msg)| {
             let code = if id == SettingId::InitialWindowSize { ErrorCode::FlowControlError } else { ErrorCode::ProtocolError };
             Http2Error::Protocol(code, msg)
         })?;
@@ -1149,9 +1196,6 @@ impl Http2Connection {
                 stream.flow_control_mut().update_initial_window_size(new_initial_window)?;
             }
         }
-
-        Frame::settings_ack().write(&mut self.stream)?;
-        self.stream.flush()?;
 
         Ok(())
     }
@@ -1564,92 +1608,44 @@ impl Http2Connection {
     }
 }
 
-fn check_alpn(negotiated_protocol: Option<AlpnProtocol>) -> Result<()> {
-    match negotiated_protocol {
-        Some(protocol) if protocol != AlpnProtocol::Http2 => Err(Http2Error::Protocol(
-            ErrorCode::ProtocolError,
-            format!("HTTP/2 connection requires h2 protocol, got: {}", protocol.name()),
-        )),
-        _ => Ok(()),
+impl Http2Stream {
+    pub fn get_send_data(&mut self, max_len: usize) -> Vec<u8> {
+        let mut data = Vec::new();
+        let mut remaining = max_len;
+        while remaining > 0 && self.send_buffer_len() > 0 {
+            if let Some(chunk) = self.send_buffer.pop_front() {
+                let take = chunk.len().min(remaining);
+                data.extend_from_slice(&chunk[..take]);
+                remaining -= take;
+                if take < chunk.len() {
+                    self.send_buffer.push_front(chunk[take..].to_vec());
+                    break;
+                }
+            }
+        }
+        
+        data
+    }
+
+    pub fn queue_send_data(&mut self, data: Vec<u8>) -> Result<()> {
+        self.send_buffer.push_back(data);
+        Ok(())
+    }
+
+    pub fn send_buffer_len(&self) -> usize {
+        self.send_buffer.iter().map(|chunk| chunk.len()).sum()
+    }
+
+    pub fn mark_send_complete(&mut self) {
+        self.end_stream_sent = true;
+    }
+
+    pub fn is_send_complete(&self) -> bool {
+        self.end_stream_sent
     }
 }
 
-fn strip_padding(frame: &Frame) -> Result<&[u8]> {
-    let payload = frame.payload.as_slice();
-    if !frame.header.flags.has(FrameFlags::PADDED) {
-        return Ok(payload);
-    }
-
-    let (&pad_length, rest) = payload.split_first().ok_or_else(|| {
-        Http2Error::Protocol(ErrorCode::FrameSizeError, "padded frame is missing its pad length".to_string())
-    })?;
-
-    rest.len().checked_sub(pad_length as usize).map(|len| &rest[..len]).ok_or_else(|| {
-        Http2Error::Protocol(ErrorCode::ProtocolError, "padding exceeds the frame payload".to_string())
-    })
-}
-
-fn validate_header_block(headers: &[(String, String)], extended_connect_enabled: bool) -> std::result::Result<HeaderBlockKind, String> {
-    let mut pseudo: HashMap<&str, &str> = HashMap::new();
-    for (name, value) in headers {
-        if name.is_empty() || name.bytes().any(|b| b.is_ascii_uppercase()) {
-            return Err(format!("invalid header name '{}'", name));
-        }
-
-        if name.starts_with(':') {
-            if !REQUEST_PSEUDO_HEADERS.contains(&name.as_str()) && name != ":status" {
-                return Err(format!("unknown pseudo-header '{}'", name));
-            }
-
-            pseudo.insert(name, value);
-        } else if CONNECTION_SPECIFIC_HEADERS.contains(&name.as_str()) || (name == "te" && value != "trailers") {
-            return Err(format!("connection-specific header '{}'", name));
-        }
-    }
-
-    if pseudo.is_empty() {
-        return Ok(HeaderBlockKind::Trailers);
-    }
-
-    if pseudo.contains_key(":status") {
-        if pseudo.len() != 1 {
-            return Err("response mixes in request pseudo-headers".to_string());
-        }
-
-        return Ok(HeaderBlockKind::Response);
-    }
-
-    let method = *pseudo.get(":method").ok_or("request is missing :method")?;
-    if method == "CONNECT" {
-        if pseudo.contains_key(":protocol") {
-            if !extended_connect_enabled {
-                return Err("extended CONNECT was not enabled".to_string());
-            }
-
-            if [":scheme", ":path", ":authority"].iter().any(|name| !pseudo.contains_key(name)) {
-                return Err("extended CONNECT requires :scheme, :path and :authority".to_string());
-            }
-        } else {
-            if pseudo.contains_key(":scheme") || pseudo.contains_key(":path") {
-                return Err("CONNECT must not include :scheme or :path".to_string());
-            }
-
-            if !pseudo.contains_key(":authority") {
-                return Err("CONNECT requires :authority".to_string());
-            }
-        }
-    } else {
-        if pseudo.contains_key(":protocol") {
-            return Err("the :protocol pseudo-header requires CONNECT".to_string());
-        }
-
-        if !pseudo.contains_key(":scheme") || !pseudo.contains_key(":path") {
-            return Err("request is missing :scheme or :path".to_string());
-        }
-    }
-
-    Ok(HeaderBlockKind::Request)
-}
+impl<T: Read + Write + Send> Http2Transport for T {}
 
 pub fn select_secure_http2_connection_algorithm(accept_encoding: &str) -> CompressionAlgorithm {
     compression::parse_accept_encoding(accept_encoding).into_iter().find_map(|(algorithm, quality)| {
@@ -1795,6 +1791,123 @@ pub fn decode_secure_http2_connection(stream: TcpStream, data: &[u8]) -> io::Res
     Ok((meta, connection))
 }
 
+fn default_local_settings(role: Role) -> Result<Settings> {
+    let mut settings = Settings::local_defaults();
+    if role == Role::Server {
+        settings.set(SettingId::EnablePush, 0).map_err(Http2Error::NotPermitted)?;
+    }
+
+    Ok(settings)
+}
+
+fn settings_entries(local: &Settings) -> Vec<(u16, u32)> {
+    let mut settings = vec![
+        (SettingId::HeaderTableSize as u16, local.header_table_size()),
+        (SettingId::EnablePush as u16, if local.enable_push() { 1 } else { 0 }),
+        (SettingId::MaxConcurrentStreams as u16, local.max_concurrent_streams()),
+        (SettingId::InitialWindowSize as u16, local.initial_window_size()),
+        (SettingId::MaxFrameSize as u16, local.max_frame_size()),
+        (SettingId::MaxHeaderListSize as u16, local.max_header_list_size()),
+    ];
+
+    if local.enable_connect_protocol() {
+        settings.push((SettingId::EnableConnectProtocol as u16, 1));
+    }
+
+    if local.no_rfc7540_priorities() {
+        settings.push((SettingId::NoRfc7540Priorities as u16, 1));
+    }
+
+    settings
+}
+
+fn check_alpn(negotiated_protocol: Option<AlpnProtocol>) -> Result<()> {
+    match negotiated_protocol {
+        Some(protocol) if protocol != AlpnProtocol::Http2 => Err(Http2Error::Protocol(
+            ErrorCode::ProtocolError,
+            format!("HTTP/2 connection requires h2 protocol, got: {}", protocol.name()),
+        )),
+        _ => Ok(()),
+    }
+}
+
+fn strip_padding(frame: &Frame) -> Result<&[u8]> {
+    let payload = frame.payload.as_slice();
+    if !frame.header.flags.has(FrameFlags::PADDED) {
+        return Ok(payload);
+    }
+
+    let (&pad_length, rest) = payload.split_first().ok_or_else(|| {
+        Http2Error::Protocol(ErrorCode::FrameSizeError, "padded frame is missing its pad length".to_string())
+    })?;
+
+    rest.len().checked_sub(pad_length as usize).map(|len| &rest[..len]).ok_or_else(|| {
+        Http2Error::Protocol(ErrorCode::ProtocolError, "padding exceeds the frame payload".to_string())
+    })
+}
+
+fn validate_header_block(headers: &[(String, String)], extended_connect_enabled: bool) -> std::result::Result<HeaderBlockKind, String> {
+    let mut pseudo: HashMap<&str, &str> = HashMap::new();
+    for (name, value) in headers {
+        if name.is_empty() || name.bytes().any(|b| b.is_ascii_uppercase()) {
+            return Err(format!("invalid header name '{}'", name));
+        }
+
+        if name.starts_with(':') {
+            if !REQUEST_PSEUDO_HEADERS.contains(&name.as_str()) && name != ":status" {
+                return Err(format!("unknown pseudo-header '{}'", name));
+            }
+
+            pseudo.insert(name, value);
+        } else if CONNECTION_SPECIFIC_HEADERS.contains(&name.as_str()) || (name == "te" && value != "trailers") {
+            return Err(format!("connection-specific header '{}'", name));
+        }
+    }
+
+    if pseudo.is_empty() {
+        return Ok(HeaderBlockKind::Trailers);
+    }
+
+    if pseudo.contains_key(":status") {
+        if pseudo.len() != 1 {
+            return Err("response mixes in request pseudo-headers".to_string());
+        }
+
+        return Ok(HeaderBlockKind::Response);
+    }
+
+    let method = *pseudo.get(":method").ok_or("request is missing :method")?;
+    if method == "CONNECT" {
+        if pseudo.contains_key(":protocol") {
+            if !extended_connect_enabled {
+                return Err("extended CONNECT was not enabled".to_string());
+            }
+
+            if [":scheme", ":path", ":authority"].iter().any(|name| !pseudo.contains_key(name)) {
+                return Err("extended CONNECT requires :scheme, :path and :authority".to_string());
+            }
+        } else {
+            if pseudo.contains_key(":scheme") || pseudo.contains_key(":path") {
+                return Err("CONNECT must not include :scheme or :path".to_string());
+            }
+
+            if !pseudo.contains_key(":authority") {
+                return Err("CONNECT requires :authority".to_string());
+            }
+        }
+    } else {
+        if pseudo.contains_key(":protocol") {
+            return Err("the :protocol pseudo-header requires CONNECT".to_string());
+        }
+
+        if !pseudo.contains_key(":scheme") || !pseudo.contains_key(":path") {
+            return Err("request is missing :scheme or :path".to_string());
+        }
+    }
+
+    Ok(HeaderBlockKind::Request)
+}
+
 fn serialize_http2_connection(connection: &Http2Connection) -> io::Result<Vec<u8>> {
     let mut lines = Vec::new();
 
@@ -1819,6 +1932,7 @@ fn serialize_http2_connection(connection: &Http2Connection) -> io::Result<Vec<u8
     lines.push(format!("local-settings-sent={}", connection.local_settings_sent));
     lines.push(format!("peer-settings-received={}", connection.peer_settings_received));
     lines.push(format!("max-frame-size={}", connection.max_frame_size));
+    lines.push(format!("padding-strategy={}", connection.padding));
     lines.push(format!("negotiated-protocol-present={}", connection.negotiated_protocol.is_some()));
     if let Some(protocol) = connection.negotiated_protocol {
         lines.push(format!(
@@ -1961,6 +2075,11 @@ fn deserialize_http2_connection(stream: TcpStream, raw_payload: &[u8]) -> io::Re
     )?;
 
     let max_frame_size = parse_u32(required_field(&kv, "max-frame-size")?, "max-frame-size")?;
+    let padding = match kv.get("padding-strategy") {
+        Some(value) => value.parse::<PaddingStrategy>().map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?,
+        None => PaddingStrategy::None,
+    };
+    
     let negotiated_protocol_present = kv.get("negotiated-protocol-present").map(|v| parse_bool(v, "negotiated-protocol-present")).transpose()?.unwrap_or(false);
     let negotiated_protocol = if negotiated_protocol_present {
         let wire = decode_blob_field(
@@ -2153,6 +2272,7 @@ fn deserialize_http2_connection(stream: TcpStream, raw_payload: &[u8]) -> io::Re
         recent_resets: VecDeque::new(),
         max_resets_per_window: DEFAULT_MAX_RESETS_PER_WINDOW,
         reset_window: DEFAULT_RESET_WINDOW,
+        padding,
     })
 }
 
@@ -2365,43 +2485,6 @@ fn parse_secure_http2_connection_meta(header: &str, body_len: usize) -> io::Resu
         encoded_size,
         issued_at_unix,
     })
-}
-
-impl Http2Stream {
-    pub fn get_send_data(&mut self, max_len: usize) -> Vec<u8> {
-        let mut data = Vec::new();
-        let mut remaining = max_len;
-        while remaining > 0 && self.send_buffer_len() > 0 {
-            if let Some(chunk) = self.send_buffer.pop_front() {
-                let take = chunk.len().min(remaining);
-                data.extend_from_slice(&chunk[..take]);
-                remaining -= take;
-                if take < chunk.len() {
-                    self.send_buffer.push_front(chunk[take..].to_vec());
-                    break;
-                }
-            }
-        }
-        
-        data
-    }
-
-    pub fn queue_send_data(&mut self, data: Vec<u8>) -> Result<()> {
-        self.send_buffer.push_back(data);
-        Ok(())
-    }
-
-    pub fn send_buffer_len(&self) -> usize {
-        self.send_buffer.iter().map(|chunk| chunk.len()).sum()
-    }
-
-    pub fn mark_send_complete(&mut self) {
-        self.end_stream_sent = true;
-    }
-
-    pub fn is_send_complete(&self) -> bool {
-        self.end_stream_sent
-    }
 }
 
 #[cfg(test)]
@@ -3430,5 +3513,119 @@ mod tests {
 
         let decoded = restored.decoder.decode(&[0x82, 0x87, 0x84, 0x80 | 62]).unwrap();
         assert_eq!(decoded.get(":authority"), Some(&"example.com".to_string()));
+    }
+
+    fn owned_request_headers() -> Vec<(String, String)> {
+        request_headers().iter().map(|(n, v)| (n.to_string(), v.to_string())).collect()
+    }
+
+    #[test]
+    fn test_outbound_headers_and_data_are_padded() {
+        let mut h = Harness::client();
+        h.conn.set_padding_strategy(PaddingStrategy::Fixed(10));
+        let stream_id = h.conn.create_stream().unwrap();
+        h.conn.send_request(stream_id, owned_request_headers(), Some(b"hello".to_vec())).unwrap();
+
+        let headers = h.next_frame();
+        assert_eq!(headers.header.frame_type, FrameType::Headers);
+        assert!(headers.header.flags.has(FrameFlags::END_HEADERS));
+        assert_eq!(headers.pad_length(), Some(10));
+        assert!(headers.payload.ends_with(&[0u8; 10]), "padding octets are zero");
+        let decoded = h.peer_decoder.decode(strip_padding(&headers).unwrap()).unwrap();
+        assert_eq!(decoded.get(":path"), Some(&"/".to_string()));
+
+        let data = h.next_frame();
+        assert_eq!(data.header.frame_type, FrameType::Data);
+        assert!(data.header.flags.has(FrameFlags::END_STREAM));
+        assert_eq!(data.pad_length(), Some(10));
+        assert_eq!(strip_padding(&data).unwrap(), b"hello");
+        assert_eq!(data.payload.len(), 16);
+        assert_eq!(h.conn.connection_flow_control.window_size(), 65535 - 16, "padding counts against flow control");
+        assert_eq!(h.conn.get_stream(stream_id).unwrap().flow_control().window_size(), 65535 - 16);
+    }
+
+    #[test]
+    fn test_padding_is_limited_by_the_flow_control_window() {
+        let mut h = Harness::client();
+        h.peer_settings(&[(SettingId::InitialWindowSize, 8)]).unwrap();
+        h.conn.set_padding_strategy(PaddingStrategy::Fixed(100));
+        let stream_id = h.conn.create_stream().unwrap();
+        h.conn.send_request(stream_id, owned_request_headers(), Some(b"abcdefghij".to_vec())).unwrap();
+
+        assert_eq!(h.next_frame().header.frame_type, FrameType::Headers);
+        let data = h.next_frame();
+        assert_eq!(data.payload.len(), 8, "the padded frame fills but never exceeds the 8-byte window");
+        assert_eq!(strip_padding(&data).unwrap(), b"abcdefg");
+        assert!(!data.header.flags.has(FrameFlags::END_STREAM));
+        assert_eq!(h.conn.get_stream(stream_id).unwrap().flow_control().window_size(), 0);
+    }
+
+    #[test]
+    fn test_block_padding_on_a_header_block_that_needs_continuation() {
+        let mut h = Harness::client();
+        h.conn.set_padding_strategy(PaddingStrategy::Block(256));
+        let stream_id = h.conn.create_stream().unwrap();
+        let mut headers = owned_request_headers();
+        headers.push(("x-large".to_string(), "v".repeat(40_000)));
+        h.conn.send_request(stream_id, headers, None).unwrap();
+
+        let first = h.next_frame();
+        assert_eq!(first.header.frame_type, FrameType::Headers);
+        assert!(!first.header.flags.has(FrameFlags::END_HEADERS));
+        assert!(first.payload.len() <= 16384);
+        assert!(first.pad_length().is_some());
+        let mut block = strip_padding(&first).unwrap().to_vec();
+        loop {
+            let frame = h.next_frame();
+            assert_eq!(frame.header.frame_type, FrameType::Continuation);
+            assert!(frame.pad_length().is_none());
+            block.extend_from_slice(&frame.payload);
+            if frame.header.flags.has(FrameFlags::END_HEADERS) {
+                break;
+            }
+        }
+
+        let decoded = h.peer_decoder.decode(&block).unwrap();
+        assert_eq!(decoded.get("x-large").map(String::len), Some(40_000));
+    }
+
+    #[test]
+    fn test_padded_request_is_understood_by_peer_connection() {
+        let listener = StdListener::bind("127.0.0.1:0").unwrap();
+        let client_side = StdStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (server_side, _) = listener.accept().unwrap();
+        let server_thread = std::thread::spawn(move || {
+            let mut server = Http2Connection::new_server(server_side).unwrap();
+            server.handshake().unwrap();
+            while server.get_stream(1).map_or(true, |s| s.state() != StreamState::HalfClosedRemote) {
+                server.receive_frame().unwrap();
+            }
+
+            server.get_stream(1).unwrap().data().to_vec()
+        });
+
+        let mut client = Http2Connection::with_transport(client_side, Role::Client).unwrap();
+        client.set_padding_strategy(PaddingStrategy::Random(64));
+        client.handshake().unwrap();
+        let stream_id = client.create_stream().unwrap();
+        let body: Vec<u8> = (0..50_000u32).map(|i| (i % 251) as u8).collect();
+        client.send_request(stream_id, owned_request_headers(), Some(body.clone())).unwrap();
+        while client.get_stream(stream_id).unwrap().send_buffer_len() > 0 {
+            client.receive_frame().unwrap();
+            client.send_pending_data().unwrap();
+        }
+
+        assert_eq!(server_thread.join().unwrap(), body);
+    }
+
+    #[test]
+    fn test_padding_strategy_survives_secure_blob() {
+        let mut h = Harness::new();
+        h.conn.set_padding_strategy(PaddingStrategy::Block(128));
+        let (_, blob) = h.conn.to_secure_blob(CompressionAlgorithm::Identity).unwrap();
+        let listener = StdListener::bind("127.0.0.1:0").unwrap();
+        let stream = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (_, restored) = Http2Connection::from_secure_blob(stream, &blob).unwrap();
+        assert_eq!(restored.padding_strategy(), PaddingStrategy::Block(128));
     }
 }

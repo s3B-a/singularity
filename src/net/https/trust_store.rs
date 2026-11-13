@@ -1,36 +1,20 @@
 use crate::crypto::encoding::x509::Certificate;
+
 use std::fs;
 use std::path::Path;
 
 // A self-contained bundle of root CA certificates extracted from Mozilla's root program
 const BUNDLED_MOZILLA_ROOTS_PEM: &str = include_str!("data/mozilla_roots.pem");
 
+#[derive(Debug, Clone, Default)]
+pub struct TrustStore {
+    anchors: Vec<Certificate>,
+}
+
 #[derive(Debug)]
 pub enum TrustStoreError {
     Io(std::io::Error),
     Parse(String),
-}
-
-impl std::fmt::Display for TrustStoreError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            TrustStoreError::Io(e) => write!(f, "Trust store IO error: {}", e),
-            TrustStoreError::Parse(msg) => write!(f, "Trust store parse error: {}", msg),
-        }
-    }
-}
-
-impl std::error::Error for TrustStoreError {}
-
-impl From<std::io::Error> for TrustStoreError {
-    fn from(err: std::io::Error) -> Self {
-        TrustStoreError::Io(err)
-    }
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct TrustStore {
-    anchors: Vec<Certificate>,
 }
 
 impl TrustStore {
@@ -148,6 +132,23 @@ impl TrustStore {
     pub fn contains_exact(&self, cert: &Certificate) -> bool {
         let der = cert.to_der();
         self.anchors.iter().any(|anchor| anchor.to_der() == der)
+    }
+}
+
+impl std::fmt::Display for TrustStoreError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TrustStoreError::Io(e) => write!(f, "Trust store IO error: {}", e),
+            TrustStoreError::Parse(msg) => write!(f, "Trust store parse error: {}", msg),
+        }
+    }
+}
+
+impl std::error::Error for TrustStoreError {}
+
+impl From<std::io::Error> for TrustStoreError {
+    fn from(err: std::io::Error) -> Self {
+        TrustStoreError::Io(err)
     }
 }
 

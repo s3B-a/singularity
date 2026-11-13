@@ -1,10 +1,11 @@
-use super::error::{Error, Result};
 use crate::crypto::constant_time_eq;
 use crate::crypto::encoding::pem;
 use crate::crypto::hash::hmac::hmac_sha256;
 use crate::crypto::hash::sha2::sha256;
 use crate::crypto::random;
 use crate::net::http::compression::{self, CompressionAlgorithm, CompressionLevel};
+use super::error::{Error, Result};
+
 use std::collections::VecDeque;
 use std::io;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -116,14 +117,6 @@ pub struct SecureQpackBlobMeta {
     pub issued_at_unix: u64,
 }
 
-#[derive(Debug, Clone)]
-struct DynamicTableEntry {
-    name: String,
-    value: String,
-    size: usize,
-    abs_index: u64,
-}
-
 #[derive(Debug)]
 pub struct QpackEncoder {
     dynamic_table: VecDeque<DynamicTableEntry>,
@@ -141,6 +134,14 @@ pub struct QpackDecoder {
     current_table_size: usize,
     insert_count: u64,
     pending_instructions: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+struct DynamicTableEntry {
+    name: String,
+    value: String,
+    size: usize,
+    abs_index: u64,
 }
 
 impl DynamicTableEntry {

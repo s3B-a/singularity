@@ -6,13 +6,6 @@
 
 use super::sha2::{Sha256, Sha512};
 
-// Trait for hash functions used in HMAC
-pub trait HashFunction: Clone {
-    fn update(&mut self, data: &[u8]);
-    fn finalize_clone(&mut self) -> Vec<u8>;
-    fn reset(&mut self);
-}
-
 // Generic HMAC struct
 #[derive(Clone)]
 pub struct Hmac<H> {
@@ -31,6 +24,13 @@ pub struct HmacSha256 {
 #[derive(Clone)]
 pub struct HmacSha512 {
     inner: Hmac<Sha512>,
+}
+
+// Trait for hash functions used in HMAC
+pub trait HashFunction: Clone {
+    fn update(&mut self, data: &[u8]);
+    fn finalize_clone(&mut self) -> Vec<u8>;
+    fn reset(&mut self);
 }
 
 // Implementation of HMAC for any hash function H that implements the HashFunction trait
@@ -130,6 +130,126 @@ impl<H: Clone> Hmac<H> {
     }
 }
 
+// HMAC-SHA256 convenience functions
+impl HmacSha256 {
+    
+    /**
+     * Create a new HMAC-SHA256 instance with a given key
+     * Args:
+     *    key - &[u8]: The secret key for HMAC
+     * 
+     * Returns:
+     *    Self: New HMAC-SHA256 instance
+     */
+    pub fn new(key: &[u8]) -> Self {
+        HmacSha256 {
+            inner: Hmac::new_with_hasher(Sha256::new(), key, 64),
+        }
+    }
+
+    /**
+     * Update the HMAC-SHA256 with data
+     * Args:
+     *    &mut self: Mutable reference to the HMAC-SHA256 instance
+     *    data - &[u8]: The data to update the HMAC with
+     * 
+     * Returns:
+     *    (): Nothing
+     */
+    pub fn update(&mut self, data: &[u8]) {
+        self.inner.update(data);
+    }
+
+    /**
+     * Finalize the HMAC-SHA256 computation and return the HMAC value
+     * Args:
+     *    self: HMAC-SHA256 instance
+     * 
+     * Returns:
+     *    [u8; 32]: The computed HMAC-SHA256 value
+     */
+    pub fn finalize(self) -> [u8; 32] {
+        let result = self.inner.finalize();
+        let mut output = [0u8; 32];
+        output.copy_from_slice(&result);
+
+        output
+    }
+
+    /**
+     * Verify the HMAC-SHA256 against an expected value
+     * Args:
+     *    self: HMAC-SHA256 instance
+     *    expected - &[u8]: The expected HMAC value to verify against
+     * 
+     * Returns:
+     *    bool: True if the computed HMAC matches the expected value, false otherwise
+     */
+    pub fn verify(self, expected: &[u8]) -> bool {
+        self.inner.verify(expected)
+    }
+}
+
+// HMAC-SHA512 convenience functions
+impl HmacSha512 {
+
+    /**
+     * Create a new HMAC-SHA512 instance with a given key
+     * Args:
+     *    key - &[u8]: The secret key for HMAC
+     * 
+     * Returns:
+     *    Self: new HMAC-SHA512 instance
+     */
+    pub fn new(key: &[u8]) -> Self {
+        HmacSha512 {
+            inner: Hmac::new_with_hasher(Sha512::new(), key, 128),
+        }
+    }
+
+    /**
+     * Update the HMAC-SHA512 with data
+     * Args:
+     *    &mut self: Mutable reference to the HMAC-SHA512 instance
+     *    data - &[u8]: The data to update the HMAC with
+     * 
+     * Returns:
+     *    (): Nothing
+     */
+    pub fn update(&mut self, data: &[u8]) {
+        self.inner.update(data);
+    }
+
+    /**
+     * Finalize the HMAC-SHA512 computation and return the HMAC value
+     * Args:
+     *    self: HMAC-SHA512 instance
+     * 
+     * Returns:
+     *    [u8; 64]: The computed HMAC-SHA512 value
+     */
+    pub fn finalize(self) -> [u8; 64] {
+        let result = self.inner.finalize();
+        let mut output = [0u8; 64];
+        output.copy_from_slice(&result);
+
+        output
+    }
+
+    /**
+     * Verify the HMAC-SHA512 against an expected value
+     * Args:
+     *    self: HMAC-SHA512 instance
+     *    expected - &[u8]: The expected HMAC value to verify against
+     * 
+     * Returns:
+     *    bool: True if the computed HMAC matches the expected value, false otherwise
+     */
+    pub fn verify(self, expected: &[u8]) -> bool {
+        self.inner.verify(expected)
+    }
+}
+
 // Implementation of HashFunction trait for Sha256
 impl HashFunction for Sha256 {
     
@@ -212,66 +332,6 @@ impl HashFunction for Sha512 {
     }
 }
 
-// HMAC-SHA256 convenience functions
-impl HmacSha256 {
-    
-    /**
-     * Create a new HMAC-SHA256 instance with a given key
-     * Args:
-     *    key - &[u8]: The secret key for HMAC
-     * 
-     * Returns:
-     *    Self: New HMAC-SHA256 instance
-     */
-    pub fn new(key: &[u8]) -> Self {
-        HmacSha256 {
-            inner: Hmac::new_with_hasher(Sha256::new(), key, 64),
-        }
-    }
-
-    /**
-     * Update the HMAC-SHA256 with data
-     * Args:
-     *    &mut self: Mutable reference to the HMAC-SHA256 instance
-     *    data - &[u8]: The data to update the HMAC with
-     * 
-     * Returns:
-     *    (): Nothing
-     */
-    pub fn update(&mut self, data: &[u8]) {
-        self.inner.update(data);
-    }
-
-    /**
-     * Finalize the HMAC-SHA256 computation and return the HMAC value
-     * Args:
-     *    self: HMAC-SHA256 instance
-     * 
-     * Returns:
-     *    [u8; 32]: The computed HMAC-SHA256 value
-     */
-    pub fn finalize(self) -> [u8; 32] {
-        let result = self.inner.finalize();
-        let mut output = [0u8; 32];
-        output.copy_from_slice(&result);
-
-        output
-    }
-
-    /**
-     * Verify the HMAC-SHA256 against an expected value
-     * Args:
-     *    self: HMAC-SHA256 instance
-     *    expected - &[u8]: The expected HMAC value to verify against
-     * 
-     * Returns:
-     *    bool: True if the computed HMAC matches the expected value, false otherwise
-     */
-    pub fn verify(self, expected: &[u8]) -> bool {
-        self.inner.verify(expected)
-    }
-}
-
 /**
  * Compute HMAC-SHA256 for given key and data
  * Args:
@@ -286,66 +346,6 @@ pub fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
     hmac.update(data);
 
     hmac.finalize()
-}
-
-// HMAC-SHA512 convenience functions
-impl HmacSha512 {
-
-    /**
-     * Create a new HMAC-SHA512 instance with a given key
-     * Args:
-     *    key - &[u8]: The secret key for HMAC
-     * 
-     * Returns:
-     *    Self: new HMAC-SHA512 instance
-     */
-    pub fn new(key: &[u8]) -> Self {
-        HmacSha512 {
-            inner: Hmac::new_with_hasher(Sha512::new(), key, 128),
-        }
-    }
-
-    /**
-     * Update the HMAC-SHA512 with data
-     * Args:
-     *    &mut self: Mutable reference to the HMAC-SHA512 instance
-     *    data - &[u8]: The data to update the HMAC with
-     * 
-     * Returns:
-     *    (): Nothing
-     */
-    pub fn update(&mut self, data: &[u8]) {
-        self.inner.update(data);
-    }
-
-    /**
-     * Finalize the HMAC-SHA512 computation and return the HMAC value
-     * Args:
-     *    self: HMAC-SHA512 instance
-     * 
-     * Returns:
-     *    [u8; 64]: The computed HMAC-SHA512 value
-     */
-    pub fn finalize(self) -> [u8; 64] {
-        let result = self.inner.finalize();
-        let mut output = [0u8; 64];
-        output.copy_from_slice(&result);
-
-        output
-    }
-
-    /**
-     * Verify the HMAC-SHA512 against an expected value
-     * Args:
-     *    self: HMAC-SHA512 instance
-     *    expected - &[u8]: The expected HMAC value to verify against
-     * 
-     * Returns:
-     *    bool: True if the computed HMAC matches the expected value, false otherwise
-     */
-    pub fn verify(self, expected: &[u8]) -> bool {
-        self.inner.verify(expected)
-    }
 }
 
 /**

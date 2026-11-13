@@ -4,9 +4,13 @@ use crate::crypto::hash::hmac::hmac_sha256;
 use crate::crypto::hash::sha2::sha256;
 use crate::crypto::random;
 use crate::net::http::compression::{self, CompressionAlgorithm, CompressionLevel};
+
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+pub const DEFAULT_URGENCY: u8 = 3;
+pub const MAX_URGENCY: u8 = 7;
 
 const PRIORITY_BLOB_MAGIC: &str = "SINGULARITY_HTTP2_PRIORITY_BLOB_V1";
 const PRIORITY_BLOB_CONTEXT: &str = "SINGULARITY_HTTP2_PRIORITY_BLOB_BINDING_V1";
@@ -40,6 +44,28 @@ pub struct Priority {
     pub stream_dependency: u32,
     pub weight: u8,
     pub exclusive: bool,
+}
+
+#[derive(Debug)]
+pub struct PriorityTree {
+    nodes: HashMap<u32, PriorityNode>,
+    root_children: Vec<u32>,
+    virtual_time: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExtensiblePriority {
+    pub urgency: u8,
+    pub incremental: bool,
+}
+
+#[derive(Debug, Clone)]
+struct PriorityNode {
+    stream_id: u32,
+    weight: u8,
+    parent: u32,
+    children: Vec<u32>,
+    virtual_finish_time: u64,
 }
 
 impl Priority {
@@ -92,25 +118,6 @@ impl Priority {
     }
 }
 
-impl Default for Priority {
-    fn default() -> Self {
-        Self {
-            stream_dependency: 0,
-            weight: 16,
-            exclusive: false,
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-struct PriorityNode {
-    stream_id: u32,
-    weight: u8,
-    parent: u32,
-    children: Vec<u32>,
-    virtual_finish_time: u64,
-}
-
 impl PriorityNode {
     fn new(stream_id: u32, weight: u8, parent: u32) -> Self {
         Self {
@@ -121,13 +128,6 @@ impl PriorityNode {
             virtual_finish_time: 0,
         }
     }
-}
-
-#[derive(Debug)]
-pub struct PriorityTree {
-    nodes: HashMap<u32, PriorityNode>,
-    root_children: Vec<u32>,
-    virtual_time: u64,
 }
 
 impl PriorityTree {
@@ -365,27 +365,6 @@ impl PriorityTree {
     }
 }
 
-impl Default for PriorityTree {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ExtensiblePriority {
-    pub urgency: u8,
-    pub incremental: bool,
-}
-
-pub const DEFAULT_URGENCY: u8 = 3;
-pub const MAX_URGENCY: u8 = 7;
-
-impl Default for ExtensiblePriority {
-    fn default() -> Self {
-        Self { urgency: DEFAULT_URGENCY, incremental: false }
-    }
-}
-
 impl ExtensiblePriority {
     pub fn new(urgency: u8, incremental: bool) -> Self {
         Self { urgency: urgency.min(MAX_URGENCY), incremental }
@@ -429,6 +408,28 @@ impl ExtensiblePriority {
 
     pub fn is_default(&self) -> bool {
         *self == Self::default()
+    }
+}
+
+impl Default for Priority {
+    fn default() -> Self {
+        Self {
+            stream_dependency: 0,
+            weight: 16,
+            exclusive: false,
+        }
+    }
+}
+
+impl Default for PriorityTree {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Default for ExtensiblePriority {
+    fn default() -> Self {
+        Self { urgency: DEFAULT_URGENCY, incremental: false }
     }
 }
 

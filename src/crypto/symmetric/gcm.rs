@@ -25,7 +25,6 @@ struct KaratsubaTable {
     h_mid: u64,
 }
 
-
 impl Gcm {
 
     /**
@@ -610,31 +609,6 @@ impl GcmOptimized {
 }
 
 /**
- * Increments the rightmost 32 bits of the counter block
- * Args:
- *    counter - &mut [u8; 16]: The counter block to increment
- * 
- * Returns:
- *    (): Nothing
- */
-fn increment_counter(counter: &mut [u8; 16]) {
-    let mut val = u32::from_be_bytes([
-        counter[12],
-        counter[13],
-        counter[14],
-        counter[15],
-    ]);
-    
-    val = val.wrapping_add(1);
-    let bytes = val.to_be_bytes();
-
-    counter[12] = bytes[0];
-    counter[13] = bytes[1];
-    counter[14] = bytes[2];
-    counter[15] = bytes[3];
-}
-
-/**
  * Convenience function to encrypt data using AES-GCM
  * Args:
  *    key - &[u8]: The AES encryption key (16, 24, or 32 bytes)
@@ -668,6 +642,31 @@ pub fn aes_gcm_decrypt(key: &[u8], nonce: &[u8], ciphertext_and_tag: &[u8], aad:
     let gcm = Gcm::new(key)?;
 
     gcm.decrypt(nonce, ciphertext_and_tag, aad)
+}
+
+/**
+ * Increments the rightmost 32 bits of the counter block
+ * Args:
+ *    counter - &mut [u8; 16]: The counter block to increment
+ * 
+ * Returns:
+ *    (): Nothing
+ */
+fn increment_counter(counter: &mut [u8; 16]) {
+    let mut val = u32::from_be_bytes([
+        counter[12],
+        counter[13],
+        counter[14],
+        counter[15],
+    ]);
+    
+    val = val.wrapping_add(1);
+    let bytes = val.to_be_bytes();
+
+    counter[12] = bytes[0];
+    counter[13] = bytes[1];
+    counter[14] = bytes[2];
+    counter[15] = bytes[3];
 }
 
 #[cfg(test)]

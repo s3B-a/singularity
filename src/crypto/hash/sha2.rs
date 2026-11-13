@@ -50,6 +50,39 @@ pub struct Sha1 {
     total_len: u64,
 }
 
+// SHA-256
+#[derive(Clone)]
+pub struct Sha256 {
+    state: [u32; 8],
+    buffer: [u8; 64],
+    buffer_len: usize,
+    total_len: u64,
+}
+
+// SHA-224
+#[derive(Clone)]
+pub struct Sha224 {
+    state: [u32; 8],
+    buffer: [u8; 64],
+    buffer_len: usize,
+    total_len: u64,
+}
+
+// SHA-512
+#[derive(Clone)]
+pub struct Sha512 {
+    state: [u64; 8],
+    buffer: [u8; 128],
+    buffer_len: usize,
+    total_len: u128,
+}
+
+// SHA-384
+#[derive(Clone)]
+pub struct Sha384 {
+    inner: Sha512,
+}
+
 impl Sha1 {
     /**
      * Create a new SHA-1 instance
@@ -188,28 +221,6 @@ impl Sha1 {
     }
 }
 
-pub fn sha1(data: &[u8]) -> [u8; 20] {
-    let mut hasher = Sha1::new();
-    hasher.update(data);
-    hasher.finalize()
-}
-
-// Implement Default trait for Sha1
-impl Default for Sha1 {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-// SHA-256
-#[derive(Clone)]
-pub struct Sha256 {
-    state: [u32; 8],
-    buffer: [u8; 64],
-    buffer_len: usize,
-    total_len: u64,
-}
-
 impl Sha256 {
 
     /**
@@ -311,37 +322,6 @@ impl Sha256 {
     }
 }
 
-/**
- * Hash data using SHA-256
- * Args:
- *    data - &[u8]: Input data to hash
- * 
- * Returns:
- *    [u8; 32]: The resulting SHA-256 hash digest
- */
-pub fn sha256(data: &[u8]) -> [u8; 32] {
-    let mut hasher = Sha256::new();
-    hasher.update(data);
-
-    hasher.finalize()
-}
-
-// Implement Default trait for Sha256
-impl Default for Sha256 {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-// SHA-224
-#[derive(Clone)]
-pub struct Sha224 {
-    state: [u32; 8],
-    buffer: [u8; 64],
-    buffer_len: usize,
-    total_len: u64,
-}
-
 impl Sha224 {
 
     /**
@@ -416,37 +396,6 @@ impl Sha224 {
 
         output
     }
-}
-
-/**
- * Hash data using SHA-224
- * Args:
- *    data - &[u8]: Input data to hash
- * 
- * Returns:
- *    [u8; 28]: The resulting SHA-224 hash digest
- */
-pub fn sha224(data: &[u8]) -> [u8; 28] {
-    let mut hasher = Sha224::new();
-    hasher.update(data);
-
-    hasher.finalize()
-}
-
-// Implement Default trait for Sha224
-impl Default for Sha224 {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-// SHA-512
-#[derive(Clone)]
-pub struct Sha512 {
-    state: [u64; 8],
-    buffer: [u8; 128],
-    buffer_len: usize,
-    total_len: u128,
 }
 
 impl Sha512 {
@@ -623,34 +572,6 @@ impl Sha512 {
     }
 }
 
-/**
- * Hash data using SHA-512
- * Args:
- *    data - &[u8]: Input data to hash
- * 
- * Returns:
- *    [u8; 64]: The resulting SHA-512 hash digest
- */
-pub fn sha512(data: &[u8]) -> [u8; 64] {
-    let mut hasher = Sha512::new();
-    hasher.update(data);
-
-    hasher.finalize()
-}
-
-// Implement Default trait for Sha512
-impl Default for Sha512 {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-// SHA-384
-#[derive(Clone)]
-pub struct Sha384 {
-    inner: Sha512,
-}
-
 impl Sha384 {
 
     /**
@@ -704,6 +625,92 @@ impl Sha384 {
     }
 }
 
+// Implement Default trait for Sha1
+impl Default for Sha1 {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// Implement Default trait for Sha256
+impl Default for Sha256 {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// Implement Default trait for Sha224
+impl Default for Sha224 {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// Implement Default trait for Sha512
+impl Default for Sha512 {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// Implement Default trait for Sha384
+impl Default for Sha384 {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+pub fn sha1(data: &[u8]) -> [u8; 20] {
+    let mut hasher = Sha1::new();
+    hasher.update(data);
+    hasher.finalize()
+}
+
+/**
+ * Hash data using SHA-256
+ * Args:
+ *    data - &[u8]: Input data to hash
+ * 
+ * Returns:
+ *    [u8; 32]: The resulting SHA-256 hash digest
+ */
+pub fn sha256(data: &[u8]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(data);
+
+    hasher.finalize()
+}
+
+/**
+ * Hash data using SHA-224
+ * Args:
+ *    data - &[u8]: Input data to hash
+ * 
+ * Returns:
+ *    [u8; 28]: The resulting SHA-224 hash digest
+ */
+pub fn sha224(data: &[u8]) -> [u8; 28] {
+    let mut hasher = Sha224::new();
+    hasher.update(data);
+
+    hasher.finalize()
+}
+
+/**
+ * Hash data using SHA-512
+ * Args:
+ *    data - &[u8]: Input data to hash
+ * 
+ * Returns:
+ *    [u8; 64]: The resulting SHA-512 hash digest
+ */
+pub fn sha512(data: &[u8]) -> [u8; 64] {
+    let mut hasher = Sha512::new();
+    hasher.update(data);
+
+    hasher.finalize()
+}
+
 /**
  * Hash data using SHA-384
  * Args:
@@ -717,13 +724,6 @@ pub fn sha384(data: &[u8]) -> [u8; 48] {
     hasher.update(data);
 
     hasher.finalize()
-}
-
-// Implement Default trait for Sha384
-impl Default for Sha384 {
-    fn default() -> Self {
-        Self::new()
-    }
 }
 
 /**
@@ -873,6 +873,19 @@ fn finalize_sha256_state(state: &mut [u32; 8], buffer: &mut [u8; 64], buffer_len
     process_sha256_block(state, buffer);
 }
 
+mod hex {
+    pub fn decode(s: &str) -> Result<Vec<u8>, ()> {
+        if s.len() % 2 != 0 {
+            return Err(());
+        }
+
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(|_| ()))
+            .collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -924,18 +937,5 @@ mod tests {
         let hash = sha384(b"");
         let expected = hex::decode("38b060a751ac96384cd9327eb1b1e36a21fdb71114be07434c0cc7bf63f6e1da274edebfe76f65fbd51ad2f14898b95b").unwrap();
         assert_eq!(&hash[..], &expected[..]);
-    }
-}
-
-mod hex {
-    pub fn decode(s: &str) -> Result<Vec<u8>, ()> {
-        if s.len() % 2 != 0 {
-            return Err(());
-        }
-
-        (0..s.len())
-            .step_by(2)
-            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(|_| ()))
-            .collect()
     }
 }

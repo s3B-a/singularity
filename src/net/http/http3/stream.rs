@@ -1,11 +1,12 @@
-use super::error::{Error, ErrorCode, Result};
-use super::frame::Frame;
 use crate::crypto::constant_time_eq;
 use crate::crypto::encoding::pem;
 use crate::crypto::hash::hmac::hmac_sha256;
 use crate::crypto::hash::sha2::sha256;
 use crate::crypto::random;
 use crate::net::http::compression::{self, CompressionAlgorithm, CompressionLevel};
+use super::error::{Error, ErrorCode, Result};
+use super::frame::Frame;
+
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fmt;
 use std::io;
@@ -27,12 +28,49 @@ pub struct SecureStreamBlobMeta {
     pub issued_at_unix: u64,
 }
 
+#[derive(Debug)]
+pub struct Stream {
+    id: StreamId,
+    stream_type: StreamType,
+    state: StreamState,
+    send_buffer: VecDeque<u8>,
+    send_offset: u64,
+    send_max_offset: u64,
+    send_final_offset: Option<u64>,
+    receive_buffer: VecDeque<u8>,
+    receive_offset: u64,
+    receive_max_offset: u64,
+    receive_final_offset: Option<u64>,
+    receive_chunks: BTreeMap<u64, DataChunk>,
+    fin_queued: bool,
+    fin_sent: bool,
+    fin_received: bool,
+    priority: u8,
+    error_code: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+struct DataChunk {
+    offset: u64,
+    data: Vec<u8>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum StreamType {
     ClientBidirectional,
     ServerBidirectional,
     ClientUnidirectional,
     ServerUnidirectional,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamState {
+    Open,
+    SendClosed,
+    ReceivedClosed,
+    Closed,
+    ResetSent,
+    ResetReceived,
 }
 
 impl StreamType {
@@ -63,16 +101,6 @@ impl StreamType {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StreamState {
-    Open,
-    SendClosed,
-    ReceivedClosed,
-    Closed,
-    ResetSent,
-    ResetReceived,
-}
-
 impl StreamState {
     pub fn can_send(&self) -> bool {
         matches!(self, StreamState::Open)
@@ -85,33 +113,6 @@ impl StreamState {
     pub fn is_closed(&self) -> bool {
         matches!(self, StreamState::Closed | StreamState::ResetSent | StreamState::ResetReceived)
     }
-}
-
-#[derive(Debug, Clone)]
-struct DataChunk {
-    offset: u64,
-    data: Vec<u8>,
-}
-
-#[derive(Debug)]
-pub struct Stream {
-    id: StreamId,
-    stream_type: StreamType,
-    state: StreamState,
-    send_buffer: VecDeque<u8>,
-    send_offset: u64,
-    send_max_offset: u64,
-    send_final_offset: Option<u64>,
-    receive_buffer: VecDeque<u8>,
-    receive_offset: u64,
-    receive_max_offset: u64,
-    receive_final_offset: Option<u64>,
-    receive_chunks: BTreeMap<u64, DataChunk>,
-    fin_queued: bool,
-    fin_sent: bool,
-    fin_received: bool,
-    priority: u8,
-    error_code: Option<u64>,
 }
 
 impl Stream {
@@ -547,6 +548,30 @@ impl Stream {
 
         let stream = deserialize_stream(&raw_payload)?;
         Ok((meta, stream))
+    }
+}
+
+impl fmt::Display for StreamType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            StreamType::ClientBidirectional => write!(f, "ClientBidi"),
+            StreamType::ServerBidirectional => write!(f, "ServerBidi"),
+            StreamType::ClientUnidirectional => write!(f, "ClientUni"),
+            StreamType::ServerUnidirectional => write!(f, "ServerUni"),
+        }
+    }
+}
+
+impl fmt::Display for StreamState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            StreamState::Open => write!(f, "Open"),
+            StreamState::SendClosed => write!(f, "SendClosed"),
+            StreamState::ReceivedClosed => write!(f, "ReceivedClosed"),
+            StreamState::Closed => write!(f, "Closed"),
+            StreamState::ResetSent => write!(f, "ResetSent"),
+            StreamState::ResetReceived => write!(f, "ResetReceived"),
+        }
     }
 }
 
@@ -986,30 +1011,6 @@ fn parse_secure_stream_meta(header: &str, body_len: usize) -> io::Result<SecureS
     }
 
     Ok(meta)
-}
-
-impl fmt::Display for StreamType {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            StreamType::ClientBidirectional => write!(f, "ClientBidi"),
-            StreamType::ServerBidirectional => write!(f, "ServerBidi"),
-            StreamType::ClientUnidirectional => write!(f, "ClientUni"),
-            StreamType::ServerUnidirectional => write!(f, "ServerUni"),
-        }
-    }
-}
-
-impl fmt::Display for StreamState {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            StreamState::Open => write!(f, "Open"),
-            StreamState::SendClosed => write!(f, "SendClosed"),
-            StreamState::ReceivedClosed => write!(f, "ReceivedClosed"),
-            StreamState::Closed => write!(f, "Closed"),
-            StreamState::ResetSent => write!(f, "ResetSent"),
-            StreamState::ResetReceived => write!(f, "ResetReceived"),
-        }
-    }
 }
 
 #[cfg(test)]

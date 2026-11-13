@@ -1,10 +1,11 @@
-use super::utils::{adler32, BitReader, BitWriter, SlidingWindow};
-use super::{CompressionAlgorithm, CompressionLevel, Compressor, Decompressor};
 use crate::crypto::constant_time_eq;
 use crate::crypto::encoding::pem;
 use crate::crypto::hash::hmac::hmac_sha256;
 use crate::crypto::hash::sha2::sha256;
 use crate::crypto::random;
+use super::utils::{adler32, BitReader, BitWriter, SlidingWindow};
+use super::{CompressionAlgorithm, CompressionLevel, Compressor, Decompressor};
+
 use std::io;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -75,6 +76,16 @@ pub struct SecureDeflateBlobMeta {
     pub raw_size: usize,
     pub encoded_size: usize,
     pub issued_at_unix: u64,
+}
+
+pub struct DeflateCompressor {
+    level: CompressionLevel,
+    window: SlidingWindow,
+}
+
+pub struct DeflateDecompressor {
+    window: SlidingWindow,
+    max_output_size: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -148,11 +159,6 @@ impl HuffmanTree {
 
         None
     }
-}
-
-pub struct DeflateCompressor {
-    level: CompressionLevel,
-    window: SlidingWindow,
 }
 
 impl DeflateCompressor {
@@ -259,11 +265,6 @@ impl DeflateCompressor {
 
         (29, 0, 0)
     }
-}
-
-pub struct DeflateDecompressor {
-    window: SlidingWindow,
-    max_output_size: Option<usize>,
 }
 
 impl DeflateDecompressor {
@@ -557,6 +558,73 @@ impl DeflateDecompressor {
     }
 }
 
+impl Compressor for DeflateCompressor {
+    fn compress(&mut self, input: &[u8]) -> io::Result<Vec<u8>> {
+        self.window.clear();
+        let _ = self.level;
+        if input.is_empty() {
+            return self.compress_block(&[], true);
+        }
+
+        let mut out = Vec::new();
+        let chunks: Vec<&[u8]> = input.chunks(MAX_UNCOMPRESSED_BLOCK_LEN).collect();
+
+        for (i, chunk) in chunks.iter().enumerate() {
+            let final_block = i + 1 == chunks.len();
+            let block = self.compress_block(chunk, final_block)?;
+            out.extend_from_slice(&block);
+        }
+
+        Ok(out)
+    }
+
+    fn compress_stream(&mut self, input: &[u8], output: &mut Vec<u8>) -> io::Result<()> {
+        for chunk in input.chunks(MAX_UNCOMPRESSED_BLOCK_LEN) {
+            let block = self.compress_block(chunk, false)?;
+            output.extend_from_slice(&block);
+        }
+        Ok(())
+    }
+
+    fn finish(&mut self) -> io::Result<Vec<u8>> {
+        Ok(Vec::new())
+    }
+
+    fn reset(&mut self) {
+        self.window.clear();
+    }
+}
+
+impl Decompressor for DeflateDecompressor {
+    fn decompress(&mut self, input: &[u8]) -> io::Result<Vec<u8>> {
+        let mut reader = BitReader::new(input);
+        self.window.clear();
+        self.decompress_block(&mut reader)
+    }
+
+    fn decompress_stream(&mut self, input: &[u8], output: &mut Vec<u8>) -> io::Result<()> {
+        let mut reader = BitReader::new(input);
+        let result = self.decompress_block(&mut reader)?;
+        output.extend_from_slice(&result);
+
+        Ok(())
+    }
+
+    fn finish(&mut self) -> io::Result<Vec<u8>> {
+        Ok(Vec::new())
+    }
+
+    fn reset(&mut self) {
+        self.window.clear();
+    }
+}
+
+impl Default for DeflateDecompressor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 pub fn select_secure_deflate_algorithm(accept_encoding: &str) -> CompressionAlgorithm {
     let parsed = super::parse_accept_encoding(accept_encoding);
     for (algorithm, quality) in &parsed {
@@ -699,73 +767,6 @@ pub fn decode_secure_deflate_payload(data: &[u8]) -> io::Result<(SecureDeflateBl
     }
 
     Ok((meta, raw_payload))
-}
-
-impl Compressor for DeflateCompressor {
-    fn compress(&mut self, input: &[u8]) -> io::Result<Vec<u8>> {
-        self.window.clear();
-        let _ = self.level;
-        if input.is_empty() {
-            return self.compress_block(&[], true);
-        }
-
-        let mut out = Vec::new();
-        let chunks: Vec<&[u8]> = input.chunks(MAX_UNCOMPRESSED_BLOCK_LEN).collect();
-
-        for (i, chunk) in chunks.iter().enumerate() {
-            let final_block = i + 1 == chunks.len();
-            let block = self.compress_block(chunk, final_block)?;
-            out.extend_from_slice(&block);
-        }
-
-        Ok(out)
-    }
-
-    fn compress_stream(&mut self, input: &[u8], output: &mut Vec<u8>) -> io::Result<()> {
-        for chunk in input.chunks(MAX_UNCOMPRESSED_BLOCK_LEN) {
-            let block = self.compress_block(chunk, false)?;
-            output.extend_from_slice(&block);
-        }
-        Ok(())
-    }
-
-    fn finish(&mut self) -> io::Result<Vec<u8>> {
-        Ok(Vec::new())
-    }
-
-    fn reset(&mut self) {
-        self.window.clear();
-    }
-}
-
-impl Decompressor for DeflateDecompressor {
-    fn decompress(&mut self, input: &[u8]) -> io::Result<Vec<u8>> {
-        let mut reader = BitReader::new(input);
-        self.window.clear();
-        self.decompress_block(&mut reader)
-    }
-
-    fn decompress_stream(&mut self, input: &[u8], output: &mut Vec<u8>) -> io::Result<()> {
-        let mut reader = BitReader::new(input);
-        let result = self.decompress_block(&mut reader)?;
-        output.extend_from_slice(&result);
-
-        Ok(())
-    }
-
-    fn finish(&mut self) -> io::Result<Vec<u8>> {
-        Ok(Vec::new())
-    }
-
-    fn reset(&mut self) {
-        self.window.clear();
-    }
-}
-
-impl Default for DeflateDecompressor {
-    fn default() -> Self {
-        Self::new()
-    }
 }
 
 pub fn compress(data: &[u8], level: CompressionLevel) -> io::Result<Vec<u8>> {

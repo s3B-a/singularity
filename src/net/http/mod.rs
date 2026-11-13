@@ -48,9 +48,6 @@ pub const MAX_REDIRECTS: usize = 10;
 pub const DEFAULT_TIMEOUT_SECS: u64 = 30;
 pub const DEFAULT_ACCEPT_ENCODING: &str = "br, zstd, gzip, deflate, identity";
 
-#[cfg(test)]
-mod tests;
-
 pub mod advanced {
     pub use super::http2::{
         Http2Connection,
@@ -72,3 +69,6 @@ pub mod advanced {
         ErrorCode as Http3ErrorCode,
     };
 }
+
+#[cfg(test)]
+mod tests;

@@ -1,7 +1,3 @@
-use std::collections::HashMap;
-use std::io::{Read, Write};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-
 use crate::crypto::constant_time_eq;
 use crate::crypto::encoding::pem;
 use crate::crypto::hash::hmac::hmac_sha256;
@@ -16,23 +12,14 @@ use crate::net::https::tls::{TlsCfg, TlsError, TlsStream};
 use crate::net::tcp::TcpStream;
 use crate::net::https::{decode_secure_https_payload, encode_secure_https_payload_auto};
 
+use std::collections::HashMap;
+use std::io::{Read, Write};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
 const HTTPS_CLIENT_STATE_BLOB_MAGIC: &str = "SINGULARITY_HTTPS_CLIENT_STATE_BLOB_V1";
 const HTTPS_CLIENT_STATE_CONTEXT: &str = "SINGULARITY_HTTPS_CLIENT_STATE_BINDING_V1";
 const HTTPS_CLIENT_REQUEST_TAG_CONTEXT: &str = "SINGULARITY_HTTPS_CLIENT_REQUEST_TAG_V1";
 const HTTPS_CLIENT_RESPONSE_TAG_CONTEXT: &str = "SINGULARITY_HTTPS_CLIENT_RESPONSE_TAG_V1";
-
-#[derive(Debug)]
-pub enum HttpsError {
-    Tls(TlsError),
-    Io(std::io::Error),
-    InvalidUrl(String),
-    InvalidResponse(String),
-    Timeout,
-    ConnectionFailed(String),
-    TooManyRedirects,
-    ProtocolNegotiationFailed(String),
-    Http2Error(String),
-}
 
 #[derive(Debug, Clone)]
 pub struct HttpsClientCfg {
@@ -47,30 +34,6 @@ pub struct HttpsClientCfg {
     pub request_compression_min_size: usize,
     pub request_compression_level: CompressionLevel,
     pub preferred_request_compression: CompressionAlgorithm,
-}
-
-impl Default for HttpsClientCfg {
-    fn default() -> Self {
-        let mut default_headers = Headers::new();
-        default_headers.insert("User-Agent", "singularity-https-client/0.1.0");
-        default_headers.insert("Accept", "*/*");
-        default_headers.insert("Accept-Encoding", "br, zstd, gzip, deflate, identity");
-        default_headers.insert("Connection", "keep-alive");
-
-        Self {
-            tls_cfg: TlsCfg::default(),
-            timeout: Duration::from_secs(30),
-            follow_redirect: true,
-            max_redirects: 10,
-            user_agent: "singularity-https-client/0.1.0".to_string(),
-            default_headers,
-            enable_secure_envelopes: true,
-            enforce_response_integrity: false,
-            request_compression_min_size: 1024,
-            request_compression_level: CompressionLevel::Default,
-            preferred_request_compression: CompressionAlgorithm::Identity,
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -91,6 +54,14 @@ pub struct HttpsClientStateSnapshot {
     pub negotiated_protocols: HashMap<String, AlpnProtocol>,
 }
 
+pub struct HttpsClient {
+    cfg: HttpsClientCfg,
+    connection_pool: ConnectionPool,
+    alpn_negotiator: AlpnNegotiator,
+    tls_connections: HashMap<String, TlsStreamWrapper>,
+    negotiated_protocols: HashMap<String, AlpnProtocol>,
+}
+
 #[derive(Debug, Clone)]
 struct Http2ConnectionWrapper {
     next_stream_id: u32,
@@ -106,12 +77,17 @@ struct TlsStreamWrapper {
     http2_conn: Option<Http2ConnectionWrapper>,
 }
 
-pub struct HttpsClient {
-    cfg: HttpsClientCfg,
-    connection_pool: ConnectionPool,
-    alpn_negotiator: AlpnNegotiator,
-    tls_connections: HashMap<String, TlsStreamWrapper>,
-    negotiated_protocols: HashMap<String, AlpnProtocol>,
+#[derive(Debug)]
+pub enum HttpsError {
+    Tls(TlsError),
+    Io(std::io::Error),
+    InvalidUrl(String),
+    InvalidResponse(String),
+    Timeout,
+    ConnectionFailed(String),
+    TooManyRedirects,
+    ProtocolNegotiationFailed(String),
+    Http2Error(String),
 }
 
 impl HttpsClient {
@@ -978,6 +954,30 @@ impl HttpsClient {
         }
 
         Ok((header_block, body))
+    }
+}
+
+impl Default for HttpsClientCfg {
+    fn default() -> Self {
+        let mut default_headers = Headers::new();
+        default_headers.insert("User-Agent", "singularity-https-client/0.1.0");
+        default_headers.insert("Accept", "*/*");
+        default_headers.insert("Accept-Encoding", "br, zstd, gzip, deflate, identity");
+        default_headers.insert("Connection", "keep-alive");
+
+        Self {
+            tls_cfg: TlsCfg::default(),
+            timeout: Duration::from_secs(30),
+            follow_redirect: true,
+            max_redirects: 10,
+            user_agent: "singularity-https-client/0.1.0".to_string(),
+            default_headers,
+            enable_secure_envelopes: true,
+            enforce_response_integrity: false,
+            request_compression_min_size: 1024,
+            request_compression_level: CompressionLevel::Default,
+            preferred_request_compression: CompressionAlgorithm::Identity,
+        }
     }
 }
 

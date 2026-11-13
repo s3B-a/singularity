@@ -1,59 +1,14 @@
-use super::record::{DnsRecord, RecordClass, RecordData, RecordType};
 use crate::crypto::constant_time_eq;
 use crate::crypto::encoding::pem;
 use crate::crypto::hash::sha2::sha256;
 use crate::crypto::random;
 use crate::net::http::compression::{self, CompressionAlgorithm, CompressionLevel};
+use super::record::{DnsRecord, RecordClass, RecordData, RecordType};
+
 use std::io::{self, Cursor, Read, Write};
 use std::net::{Ipv4Addr, Ipv6Addr};
 
 const DNS_PACKET_BLOB_MAGIC: &str = "SINGULARITY_DNS_PACKET_BLOB_V1";
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OpCode {
-    Query = 0,
-    IQuery = 1,
-    Status = 2,
-    Notify = 4,
-    Update = 5,
-}
-
-impl OpCode {
-    pub fn from_u8(value: u8) -> Option<Self> {
-        match value {
-            0 => Some(OpCode::Query),
-            1 => Some(OpCode::IQuery),
-            2 => Some(OpCode::Status),
-            4 => Some(OpCode::Notify),
-            5 => Some(OpCode::Update),
-            _ => None,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ResponseCode {
-    NoError = 0,
-    FormatError = 1,
-    ServerFailure = 2,
-    NameError = 3,
-    NotImplemented = 4,
-    Refused = 5,
-}
-
-impl ResponseCode {
-    pub fn from_u8(value: u8) -> Self {
-        match value {
-            0 => ResponseCode::NoError,
-            1 => ResponseCode::FormatError,
-            2 => ResponseCode::ServerFailure,
-            3 => ResponseCode::NameError,
-            4 => ResponseCode::NotImplemented,
-            5 => ResponseCode::Refused,
-            _ => ResponseCode::NoError,
-        }
-    }
-}
 
 #[derive(Debug, Clone)]
 pub struct DnsHeader {
@@ -69,6 +24,77 @@ pub struct DnsHeader {
     pub answer_count: u16,
     pub authority_count: u16,
     pub additional_count: u16,
+}
+
+#[derive(Debug, Clone)]
+pub struct DnsQuestion {
+    pub name: String,
+    pub record_type: RecordType,
+    pub record_class: RecordClass,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SecureDnsPacketBlobMeta {
+    pub algorithm: CompressionAlgorithm,
+    pub nonce_b64: String,
+    pub digest_b64: String,
+    pub raw_size: usize,
+    pub encoded_size: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct DnsPacket {
+    pub header: DnsHeader,
+    pub questions: Vec<DnsQuestion>,
+    pub answers: Vec<DnsRecord>,
+    pub authority: Vec<DnsRecord>,
+    pub additional: Vec<DnsRecord>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpCode {
+    Query = 0,
+    IQuery = 1,
+    Status = 2,
+    Notify = 4,
+    Update = 5,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResponseCode {
+    NoError = 0,
+    FormatError = 1,
+    ServerFailure = 2,
+    NameError = 3,
+    NotImplemented = 4,
+    Refused = 5,
+}
+
+impl OpCode {
+    pub fn from_u8(value: u8) -> Option<Self> {
+        match value {
+            0 => Some(OpCode::Query),
+            1 => Some(OpCode::IQuery),
+            2 => Some(OpCode::Status),
+            4 => Some(OpCode::Notify),
+            5 => Some(OpCode::Update),
+            _ => None,
+        }
+    }
+}
+
+impl ResponseCode {
+    pub fn from_u8(value: u8) -> Self {
+        match value {
+            0 => ResponseCode::NoError,
+            1 => ResponseCode::FormatError,
+            2 => ResponseCode::ServerFailure,
+            3 => ResponseCode::NameError,
+            4 => ResponseCode::NotImplemented,
+            5 => ResponseCode::Refused,
+            _ => ResponseCode::NoError,
+        }
+    }
 }
 
 impl DnsHeader {
@@ -159,13 +185,6 @@ impl DnsHeader {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct DnsQuestion {
-    pub name: String,
-    pub record_type: RecordType,
-    pub record_class: RecordClass,
-}
-
 impl DnsQuestion {
     pub fn new(name: String, record_type: RecordType) -> Self {
         Self {
@@ -197,24 +216,6 @@ impl DnsQuestion {
             record_class,
         })
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SecureDnsPacketBlobMeta {
-    pub algorithm: CompressionAlgorithm,
-    pub nonce_b64: String,
-    pub digest_b64: String,
-    pub raw_size: usize,
-    pub encoded_size: usize,
-}
-
-#[derive(Debug, Clone)]
-pub struct DnsPacket {
-    pub header: DnsHeader,
-    pub questions: Vec<DnsQuestion>,
-    pub answers: Vec<DnsRecord>,
-    pub authority: Vec<DnsRecord>,
-    pub additional: Vec<DnsRecord>,
 }
 
 impl DnsPacket {

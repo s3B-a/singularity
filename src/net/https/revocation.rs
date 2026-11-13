@@ -1,6 +1,7 @@
 use crate::crypto::encoding::x509::Certificate;
 use crate::crypto::encoding::x509_crl::CertificateList;
 use crate::net::http::client::HttpClient;
+
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -8,23 +9,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 const MAX_CRL_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
 const CRL_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RevocationPolicy {
-    SoftFail,
-    HardFail,
-}
-
-impl Default for RevocationPolicy {
-    fn default() -> Self {
-        RevocationPolicy::SoftFail
-    }
-}
-
-#[derive(Debug)]
-pub enum RevocationStatus {
-    Good,
-    Revoked,
-    Unknown(String),
+#[derive(Debug, Clone, Default)]
+pub struct CrlCache {
+    entries: Arc<Mutex<HashMap<String, CachedCrl>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -32,9 +19,17 @@ struct CachedCrl {
     list: CertificateList,
 }
 
-#[derive(Debug, Clone, Default)]
-pub struct CrlCache {
-    entries: Arc<Mutex<HashMap<String, CachedCrl>>>,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RevocationPolicy {
+    SoftFail,
+    HardFail,
+}
+
+#[derive(Debug)]
+pub enum RevocationStatus {
+    Good,
+    Revoked,
+    Unknown(String),
 }
 
 impl CrlCache {
@@ -55,17 +50,10 @@ impl CrlCache {
     }
 }
 
-fn unix_now() -> i64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
-}
-
-fn hex_encode(bytes: &[u8]) -> String {
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        s.push_str(&format!("{:02x}", b));
+impl Default for RevocationPolicy {
+    fn default() -> Self {
+        RevocationPolicy::SoftFail
     }
-
-    s
 }
 
 pub fn check_revocation(cert: &Certificate, issuer: &Certificate, cache: &CrlCache) -> RevocationStatus {
@@ -108,6 +96,19 @@ pub fn check_revocation(cert: &Certificate, issuer: &Certificate, cache: &CrlCac
     }
 
     RevocationStatus::Unknown(last_error)
+}
+
+fn unix_now() -> i64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        s.push_str(&format!("{:02x}", b));
+    }
+
+    s
 }
 
 fn fetch_and_verify_crl(url: &str, issuer: &Certificate, now: i64) -> Result<CertificateList, String> {

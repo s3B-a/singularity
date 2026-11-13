@@ -17,10 +17,62 @@ const ROTATIONS: [u32; 24] = [
     1, 3, 6, 10, 15, 21, 28, 36, 45, 55, 2, 14, 27, 41, 56, 8, 25, 43, 62, 18, 39, 61, 20, 44,
 ];
 
+// SHA3-256
+#[derive(Clone)]
+pub struct Sha3_256 {
+    inner: Keccak,
+}
+
+// SHA3-224
+#[derive(Clone)]
+pub struct Sha3_224 {
+    inner: Keccak,
+}
+
+// SHA3-384
+#[derive(Clone)]
+pub struct Sha3_384 {
+    inner: Keccak,
+}
+
+// SHA3-512
+#[derive(Clone)]
+pub struct Sha3_512 {
+    inner: Keccak,
+}
+
+// Keccak-256
+#[derive(Clone)]
+pub struct Keccak256 {
+    inner: Keccak,
+}
+
+// SHAKE128
+#[derive(Clone)]
+pub struct Shake128 {
+    inner: Keccak,
+}
+
+// SHAKE256
+#[derive(Clone)]
+pub struct Shake256 {
+    inner: Keccak,
+}
+
 // Keccak state
 #[derive(Clone)]
 struct KeccakState {
     state: [u64; 25],
+}
+
+// Keccak sponge construction
+#[derive(Clone)]
+struct Keccak {
+    state: KeccakState,
+    buffer: Vec<u8>,
+    rate: usize,
+    output_len: usize,
+    delim: u8,
 }
 
 impl KeccakState {
@@ -162,16 +214,6 @@ impl KeccakState {
     }
 }
 
-// Keccak sponge construction
-#[derive(Clone)]
-struct Keccak {
-    state: KeccakState,
-    buffer: Vec<u8>,
-    rate: usize,
-    output_len: usize,
-    delim: u8,
-}
-
 impl Keccak {
 
     /**
@@ -236,12 +278,6 @@ impl Keccak {
     }
 }
 
-// SHA3-256
-#[derive(Clone)]
-pub struct Sha3_256 {
-    inner: Keccak,
-}
-
 impl Sha3_256 {
 
     /**
@@ -285,33 +321,6 @@ impl Sha3_256 {
         output.copy_from_slice(&result);
         output
     }
-}
-
-/**
- * Hash data using SHA3-256
- * Args:
- *    data - &[u8]: Input data to hash
- * 
- * Returns:
- *    [u8; 32]: The resulting SHA3-256 hash digest
- */
-pub fn sha3_256(data: &[u8]) -> [u8; 32] {
-    let mut hasher = Sha3_256::new();
-    hasher.update(data);
-    hasher.finalize()
-}
-
-// Implement Default trait for Sha3_256
-impl Default for Sha3_256 {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-// SHA3-224
-#[derive(Clone)]
-pub struct Sha3_224 {
-    inner: Keccak,
 }
 
 impl Sha3_224 {
@@ -359,33 +368,6 @@ impl Sha3_224 {
     }
 }
 
-/**
- * Hash data using SHA3-224
- * Args:
- *    data - &[u8]: Input data to hash
- * 
- * Returns:
- *    [u8; 28]: The resulting SHA3-224 hash digest
- */
-pub fn sha3_224(data: &[u8]) -> [u8; 28] {
-    let mut hasher = Sha3_224::new();
-    hasher.update(data);
-    hasher.finalize()
-}
-
-// Implement Default trait for Sha3_224
-impl Default for Sha3_224 {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-// SHA3-384
-#[derive(Clone)]
-pub struct Sha3_384 {
-    inner: Keccak,
-}
-
 impl Sha3_384 {
 
     /**
@@ -429,33 +411,6 @@ impl Sha3_384 {
         output.copy_from_slice(&result);
         output
     }
-}
-
-/**
- * Hash data using SHA3-384
- * Args:
- *    data - &[u8]: Input data to hash
- * 
- * Returns:
- *    [u8; 48]: The resulting SHA3-384 hash digest
- */
-pub fn sha3_384(data: &[u8]) -> [u8; 48] {
-    let mut hasher = Sha3_384::new();
-    hasher.update(data);
-    hasher.finalize()
-}
-
-// Implement Default trait for Sha3_384
-impl Default for Sha3_384 {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-// SHA3-512
-#[derive(Clone)]
-pub struct Sha3_512 {
-    inner: Keccak,
 }
 
 impl Sha3_512 {
@@ -503,33 +458,6 @@ impl Sha3_512 {
     }
 }
 
-/**
- * Hash data using SHA3-512
- * Args:
- *    data - &[u8]: Input data to hash
- * 
- * Returns:
- *    [u8; 64]: The resulting SHA3-512 hash digest
- */
-pub fn sha3_512(data: &[u8]) -> [u8; 64] {
-    let mut hasher = Sha3_512::new();
-    hasher.update(data);
-    hasher.finalize()
-}
-
-// Implement Default trait for Sha3_512
-impl Default for Sha3_512 {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-// Keccak-256
-#[derive(Clone)]
-pub struct Keccak256 {
-    inner: Keccak,
-}
-
 impl Keccak256 {
     
     /**
@@ -573,33 +501,6 @@ impl Keccak256 {
         output.copy_from_slice(&result);
         output
     }
-}
-
-/**
- * Hash data using Keccak256
- * Args:
- *    data - &[u8]: Input data to hash
- * 
- * Returns:
- *    [u8; 32]: The resulting Keccak256 hash digest
- */
-pub fn keccak256(data: &[u8]) -> [u8; 32] {
-    let mut hasher = Keccak256::new();
-    hasher.update(data);
-    hasher.finalize()
-}
-
-// Implement Default trait for Keccak256
-impl Default for Keccak256 {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-// SHAKE128
-#[derive(Clone)]
-pub struct Shake128 {
-    inner: Keccak,
 }
 
 impl Shake128 {
@@ -646,34 +547,6 @@ impl Shake128 {
     }
 }
 
-/**
- * Hash data using SHAKE128
- * Args:
- *    data - &[u8]: Input data to hash
- *    output_len - usize: Desired output length in bytes
- * 
- * Returns:
- *    Vec<u8>: The resulting hash digest
- */
-pub fn shake128(data: &[u8], output_len: usize) -> Vec<u8> {
-    let mut hasher = Shake128::new();
-    hasher.update(data);
-    hasher.finalize(output_len)
-}
-
-// Implement Default trait for Shake128
-impl Default for Shake128 {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-// SHAKE256
-#[derive(Clone)]
-pub struct Shake256 {
-    inner: Keccak,
-}
-
 impl Shake256 {
 
     /**
@@ -718,6 +591,140 @@ impl Shake256 {
     }
 }
 
+// Implement Default trait for Sha3_256
+impl Default for Sha3_256 {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// Implement Default trait for Sha3_224
+impl Default for Sha3_224 {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// Implement Default trait for Sha3_384
+impl Default for Sha3_384 {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// Implement Default trait for Sha3_512
+impl Default for Sha3_512 {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// Implement Default trait for Keccak256
+impl Default for Keccak256 {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// Implement Default trait for Shake128
+impl Default for Shake128 {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// Implement Default trait for Shake256
+impl Default for Shake256 {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/**
+ * Hash data using SHA3-256
+ * Args:
+ *    data - &[u8]: Input data to hash
+ * 
+ * Returns:
+ *    [u8; 32]: The resulting SHA3-256 hash digest
+ */
+pub fn sha3_256(data: &[u8]) -> [u8; 32] {
+    let mut hasher = Sha3_256::new();
+    hasher.update(data);
+    hasher.finalize()
+}
+
+/**
+ * Hash data using SHA3-224
+ * Args:
+ *    data - &[u8]: Input data to hash
+ * 
+ * Returns:
+ *    [u8; 28]: The resulting SHA3-224 hash digest
+ */
+pub fn sha3_224(data: &[u8]) -> [u8; 28] {
+    let mut hasher = Sha3_224::new();
+    hasher.update(data);
+    hasher.finalize()
+}
+
+/**
+ * Hash data using SHA3-384
+ * Args:
+ *    data - &[u8]: Input data to hash
+ * 
+ * Returns:
+ *    [u8; 48]: The resulting SHA3-384 hash digest
+ */
+pub fn sha3_384(data: &[u8]) -> [u8; 48] {
+    let mut hasher = Sha3_384::new();
+    hasher.update(data);
+    hasher.finalize()
+}
+
+/**
+ * Hash data using SHA3-512
+ * Args:
+ *    data - &[u8]: Input data to hash
+ * 
+ * Returns:
+ *    [u8; 64]: The resulting SHA3-512 hash digest
+ */
+pub fn sha3_512(data: &[u8]) -> [u8; 64] {
+    let mut hasher = Sha3_512::new();
+    hasher.update(data);
+    hasher.finalize()
+}
+
+/**
+ * Hash data using Keccak256
+ * Args:
+ *    data - &[u8]: Input data to hash
+ * 
+ * Returns:
+ *    [u8; 32]: The resulting Keccak256 hash digest
+ */
+pub fn keccak256(data: &[u8]) -> [u8; 32] {
+    let mut hasher = Keccak256::new();
+    hasher.update(data);
+    hasher.finalize()
+}
+
+/**
+ * Hash data using SHAKE128
+ * Args:
+ *    data - &[u8]: Input data to hash
+ *    output_len - usize: Desired output length in bytes
+ * 
+ * Returns:
+ *    Vec<u8>: The resulting hash digest
+ */
+pub fn shake128(data: &[u8], output_len: usize) -> Vec<u8> {
+    let mut hasher = Shake128::new();
+    hasher.update(data);
+    hasher.finalize(output_len)
+}
+
 /**
  * Hash data using SHAKE256
  * Args:
@@ -731,13 +738,6 @@ pub fn shake256(data: &[u8], output_len: usize) -> Vec<u8> {
     let mut hasher = Shake256::new();
     hasher.update(data);
     hasher.finalize(output_len)
-}
-
-// Implement Default trait for Shake256
-impl Default for Shake256 {
-    fn default() -> Self {
-        Self::new()
-    }
 }
 
 mod hex {

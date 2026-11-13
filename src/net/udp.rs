@@ -4,6 +4,7 @@ use crate::crypto::hash::hmac::hmac_sha256;
 use crate::crypto::hash::sha2::sha256;
 use crate::crypto::random;
 use crate::net::http::compression::{self, CompressionAlgorithm, CompressionLevel};
+
 use std::io;
 use std::net::{SocketAddr, ToSocketAddrs, UdpSocket as StdUdpSocket};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -39,6 +40,153 @@ pub struct UdpCompressionCfg {
 
 pub struct UdpSocket {
     socket: StdUdpSocket,
+}
+
+impl UdpSocket {
+    pub fn bind<A: ToSocketAddrs>(addr: A) -> io::Result<Self> {
+        let socket = StdUdpSocket::bind(addr)?;
+        Ok(Self { socket })
+    }
+
+    pub fn send_to(&self, buf: &[u8], addr: SocketAddr) -> io::Result<usize> {
+        self.socket.send_to(buf, addr)
+    }
+
+    pub fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+        self.socket.recv_from(buf)
+    }
+
+    pub fn connect<A: ToSocketAddrs>(&self, addr: A) -> io::Result<()> {
+        self.socket.connect(addr)
+    }
+
+    pub fn send(&self, buf: &[u8]) -> io::Result<usize> {
+        self.socket.send(buf)
+    }
+
+    pub fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
+        self.socket.recv(buf)
+    }
+
+    pub fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        self.socket.set_read_timeout(timeout)
+    }
+
+    pub fn set_write_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        self.socket.set_write_timeout(timeout)
+    }
+
+    pub fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.socket.local_addr()
+    }
+
+    pub fn set_broadcast(&self, broadcast: bool) -> io::Result<()> {
+        self.socket.set_broadcast(broadcast)
+    }
+
+    pub fn try_clone(&self) -> io::Result<Self> {
+        Ok(Self {
+            socket: self.socket.try_clone()?,
+        })
+    }
+
+    pub fn send_recv_timeout(&self, send_buf: &[u8], recv_buf: &mut [u8], addr: SocketAddr, timeout: Duration) -> io::Result<usize> {
+        self.set_read_timeout(Some(timeout))?;
+        self.set_write_timeout(Some(timeout))?;
+        self.send_to(send_buf, addr)?;
+        let (size, _) = self.recv_from(recv_buf)?;
+
+        Ok(size)
+    }
+
+    pub fn send_secure_to(&self, payload: &[u8], addr: SocketAddr, security_cfg: &UdpSecurityCfg, compression_cfg: &UdpCompressionCfg) -> io::Result<(usize, SecureUdpDatagramMeta)> {
+        let (meta, datagram) = encode_secure_udp_datagram(payload, security_cfg, compression_cfg)?;
+        let sent = self.send_to(&datagram, addr)?;
+        
+        Ok((sent, meta))
+    }
+
+    pub fn send_secure_to_auto(&self, payload: &[u8], addr: SocketAddr, accept_encoding: &str) -> io::Result<(usize, SecureUdpDatagramMeta)> {
+        let algorithm = select_secure_udp_compression_algorithm(accept_encoding);
+        let mut compression_cfg = UdpCompressionCfg::default();
+        compression_cfg.algorithm = algorithm;
+
+        self.send_secure_to(payload, addr, &UdpSecurityCfg::default(), &compression_cfg)
+    }
+
+    pub fn recv_secure_from(&self, security_cfg: &UdpSecurityCfg, max_datagram_size: usize) -> io::Result<(SecureUdpDatagramMeta, Vec<u8>, SocketAddr)> {
+        if max_datagram_size == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "max_datagram_size must be > 0",
+            ));
+        }
+
+        let mut datagram = vec![0u8; max_datagram_size];
+        let (size, addr) = self.recv_from(&mut datagram)?;
+        datagram.truncate(size);
+        let (meta, payload) = decode_secure_udp_datagram(&datagram, security_cfg)?;
+        
+        Ok((meta, payload, addr))
+    }
+
+    pub fn recv_secure_from_default(&self, max_datagram_size: usize) -> io::Result<(SecureUdpDatagramMeta, Vec<u8>, SocketAddr)> {
+        self.recv_secure_from(&UdpSecurityCfg::default(), max_datagram_size)
+    }
+
+    pub fn send_secure(&self, payload: &[u8], security_cfg: &UdpSecurityCfg, compression_cfg: &UdpCompressionCfg) -> io::Result<SecureUdpDatagramMeta> {
+        let (meta, datagram) = encode_secure_udp_datagram(payload, security_cfg, compression_cfg)?;
+        self.send(&datagram)?;
+        
+        Ok(meta)
+    }
+
+    pub fn send_secure_auto(&self, payload: &[u8], accept_encoding: &str) -> io::Result<SecureUdpDatagramMeta> {
+        let algorithm = select_secure_udp_compression_algorithm(accept_encoding);
+        let mut compression_cfg = UdpCompressionCfg::default();
+        compression_cfg.algorithm = algorithm;
+
+        self.send_secure(payload, &UdpSecurityCfg::default(), &compression_cfg)
+    }
+
+    pub fn recv_secure(&self, security_cfg: &UdpSecurityCfg, max_datagram_size: usize) -> io::Result<(SecureUdpDatagramMeta, Vec<u8>)> {
+        if max_datagram_size == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "max_datagram_size must be > 0",
+            ));
+        }
+
+        let mut datagram = vec![0u8; max_datagram_size];
+        let size = self.recv(&mut datagram)?;
+        datagram.truncate(size);
+
+        decode_secure_udp_datagram(&datagram, security_cfg)
+    }
+
+    pub fn recv_secure_default(&self, max_datagram_size: usize) -> io::Result<(SecureUdpDatagramMeta, Vec<u8>)> {
+        self.recv_secure(&UdpSecurityCfg::default(), max_datagram_size)
+    }
+}
+
+impl Default for UdpSecurityCfg {
+    fn default() -> Self {
+        Self {
+            enable_integrity: true,
+            nonce_len: 24,
+        }
+    }
+}
+
+impl Default for UdpCompressionCfg {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            algorithm: CompressionAlgorithm::Brotli,
+            level: CompressionLevel::Default,
+            min_size: 512,
+        }
+    }
 }
 
 pub fn select_secure_udp_compression_algorithm(accept_encoding: &str) -> CompressionAlgorithm {
@@ -190,153 +338,6 @@ pub fn decode_secure_udp_datagram(secure_datagram: &[u8], security_cfg: &UdpSecu
     }
 
     Ok((meta, decoded_payload))
-}
-
-impl UdpSocket {
-    pub fn bind<A: ToSocketAddrs>(addr: A) -> io::Result<Self> {
-        let socket = StdUdpSocket::bind(addr)?;
-        Ok(Self { socket })
-    }
-
-    pub fn send_to(&self, buf: &[u8], addr: SocketAddr) -> io::Result<usize> {
-        self.socket.send_to(buf, addr)
-    }
-
-    pub fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
-        self.socket.recv_from(buf)
-    }
-
-    pub fn connect<A: ToSocketAddrs>(&self, addr: A) -> io::Result<()> {
-        self.socket.connect(addr)
-    }
-
-    pub fn send(&self, buf: &[u8]) -> io::Result<usize> {
-        self.socket.send(buf)
-    }
-
-    pub fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
-        self.socket.recv(buf)
-    }
-
-    pub fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
-        self.socket.set_read_timeout(timeout)
-    }
-
-    pub fn set_write_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
-        self.socket.set_write_timeout(timeout)
-    }
-
-    pub fn local_addr(&self) -> io::Result<SocketAddr> {
-        self.socket.local_addr()
-    }
-
-    pub fn set_broadcast(&self, broadcast: bool) -> io::Result<()> {
-        self.socket.set_broadcast(broadcast)
-    }
-
-    pub fn try_clone(&self) -> io::Result<Self> {
-        Ok(Self {
-            socket: self.socket.try_clone()?,
-        })
-    }
-
-    pub fn send_recv_timeout(&self, send_buf: &[u8], recv_buf: &mut [u8], addr: SocketAddr, timeout: Duration) -> io::Result<usize> {
-        self.set_read_timeout(Some(timeout))?;
-        self.set_write_timeout(Some(timeout))?;
-        self.send_to(send_buf, addr)?;
-        let (size, _) = self.recv_from(recv_buf)?;
-
-        Ok(size)
-    }
-
-    pub fn send_secure_to(&self, payload: &[u8], addr: SocketAddr, security_cfg: &UdpSecurityCfg, compression_cfg: &UdpCompressionCfg) -> io::Result<(usize, SecureUdpDatagramMeta)> {
-        let (meta, datagram) = encode_secure_udp_datagram(payload, security_cfg, compression_cfg)?;
-        let sent = self.send_to(&datagram, addr)?;
-        
-        Ok((sent, meta))
-    }
-
-    pub fn send_secure_to_auto(&self, payload: &[u8], addr: SocketAddr, accept_encoding: &str) -> io::Result<(usize, SecureUdpDatagramMeta)> {
-        let algorithm = select_secure_udp_compression_algorithm(accept_encoding);
-        let mut compression_cfg = UdpCompressionCfg::default();
-        compression_cfg.algorithm = algorithm;
-
-        self.send_secure_to(payload, addr, &UdpSecurityCfg::default(), &compression_cfg)
-    }
-
-    pub fn recv_secure_from(&self, security_cfg: &UdpSecurityCfg, max_datagram_size: usize) -> io::Result<(SecureUdpDatagramMeta, Vec<u8>, SocketAddr)> {
-        if max_datagram_size == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "max_datagram_size must be > 0",
-            ));
-        }
-
-        let mut datagram = vec![0u8; max_datagram_size];
-        let (size, addr) = self.recv_from(&mut datagram)?;
-        datagram.truncate(size);
-        let (meta, payload) = decode_secure_udp_datagram(&datagram, security_cfg)?;
-        
-        Ok((meta, payload, addr))
-    }
-
-    pub fn recv_secure_from_default(&self, max_datagram_size: usize) -> io::Result<(SecureUdpDatagramMeta, Vec<u8>, SocketAddr)> {
-        self.recv_secure_from(&UdpSecurityCfg::default(), max_datagram_size)
-    }
-
-    pub fn send_secure(&self, payload: &[u8], security_cfg: &UdpSecurityCfg, compression_cfg: &UdpCompressionCfg) -> io::Result<SecureUdpDatagramMeta> {
-        let (meta, datagram) = encode_secure_udp_datagram(payload, security_cfg, compression_cfg)?;
-        self.send(&datagram)?;
-        
-        Ok(meta)
-    }
-
-    pub fn send_secure_auto(&self, payload: &[u8], accept_encoding: &str) -> io::Result<SecureUdpDatagramMeta> {
-        let algorithm = select_secure_udp_compression_algorithm(accept_encoding);
-        let mut compression_cfg = UdpCompressionCfg::default();
-        compression_cfg.algorithm = algorithm;
-
-        self.send_secure(payload, &UdpSecurityCfg::default(), &compression_cfg)
-    }
-
-    pub fn recv_secure(&self, security_cfg: &UdpSecurityCfg, max_datagram_size: usize) -> io::Result<(SecureUdpDatagramMeta, Vec<u8>)> {
-        if max_datagram_size == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "max_datagram_size must be > 0",
-            ));
-        }
-
-        let mut datagram = vec![0u8; max_datagram_size];
-        let size = self.recv(&mut datagram)?;
-        datagram.truncate(size);
-
-        decode_secure_udp_datagram(&datagram, security_cfg)
-    }
-
-    pub fn recv_secure_default(&self, max_datagram_size: usize) -> io::Result<(SecureUdpDatagramMeta, Vec<u8>)> {
-        self.recv_secure(&UdpSecurityCfg::default(), max_datagram_size)
-    }
-}
-
-impl Default for UdpSecurityCfg {
-    fn default() -> Self {
-        Self {
-            enable_integrity: true,
-            nonce_len: 24,
-        }
-    }
-}
-
-impl Default for UdpCompressionCfg {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            algorithm: CompressionAlgorithm::Brotli,
-            level: CompressionLevel::Default,
-            min_size: 512,
-        }
-    }
 }
 
 fn compute_datagram_tag(nonce: &[u8], algorithm: CompressionAlgorithm, raw_size: usize, encoded_payload: &[u8]) -> [u8; 32] {

@@ -1,11 +1,12 @@
-use super::deflate;
-use super::utils::crc32;
-use super::{CompressionAlgorithm, CompressionLevel, Compressor, Decompressor};
 use crate::crypto::constant_time_eq;
 use crate::crypto::encoding::pem;
 use crate::crypto::hash::hmac::hmac_sha256;
 use crate::crypto::hash::sha2::sha256;
 use crate::crypto::random;
+use super::deflate;
+use super::utils::crc32;
+use super::{CompressionAlgorithm, CompressionLevel, Compressor, Decompressor};
+
 use std::io;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -39,6 +40,16 @@ pub struct GzipCompressor {
     size: u32,
 }
 
+pub struct GzipDecompressor {
+    deflate: deflate::DeflateDecompressor,
+    crc: u32,
+    size: u32,
+    expected_crc: Option<u32>,
+    expected_size: Option<u32>,
+    header_read: bool,
+    trailer_read: bool,
+}
+
 impl GzipCompressor {
     pub fn new(level: CompressionLevel) -> Self {
         Self {
@@ -70,16 +81,6 @@ impl GzipCompressor {
 
         trailer
     }
-}
-
-pub struct GzipDecompressor {
-    deflate: deflate::DeflateDecompressor,
-    crc: u32,
-    size: u32,
-    expected_crc: Option<u32>,
-    expected_size: Option<u32>,
-    header_read: bool,
-    trailer_read: bool,
 }
 
 impl GzipDecompressor {
@@ -193,6 +194,147 @@ impl GzipDecompressor {
         let size = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
 
         Ok((crc, size))
+    }
+}
+
+impl Compressor for GzipCompressor {
+    fn compress(&mut self, input: &[u8]) -> io::Result<Vec<u8>> {
+        let mut output = self.write_header();
+        let compressed = self.deflate.compress(input)?;
+        output.extend_from_slice(&compressed);
+
+        let crc = crc32(input);
+        let size = input.len() as u32;
+        output.extend_from_slice(&self.write_trailer(crc, size));
+
+        Ok(output)
+    }
+
+    fn compress_stream(&mut self, input: &[u8], output: &mut Vec<u8>) -> io::Result<()> {
+        if self.size == 0 {
+            output.extend_from_slice(&self.write_header());
+        }
+
+        self.deflate.compress_stream(input, output)?;
+
+        self.crc = super::utils::crc32_update(self.crc, input);
+        self.size = self.size.wrapping_add(input.len() as u32);
+
+        Ok(())
+    }
+
+    fn finish(&mut self) -> io::Result<Vec<u8>> {
+        let mut output = self.deflate.finish()?;
+        output.extend_from_slice(&self.write_trailer(self.crc ^ 0xffffffff, self.size));
+
+        Ok(output)
+    }
+
+    fn reset(&mut self) {
+        self.deflate.reset();
+        self.crc = 0xffffffff;
+        self.size = 0;
+    }
+}
+
+impl Decompressor for GzipDecompressor {
+    fn decompress(&mut self, input: &[u8]) -> io::Result<Vec<u8>> {
+        let (header_size, _flags) = Self::read_header(input)?;
+        if input.len() < header_size + 8 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "GZIP data too short",
+            ));
+        }
+
+        let deflate_data_end = input.len() - 8;
+        let deflate_data = &input[header_size..deflate_data_end];
+
+        let output = self.deflate.decompress(deflate_data)?;
+        let (crc, size) = Self::read_trailer(&input[deflate_data_end..])?;
+        let calculated_crc = crc32(&output);
+        if calculated_crc != crc {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("CRC32 mismatch: expected {}, got {}", crc, calculated_crc),
+            ));
+        }
+
+        let calculated_size = output.len() as u32;
+        if calculated_size != size {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Size mismatch: expected {}, got {}", size, calculated_size),
+            ));
+        }
+
+        Ok(output)
+    }
+
+    fn decompress_stream(&mut self, input: &[u8], output: &mut Vec<u8>) -> io::Result<()> {
+        if !self.header_read {
+            let (header_size, _flags) = Self::read_header(input)?;
+            self.header_read = true;
+            if input.len() > header_size + 8 {
+                let deflate_data = &input[header_size..input.len() - 8];
+                let decompressed = self.deflate.decompress(deflate_data)?;
+                output.extend_from_slice(&decompressed);
+
+                self.crc = super::utils::crc32_update(self.crc, &decompressed);
+                self.size = self.size.wrapping_add(decompressed.len() as u32);
+
+                let (crc, size) = Self::read_trailer(&input[input.len() - 8..])?;
+                self.expected_crc = Some(crc);
+                self.expected_size = Some(size);
+                self.trailer_read = true;
+            }
+        } else if !self.trailer_read && input.len() >= 8 {
+            let (crc, size) = Self::read_trailer(&input[input.len() - 8..])?;
+            if crc != (self.crc ^ 0xffffffff) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("CRC32 mismatch: expected {}, got {}", crc, self.crc ^ 0xffffffff),
+                ));
+            }
+
+            if size != self.size {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("Size mismatch: expected {}, got {}", size, self.size),
+                ));
+            }
+
+            self.trailer_read = true;
+        }
+
+        Ok(())
+    }
+
+    fn finish(&mut self) -> io::Result<Vec<u8>> {
+        if self.header_read && self.trailer_read {
+            Ok(Vec::new())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "GZIP decompression not finished",
+            ))
+        }
+    }
+
+    fn reset(&mut self) {
+        self.deflate.reset();
+        self.crc = 0xffffffff;
+        self.size = 0;
+        self.expected_crc = None;
+        self.expected_size = None;
+        self.header_read = false;
+        self.trailer_read = false;
+    }
+}
+
+impl Default for GzipDecompressor {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -382,141 +524,6 @@ pub fn decompress_bounded(data: &[u8], max_output_size: usize) -> io::Result<Vec
     Ok(output)
 }
 
-impl Compressor for GzipCompressor {
-    fn compress(&mut self, input: &[u8]) -> io::Result<Vec<u8>> {
-        let mut output = self.write_header();
-        let compressed = self.deflate.compress(input)?;
-        output.extend_from_slice(&compressed);
-
-        let crc = crc32(input);
-        let size = input.len() as u32;
-        output.extend_from_slice(&self.write_trailer(crc, size));
-
-        Ok(output)
-    }
-
-    fn compress_stream(&mut self, input: &[u8], output: &mut Vec<u8>) -> io::Result<()> {
-        if self.size == 0 {
-            output.extend_from_slice(&self.write_header());
-        }
-
-        self.deflate.compress_stream(input, output)?;
-
-        self.crc = super::utils::crc32_update(self.crc, input);
-        self.size = self.size.wrapping_add(input.len() as u32);
-
-        Ok(())
-    }
-
-    fn finish(&mut self) -> io::Result<Vec<u8>> {
-        let mut output = self.deflate.finish()?;
-        output.extend_from_slice(&self.write_trailer(self.crc ^ 0xffffffff, self.size));
-
-        Ok(output)
-    }
-
-    fn reset(&mut self) {
-        self.deflate.reset();
-        self.crc = 0xffffffff;
-        self.size = 0;
-    }
-}
-
-impl Decompressor for GzipDecompressor {
-    fn decompress(&mut self, input: &[u8]) -> io::Result<Vec<u8>> {
-        let (header_size, _flags) = Self::read_header(input)?;
-        if input.len() < header_size + 8 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "GZIP data too short",
-            ));
-        }
-
-        let deflate_data_end = input.len() - 8;
-        let deflate_data = &input[header_size..deflate_data_end];
-
-        let output = self.deflate.decompress(deflate_data)?;
-        let (crc, size) = Self::read_trailer(&input[deflate_data_end..])?;
-        let calculated_crc = crc32(&output);
-        if calculated_crc != crc {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("CRC32 mismatch: expected {}, got {}", crc, calculated_crc),
-            ));
-        }
-
-        let calculated_size = output.len() as u32;
-        if calculated_size != size {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("Size mismatch: expected {}, got {}", size, calculated_size),
-            ));
-        }
-
-        Ok(output)
-    }
-
-    fn decompress_stream(&mut self, input: &[u8], output: &mut Vec<u8>) -> io::Result<()> {
-        if !self.header_read {
-            let (header_size, _flags) = Self::read_header(input)?;
-            self.header_read = true;
-            if input.len() > header_size + 8 {
-                let deflate_data = &input[header_size..input.len() - 8];
-                let decompressed = self.deflate.decompress(deflate_data)?;
-                output.extend_from_slice(&decompressed);
-
-                self.crc = super::utils::crc32_update(self.crc, &decompressed);
-                self.size = self.size.wrapping_add(decompressed.len() as u32);
-
-                let (crc, size) = Self::read_trailer(&input[input.len() - 8..])?;
-                self.expected_crc = Some(crc);
-                self.expected_size = Some(size);
-                self.trailer_read = true;
-            }
-        } else if !self.trailer_read && input.len() >= 8 {
-            let (crc, size) = Self::read_trailer(&input[input.len() - 8..])?;
-            if crc != (self.crc ^ 0xffffffff) {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("CRC32 mismatch: expected {}, got {}", crc, self.crc ^ 0xffffffff),
-                ));
-            }
-
-            if size != self.size {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("Size mismatch: expected {}, got {}", size, self.size),
-                ));
-            }
-
-            self.trailer_read = true;
-        }
-
-        Ok(())
-    }
-
-    fn finish(&mut self) -> io::Result<Vec<u8>> {
-        if self.header_read && self.trailer_read {
-            Ok(Vec::new())
-        } else {
-            Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "GZIP decompression not finished",
-            ))
-        }
-    }
-
-    fn reset(&mut self) {
-        self.deflate.reset();
-        self.crc = 0xffffffff;
-        self.size = 0;
-        self.expected_crc = None;
-        self.expected_size = None;
-        self.header_read = false;
-        self.trailer_read = false;
-    }
-}
-
 fn compute_gzip_blob_tag(nonce: &[u8], algorithm: CompressionAlgorithm, raw_size: usize, encoded_payload: &[u8]) -> [u8; 32] {
     let mut mac_input = Vec::new();
     mac_input.extend_from_slice(GZIP_BLOB_CONTEXT.as_bytes());
@@ -682,12 +689,6 @@ fn parse_secure_gzip_blob_meta(header: &str, body_len: usize) -> io::Result<Secu
         encoded_size,
         issued_at_unix,
     })
-}
-
-impl Default for GzipDecompressor {
-    fn default() -> Self {
-        Self::new()
-    }
 }
 
 #[cfg(test)]

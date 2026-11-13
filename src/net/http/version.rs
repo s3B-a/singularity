@@ -4,6 +4,7 @@ use crate::crypto::hash::hmac::hmac_sha256;
 use crate::crypto::hash::sha2::sha256;
 use crate::crypto::random;
 use crate::net::http::compression::{self, CompressionAlgorithm, CompressionLevel};
+
 use std::fmt;
 use std::io;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -276,6 +277,18 @@ impl HttpVersion {
     }
 }
 
+impl fmt::Display for HttpVersion {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+impl Default for HttpVersion {
+    fn default() -> Self {
+        HttpVersion::Http11
+    }
+}
+
 fn serialize_http_version(version: &HttpVersion) -> Vec<u8> {
     let alpn = version.alpn_protocol().map(|v| String::from_utf8_lossy(v).to_string()).unwrap_or_default();
     format!(
@@ -540,18 +553,6 @@ fn parse_secure_http_version_meta(header: &str, body_len: usize) -> io::Result<S
         encoded_size,
         issued_at_unix,
     })
-}
-
-impl fmt::Display for HttpVersion {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.as_str())
-    }
-}
-
-impl Default for HttpVersion {
-    fn default() -> Self {
-        HttpVersion::Http11
-    }
 }
 
 #[cfg(test)]

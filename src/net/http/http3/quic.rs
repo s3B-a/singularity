@@ -1,10 +1,3 @@
-use super::connection::Http3Connection;
-use super::crypto::compute_retry_integrity_tag;
-use super::error::{Error, ErrorCode, Result};
-use super::packet::{Packet, PacketHeader, PacketType};
-use super::quic_tls::{CryptoAction, QuicTlsState};
-use super::stream::StreamId;
-use super::{Config, ConnectionId, Role, HTTP3_VERSION};
 use crate::crypto::constant_time_eq;
 use crate::crypto::encoding::pem;
 use crate::crypto::hash::hmac::hmac_sha256;
@@ -12,6 +5,14 @@ use crate::crypto::hash::sha2::sha256;
 use crate::crypto::random;
 use crate::net::http::compression::{self, CompressionAlgorithm, CompressionLevel};
 use crate::net::udp::UdpSocket;
+use super::connection::Http3Connection;
+use super::crypto::compute_retry_integrity_tag;
+use super::error::{Error, ErrorCode, Result};
+use super::packet::{Packet, PacketHeader, PacketType};
+use super::quic_tls::{CryptoAction, QuicTlsState};
+use super::stream::StreamId;
+use super::{Config, ConnectionId, Role, HTTP3_VERSION};
+
 use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
@@ -19,6 +20,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const QUIC_STATS_BLOB_MAGIC: &str = "SINGULARITY_HTTP3_QUIC_STATS_BLOB_V1";
 const QUIC_STATS_BLOB_CONTEXT: &str = "SINGULARITY_HTTP3_QUIC_STATS_BLOB_BINDING_V1";
+
+const RETRY_TOKEN_VALIDITY_SECS: u64 = 10;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SecureQuicStatsBlobMeta {
@@ -31,18 +34,61 @@ pub struct SecureQuicStatsBlobMeta {
     pub issued_at_unix: u64,
 }
 
-#[derive(Debug, Clone, Copy)]
-pub enum StreamEvent {
-    DataReady(StreamId),
-    Finished(StreamId),
-    Reset(StreamId, u64),
-}
-
 pub struct QuicClient {
     config: Config,
     connections: HashMap<SocketAddr, Http3Connection>,
     default_timeout: Duration,
     tls_states: HashMap<SocketAddr, QuicTlsState>,
+}
+
+pub struct QuicServer {
+    config: Config,
+    socket: UdpSocket,
+    connections: HashMap<ConnectionId, Http3Connection>,
+    tls_states: HashMap<ConnectionId, QuicTlsState>,
+    pending_connections: HashMap<SocketAddr, PendingConnection>,
+    bind_addr: SocketAddr,
+    retry_secret: Vec<u8>,
+}
+
+pub struct QuicEndpoint {
+    role: Role,
+    config: Config,
+    socket: UdpSocket,
+    connections: HashMap<ConnectionId, Http3Connection>,
+    tls_states: HashMap<ConnectionId, QuicTlsState>,
+}
+
+pub struct QuicConnectionManager {
+    client_connections: HashMap<SocketAddr, Http3Connection>,
+    server_connections: HashMap<ConnectionId, Http3Connection>,
+    tls_states: HashMap<String, QuicTlsState>,
+    config: Config,
+}
+
+#[derive(Debug, Clone)]
+pub struct QuicStats {
+    pub total_connections: usize,
+    pub active_connections: usize,
+    pub closed_connections: usize,
+    pub bytes_sent: u64,
+    pub bytes_received: u64,
+    pub packets_sent: u64,
+    pub packets_received: u64,
+    pub packets_lost: u64,
+}
+
+struct PendingConnection {
+    scid: ConnectionId,
+    dcid: ConnectionId,
+    created_at: Instant,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum StreamEvent {
+    DataReady(StreamId),
+    Finished(StreamId),
+    Reset(StreamId, u64),
 }
 
 enum ConnectAttemptResult {
@@ -322,92 +368,6 @@ impl QuicClient {
     }
 }
 
-const RETRY_TOKEN_VALIDITY_SECS: u64 = 10;
-
-fn encode_socket_addr(addr: SocketAddr) -> Vec<u8> {
-    let mut bytes = Vec::new();
-    match addr {
-        SocketAddr::V4(v4) => {
-            bytes.push(4);
-            bytes.extend_from_slice(&v4.ip().octets());
-        }
-        SocketAddr::V6(v6) => {
-            bytes.push(6);
-            bytes.extend_from_slice(&v6.ip().octets());
-        }
-    }
-
-    bytes.extend_from_slice(&addr.port().to_be_bytes());
-    bytes
-}
-
-fn generate_retry_token(server_secret: &[u8], peer_addr: SocketAddr, odcid: &ConnectionId) -> Vec<u8> {
-    let issued_at = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
-
-    let mut payload = encode_socket_addr(peer_addr);
-    payload.push(odcid.len() as u8);
-    payload.extend_from_slice(odcid.as_bytes());
-    payload.extend_from_slice(&issued_at.to_be_bytes());
-
-    let mac = hmac_sha256(server_secret, &payload);
-    let mut token = payload;
-    token.extend_from_slice(&mac);
-    token
-}
-
-fn validate_retry_token(server_secret: &[u8], token: &[u8], peer_addr: SocketAddr) -> Option<ConnectionId> {
-    if token.len() <= 32 {
-        return None;
-    }
-
-    let (payload, mac) = token.split_at(token.len() - 32);
-    let expected_mac = hmac_sha256(server_secret, payload);
-    if !constant_time_eq(&expected_mac, mac) {
-        return None;
-    }
-
-    let expected_addr = encode_socket_addr(peer_addr);
-    if payload.len() < expected_addr.len() + 1 {
-        return None;
-    }
-
-    let (addr_bytes, rest) = payload.split_at(expected_addr.len());
-    if addr_bytes != expected_addr.as_slice() {
-        return None;
-    }
-
-    let odcid_len = rest[0] as usize;
-    if rest.len() < 1 + odcid_len + 8 {
-        return None;
-    }
-
-    let odcid_bytes = &rest[1..1 + odcid_len];
-    let issued_at = u64::from_be_bytes(rest[1 + odcid_len..1 + odcid_len + 8].try_into().ok()?);
-
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
-    if now.saturating_sub(issued_at) > RETRY_TOKEN_VALIDITY_SECS {
-        return None;
-    }
-
-    Some(ConnectionId::new(odcid_bytes.to_vec()))
-}
-
-pub struct QuicServer {
-    config: Config,
-    socket: UdpSocket,
-    connections: HashMap<ConnectionId, Http3Connection>,
-    tls_states: HashMap<ConnectionId, QuicTlsState>,
-    pending_connections: HashMap<SocketAddr, PendingConnection>,
-    bind_addr: SocketAddr,
-    retry_secret: Vec<u8>,
-}
-
-struct PendingConnection {
-    scid: ConnectionId,
-    dcid: ConnectionId,
-    created_at: Instant,
-}
-
 impl PendingConnection {
     fn new(scid: ConnectionId, dcid: ConnectionId) -> Self {
         Self {
@@ -674,14 +634,6 @@ impl QuicServer {
     }
 }
 
-pub struct QuicEndpoint {
-    role: Role,
-    config: Config,
-    socket: UdpSocket,
-    connections: HashMap<ConnectionId, Http3Connection>,
-    tls_states: HashMap<ConnectionId, QuicTlsState>,
-}
-
 impl QuicEndpoint {
     pub fn new(role: Role, bind_addr: SocketAddr, config: Config) -> Result<Self> {
         let socket = UdpSocket::bind(bind_addr)?;
@@ -793,13 +745,6 @@ impl QuicEndpoint {
     }
 }
 
-pub struct QuicConnectionManager {
-    client_connections: HashMap<SocketAddr, Http3Connection>,
-    server_connections: HashMap<ConnectionId, Http3Connection>,
-    tls_states: HashMap<String, QuicTlsState>,
-    config: Config,
-}
-
 impl QuicConnectionManager {
     pub fn new(config: Config) -> Self {
         Self {
@@ -893,18 +838,6 @@ impl QuicConnectionManager {
 
         Ok(())
     }
-}
-
-#[derive(Debug, Clone)]
-pub struct QuicStats {
-    pub total_connections: usize,
-    pub active_connections: usize,
-    pub closed_connections: usize,
-    pub bytes_sent: u64,
-    pub bytes_received: u64,
-    pub packets_sent: u64,
-    pub packets_received: u64,
-    pub packets_lost: u64,
 }
 
 impl QuicStats {
@@ -1098,6 +1031,74 @@ pub fn encode_secure_quic_stats_auto(stats: &QuicStats, accept_encoding: &str) -
 
 pub fn decode_secure_quic_stats(data: &[u8]) -> io::Result<(SecureQuicStatsBlobMeta, QuicStats)> {
     QuicStats::from_secure_blob(data)
+}
+
+fn encode_socket_addr(addr: SocketAddr) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    match addr {
+        SocketAddr::V4(v4) => {
+            bytes.push(4);
+            bytes.extend_from_slice(&v4.ip().octets());
+        }
+        SocketAddr::V6(v6) => {
+            bytes.push(6);
+            bytes.extend_from_slice(&v6.ip().octets());
+        }
+    }
+
+    bytes.extend_from_slice(&addr.port().to_be_bytes());
+    bytes
+}
+
+fn generate_retry_token(server_secret: &[u8], peer_addr: SocketAddr, odcid: &ConnectionId) -> Vec<u8> {
+    let issued_at = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+
+    let mut payload = encode_socket_addr(peer_addr);
+    payload.push(odcid.len() as u8);
+    payload.extend_from_slice(odcid.as_bytes());
+    payload.extend_from_slice(&issued_at.to_be_bytes());
+
+    let mac = hmac_sha256(server_secret, &payload);
+    let mut token = payload;
+    token.extend_from_slice(&mac);
+    token
+}
+
+fn validate_retry_token(server_secret: &[u8], token: &[u8], peer_addr: SocketAddr) -> Option<ConnectionId> {
+    if token.len() <= 32 {
+        return None;
+    }
+
+    let (payload, mac) = token.split_at(token.len() - 32);
+    let expected_mac = hmac_sha256(server_secret, payload);
+    if !constant_time_eq(&expected_mac, mac) {
+        return None;
+    }
+
+    let expected_addr = encode_socket_addr(peer_addr);
+    if payload.len() < expected_addr.len() + 1 {
+        return None;
+    }
+
+    let (addr_bytes, rest) = payload.split_at(expected_addr.len());
+    if addr_bytes != expected_addr.as_slice() {
+        return None;
+    }
+
+    let odcid_len = rest[0] as usize;
+    if rest.len() < 1 + odcid_len + 8 {
+        return None;
+    }
+
+    let odcid_bytes = &rest[1..1 + odcid_len];
+    let issued_at = u64::from_be_bytes(rest[1 + odcid_len..1 + odcid_len + 8].try_into().ok()?);
+
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    if now.saturating_sub(issued_at) > RETRY_TOKEN_VALIDITY_SECS {
+        return None;
+    }
+
+    Some(ConnectionId::new(odcid_bytes.to_vec()))
 }
 
 fn serialize_quic_stats(stats: &QuicStats) -> Vec<u8> {

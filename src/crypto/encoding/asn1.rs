@@ -3,6 +3,25 @@
 
 use crate::crypto::{Error, Result};
 
+// DER Encoder
+pub struct DerEncoder {
+    data: Vec<u8>,
+}
+
+// DER Decoder
+pub struct DerDecoder<'a> {
+    pub data: &'a [u8],
+    pub pos: usize,
+}
+
+// ASN.1 Element
+#[derive(Clone, Debug)]
+pub struct Asn1Element {
+    pub tag: u8,
+    pub constructed: bool,
+    pub data: Vec<u8>,
+}
+
 // Tag Classes
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TagClass {
@@ -28,25 +47,6 @@ pub enum Tag {
     Ia5String = 0x16,
     UtcTime = 0x17,
     GeneralizedTime = 0x18,
-}
-
-// DER Encoder
-pub struct DerEncoder {
-    data: Vec<u8>,
-}
-
-// DER Decoder
-pub struct DerDecoder<'a> {
-    pub data: &'a [u8],
-    pub pos: usize,
-}
-
-// ASN.1 Element
-#[derive(Clone, Debug)]
-pub struct Asn1Element {
-    pub tag: u8,
-    pub constructed: bool,
-    pub data: Vec<u8>,
 }
 
 impl DerEncoder {
@@ -931,6 +931,35 @@ impl Default for DerDecoder<'_> {
 }
 
 /**
+ * Decodes the raw content bytes of an OBJECT IDENTIFIER (i.e. already stripped of its
+ * tag/length, as produced by `DerDecoder::read_element`) into its dotted arc components.
+ * Args:
+ *    content - &[u8]: The OID's content bytes
+ *
+ * Returns:
+ *    Result<Vec<u64>>: The OID's dotted arc components, or an error if decoding fails
+ */
+pub fn decode_oid_content(content: &[u8]) -> Result<Vec<u64>> {
+    if content.is_empty() {
+        return Err(Error::CryptoError("Invalid OBJECT IDENTIFIER length".to_string()));
+    }
+
+    let mut oid = Vec::new();
+    let first_byte = content[0] as u64;
+
+    oid.push(first_byte / 40);
+    oid.push(first_byte % 40);
+    let mut i = 1;
+    while i < content.len() {
+        let (value, consumed) = decode_base128(&content[i..])?;
+        oid.push(value);
+        i += consumed;
+    }
+
+    Ok(oid)
+}
+
+/**
  * Encodes a u64 value using base-128 encoding
  * Args:
  *    mut value - u64: The u64 value to encode
@@ -986,35 +1015,6 @@ fn decode_base128(data: &[u8]) -> Result<(u64, usize)> {
     }
 
     Err(Error::CryptoError("Incomplete base128 integer".to_string()))
-}
-
-/**
- * Decodes the raw content bytes of an OBJECT IDENTIFIER (i.e. already stripped of its
- * tag/length, as produced by `DerDecoder::read_element`) into its dotted arc components.
- * Args:
- *    content - &[u8]: The OID's content bytes
- *
- * Returns:
- *    Result<Vec<u64>>: The OID's dotted arc components, or an error if decoding fails
- */
-pub fn decode_oid_content(content: &[u8]) -> Result<Vec<u64>> {
-    if content.is_empty() {
-        return Err(Error::CryptoError("Invalid OBJECT IDENTIFIER length".to_string()));
-    }
-
-    let mut oid = Vec::new();
-    let first_byte = content[0] as u64;
-
-    oid.push(first_byte / 40);
-    oid.push(first_byte % 40);
-    let mut i = 1;
-    while i < content.len() {
-        let (value, consumed) = decode_base128(&content[i..])?;
-        oid.push(value);
-        i += consumed;
-    }
-
-    Ok(oid)
 }
 
 // Commonly used OIDs rexported as constants

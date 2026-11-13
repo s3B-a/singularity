@@ -4,6 +4,7 @@ use crate::crypto::hash::hmac::hmac_sha256;
 use crate::crypto::hash::sha2::sha256;
 use crate::crypto::random;
 use crate::net::http::compression::{self, CompressionAlgorithm, CompressionLevel};
+
 use std::collections::{HashMap, HashSet};
 use std::io::{self, BufRead};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -291,6 +292,47 @@ pub fn decode_secure_trailer_headers(data: &[u8]) -> io::Result<(SecureTrailerHe
     Ok((meta, trailers))
 }
 
+pub fn is_forbidden_trailer_field(field_name: &str) -> bool {
+    const FORBIDDEN_FIELDS: &[&str] = &[
+        "transfer-encoding",
+        "content-length",
+        "trailer",
+        "host",
+        "cache-control",
+        "expect",
+        "max-forwards",
+        "pragma",
+        "range",
+        "te",
+        "authorization",
+        "proxy-authorization",
+        "www-authenticate",
+        "proxy-authenticate",
+        "cookie",
+        "set-cookie",
+        "content-encoding",
+        "content-type",
+        "content-range",
+        "connection",
+        "keep-alive",
+        "upgrade",
+        "via",
+        "warning",
+        "if-match",
+        "if-none-match",
+        "if-modified-since",
+        "if-unmodified-since",
+        "if-range",
+        "age",
+        "expires",
+        "date",
+        "retry-after",
+    ];
+
+    let normalized = field_name.trim().to_ascii_lowercase();
+    FORBIDDEN_FIELDS.contains(&normalized.as_str())
+}
+
 fn serialize_trailer_headers(trailers: &TrailerHeaders) -> Vec<u8> {
     let mut lines = Vec::new();
     if let Some(expected) = &trailers.expected {
@@ -557,47 +599,6 @@ fn parse_secure_trailer_headers_meta(header: &str, body_len: usize) -> io::Resul
         encoded_size,
         issued_at_unix,
     })
-}
-
-pub fn is_forbidden_trailer_field(field_name: &str) -> bool {
-    const FORBIDDEN_FIELDS: &[&str] = &[
-        "transfer-encoding",
-        "content-length",
-        "trailer",
-        "host",
-        "cache-control",
-        "expect",
-        "max-forwards",
-        "pragma",
-        "range",
-        "te",
-        "authorization",
-        "proxy-authorization",
-        "www-authenticate",
-        "proxy-authenticate",
-        "cookie",
-        "set-cookie",
-        "content-encoding",
-        "content-type",
-        "content-range",
-        "connection",
-        "keep-alive",
-        "upgrade",
-        "via",
-        "warning",
-        "if-match",
-        "if-none-match",
-        "if-modified-since",
-        "if-unmodified-since",
-        "if-range",
-        "age",
-        "expires",
-        "date",
-        "retry-after",
-    ];
-
-    let normalized = field_name.trim().to_ascii_lowercase();
-    FORBIDDEN_FIELDS.contains(&normalized.as_str())
 }
 
 pub mod common {

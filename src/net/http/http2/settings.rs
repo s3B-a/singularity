@@ -4,14 +4,15 @@ use crate::crypto::hash::hmac::hmac_sha256;
 use crate::crypto::hash::sha2::sha256;
 use crate::crypto::random;
 use crate::net::http::compression::{self, CompressionAlgorithm, CompressionLevel};
+
 use std::collections::HashMap;
 use std::io;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+pub const DEFAULT_LOCAL_MAX_CONCURRENT_STREAMS: u32 = 100;
+
 const SETTINGS_BLOB_MAGIC: &str = "SINGULARITY_HTTP2_SETTINGS_BLOB_V1";
 const SETTINGS_BLOB_CONTEXT: &str = "SINGULARITY_HTTP2_SETTINGS_BLOB_BINDING_V1";
-
-pub const DEFAULT_LOCAL_MAX_CONCURRENT_STREAMS: u32 = 100;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SecureSettingsBlobMeta {
@@ -22,6 +23,11 @@ pub struct SecureSettingsBlobMeta {
     pub raw_size: usize,
     pub encoded_size: usize,
     pub issued_at_unix: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct Settings {
+    settings: HashMap<SettingId, u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -51,11 +57,6 @@ impl SettingId {
             _ => None,
         }
     }
-}
-
-#[derive(Debug, Clone)]
-pub struct Settings {
-    settings: HashMap<SettingId, u32>,
 }
 
 impl Settings {

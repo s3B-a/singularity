@@ -4,13 +4,6 @@
 use crate::crypto::{Error, Result};
 use super::{x25519, p256};
 
-// ECDH Key trait for key exchange operations
-pub trait EcdhKey {
-    fn exchange(&self, their_public: &[u8]) -> Result<Vec<u8>>;
-
-    fn public_bytes(&self) -> Vec<u8>;
-}
-
 // Supported ECDH curves
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EcdhCurve {
@@ -28,6 +21,13 @@ pub enum EcdhPrivateKey {
 pub enum EcdhPublicKey {
     X25519(x25519::X25519PublicKey),
     P256(p256::P256PublicKey)
+}
+
+// ECDH Key trait for key exchange operations
+pub trait EcdhKey {
+    fn exchange(&self, their_public: &[u8]) -> Result<Vec<u8>>;
+
+    fn public_bytes(&self) -> Vec<u8>;
 }
 
 impl EcdhPrivateKey {

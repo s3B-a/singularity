@@ -4,6 +4,7 @@ use crate::crypto::hash::hmac::hmac_sha256;
 use crate::crypto::hash::sha2::sha256;
 use crate::crypto::random;
 use crate::net::http::compression::{self, CompressionAlgorithm, CompressionLevel};
+
 use std::collections::HashMap;
 use std::fmt;
 use std::io;
@@ -201,6 +202,18 @@ impl Headers {
 
     pub fn from_secure_blob(data: &[u8]) -> io::Result<(SecureHeadersBlobMeta, Self)> {
         decode_secure_headers(data)
+    }
+}
+
+impl Default for Headers {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl fmt::Display for Headers {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.format())
     }
 }
 
@@ -591,18 +604,6 @@ fn parse_secure_headers_meta(header: &str, body_len: usize) -> io::Result<Secure
         encoded_size,
         issued_at_unix,
     })
-}
-
-impl Default for Headers {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl fmt::Display for Headers {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.format())
-    }
 }
 
 #[cfg(test)]

@@ -91,14 +91,6 @@ pub fn decode_component(input: &str) -> Result<String, String> {
     decode(input)
 }
 
-fn percent_encode_char(ch: char, result: &mut String) {
-    let mut buffer = [0u8; 4];
-    let bytes = ch.encode_utf8(&mut buffer).as_bytes();
-    for &byte in bytes {
-        let _ = write!(result, "%{:02X}", byte);
-    }
-}
-
 pub fn encode_form(input: &str) -> String {
     let mut result = String::with_capacity(input.len() * 2);
     for ch in input.chars() {
@@ -168,6 +160,14 @@ pub fn decode_form(input: &str) -> Result<String, String> {
     }
 
     Ok(result)
+}
+
+fn percent_encode_char(ch: char, result: &mut String) {
+    let mut buffer = [0u8; 4];
+    let bytes = ch.encode_utf8(&mut buffer).as_bytes();
+    for &byte in bytes {
+        let _ = write!(result, "%{:02X}", byte);
+    }
 }
 
 #[cfg(test)]

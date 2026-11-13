@@ -1,16 +1,18 @@
-use super::chunked::{ChunkedDecoder, ChunkedLimitError, DEFAULT_MAX_CHUNK_LINE};
-use super::compression::{self, CompressionAlgorithm, CompressionConfig, CompressionLevel};
-use super::conditional::{evaluate_preconditions, http_date_now, if_range_matches, parse_http_date, EntityTag, PreconditionOutcome};
-use super::negotiation::ContentNegotiator;
-use super::range::{build_multipart_byteranges, evaluate_ranges, parse_range_header, ContentRange, RangeOutcome};
-use super::{HttpMethod, HttpRequest, HttpResponse, HttpVersion};
 use crate::crypto::constant_time_eq;
 use crate::crypto::encoding::pem;
 use crate::crypto::hash::hmac::hmac_sha256;
 use crate::crypto::hash::sha2::sha256;
 use crate::crypto::random;
 use crate::net::tcp::{TcpListener, TcpStream};
-use std::collections::HashMap;
+use super::chunked::{ChunkedDecoder, ChunkedLimitError, DEFAULT_MAX_CHUNK_LINE};
+use super::compression::{self, CompressionAlgorithm, CompressionConfig, CompressionLevel};
+use super::conditional::{evaluate_preconditions, http_date_now, if_range_matches, parse_http_date, EntityTag, PreconditionOutcome};
+use super::http2::{h2c, H2cTransport, H2cUpgrade, Http2Connection, Http2Error, PaddingStrategy, StreamState, CLIENT_PREFACE};
+use super::negotiation::ContentNegotiator;
+use super::range::{build_multipart_byteranges, evaluate_ranges, parse_range_header, ContentRange, RangeOutcome};
+use super::{HttpMethod, HttpRequest, HttpResponse, HttpVersion};
+
+use std::collections::{HashMap, HashSet};
 use std::io::{self, BufRead, BufReader, Write};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -46,6 +48,9 @@ pub struct HttpServerCfg {
     pub max_header_bytes: usize,
     pub max_header_count: usize,
     pub auto_etag: bool,
+    pub h2c_upgrade: bool,
+    pub h2c_prior_knowledge: bool,
+    pub http2_padding: PaddingStrategy,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -65,11 +70,20 @@ pub struct Http1RawRequest {
     pub body: Vec<u8>,
 }
 
+pub struct HttpServer {
+    cfg: HttpServerCfg,
+    handler: Option<HttpHandler>,
+    listener: Option<TcpListener>,
+    running: Arc<AtomicBool>,
+    address: Option<SocketAddr>,
+}
+
 #[derive(Debug)]
 pub enum Http1ReadError {
     Closed,
     Reject(u16, String),
     Io(io::Error),
+    Http2Preface,
 }
 
 enum Line {
@@ -78,12 +92,10 @@ enum Line {
     TooLong,
 }
 
-pub struct HttpServer {
-    cfg: HttpServerCfg,
-    handler: Option<HttpHandler>,
-    listener: Option<TcpListener>,
-    running: Arc<AtomicBool>,
-    address: Option<SocketAddr>,
+enum Http1Exit {
+    Closed,
+    PriorKnowledge,
+    Upgrade { request: HttpRequest, settings: Vec<(u16, u32)> },
 }
 
 impl HttpServer {
@@ -215,25 +227,62 @@ impl HttpServer {
         stream.set_write_timeout(Some(config.request_timeout))?;
         let mut reader = BufReader::new(stream.try_clone()?);
         let mut writer = stream;
-        Self::serve_connection(&mut reader, &mut writer, &config, handler.as_ref())
+        match Self::serve_connection(&mut reader, &mut writer, &config, handler.as_ref())? {
+            Http1Exit::Closed => Ok(()),
+            Http1Exit::PriorKnowledge => {
+                let transport = H2cTransport::with_replay(CLIENT_PREFACE.to_vec(), reader, writer);
+                let conn = Http2Connection::new_server(transport).map_err(h2_to_io)?;
+                Self::serve_http2(conn, &config, handler.as_ref(), None)
+            }
+            Http1Exit::Upgrade { request, settings } => {
+                let headers = h2c::http1_request_to_h2_headers(request.method().as_str(), request.path(), &request_fields(&request));
+                let transport = H2cTransport::new(reader, writer);
+                let conn = Http2Connection::upgrade_server(transport, &settings, headers, request.body_bytes().to_vec()).map_err(h2_to_io)?;
+                Self::serve_http2(conn, &config, handler.as_ref(), Some(request))
+            }
+        }
     }
 
-    fn serve_connection<R: BufRead, W: Write>(reader: &mut R, writer: &mut W, config: &HttpServerCfg, handler: Option<&HttpHandler>) -> io::Result<()> {
+    fn serve_connection<R: BufRead, W: Write>(reader: &mut R, writer: &mut W, config: &HttpServerCfg, handler: Option<&HttpHandler>) -> io::Result<Http1Exit> {
+        let mut first_request = true;
         loop {
             let request = match Self::parse_request(reader, writer, config) {
                 Ok(request) => request,
-                Err(Http1ReadError::Closed) => return Ok(()),
-                Err(Http1ReadError::Io(e)) if matches!(e.kind(), io::ErrorKind::UnexpectedEof | io::ErrorKind::ConnectionReset | io::ErrorKind::ConnectionAborted | io::ErrorKind::BrokenPipe) => return Ok(()),
+                Err(Http1ReadError::Http2Preface) => {
+                    let (status, reason) = if !config.h2c_prior_knowledge {
+                        (505, "HTTP/2 with prior knowledge is disabled")
+                    } else if !first_request {
+                        (400, "HTTP/2 connection preface after an HTTP/1.1 request")
+                    } else {
+                        let mut tail = [0u8; 8];
+                        reader.read_exact(&mut tail)?;
+                        if tail == h2c::PREFACE_TAIL {
+                            return Ok(Http1Exit::PriorKnowledge);
+                        }
+
+                        (400, "malformed HTTP/2 connection preface")
+                    };
+
+                    Self::write_rejection(writer, status, reason);
+                    return Ok(Http1Exit::Closed);
+                }
+                Err(Http1ReadError::Closed) => return Ok(Http1Exit::Closed),
+                Err(Http1ReadError::Io(e)) if matches!(e.kind(), io::ErrorKind::UnexpectedEof | io::ErrorKind::ConnectionReset | io::ErrorKind::ConnectionAborted | io::ErrorKind::BrokenPipe) => return Ok(Http1Exit::Closed),
                 Err(Http1ReadError::Io(e)) => return Err(e),
                 Err(Http1ReadError::Reject(status, reason)) => {
-                    eprintln!("Rejecting request with {}: {}", status, reason);
-                    let mut response = Self::error_response(status, &HttpResponse::default_reason_phrase(status));
-                    response.set_header("Connection", "close");
-                    let _ = writer.write_all(&Self::serialize_response(&response, false));
-                    let _ = writer.flush();
-                    return Ok(());
+                    Self::write_rejection(writer, status, &reason);
+                    return Ok(Http1Exit::Closed);
                 }
             };
+
+            first_request = false;
+            if config.h2c_upgrade && *request.version_ref() == HttpVersion::Http11 {
+                if let H2cUpgrade::Requested(settings) = h2c::parse_upgrade_request(&request_fields(&request)) {
+                    writer.write_all(h2c::SWITCHING_PROTOCOLS_RESPONSE)?;
+                    writer.flush()?;
+                    return Ok(Http1Exit::Upgrade { request, settings });
+                }
+            }
 
             let base_response = match handler {
                 Some(h) => h(&request),
@@ -253,9 +302,126 @@ impl HttpServer {
             writer.write_all(&Self::serialize_response(&finalized, request.method() == HttpMethod::HEAD))?;
             writer.flush()?;
             if close {
-                return Ok(());
+                return Ok(Http1Exit::Closed);
             }
         }
+    }
+
+    fn write_rejection<W: Write>(writer: &mut W, status: u16, reason: &str) {
+        eprintln!("Rejecting request with {}: {}", status, reason);
+        let mut response = Self::error_response(status, &HttpResponse::default_reason_phrase(status));
+        response.set_header("Connection", "close");
+        let _ = writer.write_all(&Self::serialize_response(&response, false));
+        let _ = writer.flush();
+    }
+
+    fn serve_http2(mut conn: Http2Connection, config: &HttpServerCfg, handler: Option<&HttpHandler>, upgraded: Option<HttpRequest>) -> io::Result<()> {
+        conn.set_padding_strategy(config.http2_padding);
+        conn.handshake().map_err(h2_to_io)?;
+        let mut answered = HashSet::new();
+        if let Some(request) = upgraded {
+            answered.insert(1);
+            Self::respond_http2(&mut conn, 1, Ok(request), config, handler)?;
+        }
+
+        loop {
+            answered.retain(|stream_id| {
+                let finished = conn.get_stream(*stream_id).map_or(true, |stream| stream.is_closed());
+                if finished {
+                    let _ = conn.close_stream(*stream_id);
+                }
+
+                !finished
+            });
+
+            if conn.goaway_received {
+                break;
+            }
+
+            match conn.receive_frame() {
+                Ok(()) => {}
+                Err(Http2Error::Io(e)) if matches!(e.kind(), io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock | io::ErrorKind::UnexpectedEof | io::ErrorKind::ConnectionReset | io::ErrorKind::ConnectionAborted | io::ErrorKind::BrokenPipe) => break,
+                Err(e) => return Err(h2_to_io(e)),
+            }
+
+            conn.send_pending_data().map_err(h2_to_io)?;
+            let mut ready: Vec<u32> = conn.streams.iter()
+                .filter(|(id, stream)| !answered.contains(*id) && stream.headers_received && stream.state() == StreamState::HalfClosedRemote)
+                .map(|(id, _)| *id)
+                .collect();
+            ready.sort_unstable();
+            for stream_id in ready {
+                answered.insert(stream_id);
+                let request = Self::http2_stream_request(&conn, stream_id);
+                Self::respond_http2(&mut conn, stream_id, request, config, handler)?;
+            }
+        }
+
+        let _ = conn.close();
+        Ok(())
+    }
+
+    fn http2_stream_request(conn: &Http2Connection, stream_id: u32) -> Result<HttpRequest, (u16, String)> {
+        let stream = conn.get_stream(stream_id).ok_or((400, "unknown stream".to_string()))?;
+        let headers = stream.response_headers();
+        let pseudo = |name: &str| headers.iter().find(|(k, _)| k == name).map(|(_, v)| v.as_str());
+        let method_name = pseudo(":method").ok_or((400, "missing :method".to_string()))?;
+        let method = HttpMethod::from_str(method_name).ok_or((501, format!("unsupported method {}", method_name)))?;
+        let mut request = HttpRequest::new(method, pseudo(":path").unwrap_or("/")).version(HttpVersion::Http2);
+        let has_host = headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("host"));
+        if let Some(authority) = pseudo(":authority").filter(|a| !has_host && !a.is_empty()) {
+            request.headers_mut().append("host".to_string(), authority.to_string());
+        }
+
+        for (name, value) in headers.iter().filter(|(k, _)| !k.starts_with(':')) {
+            request.headers_mut().append(name.clone(), value.clone());
+        }
+
+        let field = |name: &str| headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.as_str());
+        let body = Self::decode_request_body(stream.data().to_vec(), field("content-encoding"), field("digest"))
+            .map_err(|e| match e {
+                Http1ReadError::Reject(status, reason) => (status, reason),
+                other => (400, other.to_string()),
+            })?;
+
+        Ok(request.set_body(body))
+    }
+
+    fn respond_http2(conn: &mut Http2Connection, stream_id: u32, request: Result<HttpRequest, (u16, String)>, config: &HttpServerCfg, handler: Option<&HttpHandler>) -> io::Result<()> {
+        let (response, head_request) = match request {
+            Ok(request) => {
+                let base = match handler {
+                    Some(h) => h(&request),
+                    None => Self::default_handler(&request),
+                };
+
+                (Self::finalize_response_for_request(&request, base, config)?, request.method() == HttpMethod::HEAD)
+            }
+            Err((status, reason)) => {
+                eprintln!("Rejecting HTTP/2 stream {} with {}: {}", stream_id, status, reason);
+                (Self::error_response(status, &HttpResponse::default_reason_phrase(status)), false)
+            }
+        };
+
+        let mut headers = vec![(":status".to_string(), response.status_code().to_string())];
+        for (name, value) in response.header_fields() {
+            let name = name.to_ascii_lowercase();
+            if !h2c::is_hop_by_hop(&name) {
+                headers.push((name, value.clone()));
+            }
+        }
+
+        if !response.has_header("Content-Length") && !response.body().is_empty() {
+            headers.push(("content-length".to_string(), response.body().len().to_string()));
+        }
+
+        let body = if head_request || Self::is_bodyless_status(response.status_code()) {
+            None
+        } else {
+            Some(response.body().to_vec())
+        };
+
+        conn.send_request(stream_id, headers, body).map_err(h2_to_io)
     }
 
     fn wants_close(request: &HttpRequest) -> bool {
@@ -270,8 +436,18 @@ impl HttpServer {
 
     fn parse_request<R: BufRead, W: Write>(reader: &mut R, writer: &mut W, config: &HttpServerCfg) -> Result<HttpRequest, Http1ReadError> {
         let raw = Self::read_http1_request(reader, writer, &Http1RequestLimits::from_cfg(config))?;
-        let mut body = raw.body;
-        if let Some(enc) = raw.fields.iter().find(|(k, _)| k.eq_ignore_ascii_case("content-encoding")).map(|(_, v)| v.as_str()) {
+        let field = |name: &str| raw.fields.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.as_str());
+        let body = Self::decode_request_body(raw.body, field("content-encoding"), field("digest"))?;
+        let mut request = HttpRequest::new(raw.method, raw.target).version(raw.version);
+        for (name, value) in raw.fields {
+            request.headers_mut().append(name, value);
+        }
+
+        Ok(request.set_body(body))
+    }
+
+    fn decode_request_body(mut body: Vec<u8>, content_encoding: Option<&str>, digest: Option<&str>) -> Result<Vec<u8>, Http1ReadError> {
+        if let Some(enc) = content_encoding {
             if !enc.eq_ignore_ascii_case("identity") && !body.is_empty() {
                 let algo = CompressionAlgorithm::from_content_encoding(&enc.to_ascii_lowercase())
                     .ok_or_else(|| reject(415, format!("unsupported content-encoding {}", enc)))?;
@@ -279,16 +455,11 @@ impl HttpServer {
             }
         }
 
-        if let Some(digest_header) = raw.fields.iter().find(|(k, _)| k.eq_ignore_ascii_case("digest")).map(|(_, v)| v.as_str()) {
+        if let Some(digest_header) = digest {
             Self::verify_digest_header(&body, digest_header).map_err(|e| reject(400, e.to_string()))?;
         }
 
-        let mut request = HttpRequest::new(raw.method, raw.target).version(raw.version);
-        for (name, value) in raw.fields {
-            request.headers_mut().append(name, value);
-        }
-
-        Ok(request.set_body(body))
+        Ok(body)
     }
 
     pub fn read_http1_request<R: BufRead, W: Write>(reader: &mut R, writer: &mut W, limits: &Http1RequestLimits) -> Result<Http1RawRequest, Http1ReadError> {
@@ -309,6 +480,10 @@ impl HttpServer {
 
         let request_line = request_line.ok_or_else(|| reject(400, "no request line"))?;
         let request_line = String::from_utf8(request_line).map_err(|_| reject(400, "request line is not valid UTF-8"))?;
+        if request_line == h2c::PREFACE_REQUEST_LINE {
+            return Err(Http1ReadError::Http2Preface);
+        }
+
         let parts: Vec<&str> = request_line.split(' ').collect();
         let [method, target, version] = parts.as_slice() else {
             return Err(reject(400, "malformed request line"));
@@ -785,6 +960,64 @@ impl Default for Http1RequestLimits {
     }
 }
 
+impl Default for HttpServer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Default for HttpServerCfg {
+    fn default() -> Self {
+        Self {
+            max_connections: 100,
+            request_timeout: Duration::from_secs(30),
+            max_body_size: 10 * 1024 * 1024,
+            keep_alive_timeout: Duration::from_secs(5),
+            keep_alive: true,
+            default_version: HttpVersion::Http11,
+            max_request_line_size: 8 * 1024,
+            max_header_bytes: 64 * 1024,
+            max_header_count: 100,
+            auto_etag: true,
+            h2c_upgrade: true,
+            h2c_prior_knowledge: true,
+            http2_padding: PaddingStrategy::None,
+        }
+    }
+}
+
+impl std::fmt::Debug for HttpServer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HttpServer")
+            .field("cfg", &self.cfg)
+            .field("handler_installed", &self.handler.is_some())
+            .field("listener_installed", &self.listener.is_some())
+            .field("running", &self.running.load(Ordering::SeqCst))
+            .field("address", &self.address)
+            .finish()
+    }
+}
+
+impl From<io::Error> for Http1ReadError {
+    fn from(err: io::Error) -> Self {
+        match err.kind() {
+            io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock => Http1ReadError::Reject(408, "request timed out".to_string()),
+            _ => Http1ReadError::Io(err),
+        }
+    }
+}
+
+impl std::fmt::Display for Http1ReadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Http1ReadError::Closed => write!(f, "connection closed"),
+            Http1ReadError::Reject(status, reason) => write!(f, "{}: {}", status, reason),
+            Http1ReadError::Io(e) => write!(f, "{}", e),
+            Http1ReadError::Http2Preface => write!(f, "HTTP/2 connection preface"),
+        }
+    }
+}
+
 pub fn select_secure_http_server_profile_algorithm(accept_encoding: &str) -> CompressionAlgorithm {
     compression::parse_accept_encoding(accept_encoding).into_iter().find_map(|(algorithm, quality)| {
         if quality > 0.0 && algorithm.is_implemented() {
@@ -953,6 +1186,9 @@ fn serialize_http_server_profile(server: &HttpServer) -> Vec<u8> {
     lines.push(format!("max-header-bytes={}", server.cfg.max_header_bytes));
     lines.push(format!("max-header-count={}", server.cfg.max_header_count));
     lines.push(format!("auto-etag={}", server.cfg.auto_etag));
+    lines.push(format!("h2c-upgrade={}", server.cfg.h2c_upgrade));
+    lines.push(format!("h2c-prior-knowledge={}", server.cfg.h2c_prior_knowledge));
+    lines.push(format!("http2-padding={}", server.cfg.http2_padding));
     lines.push(format!("handler-installed={}", server.handler.is_some()));
     lines.push(format!(
         "running={}",
@@ -1029,6 +1265,15 @@ fn deserialize_http_server_profile(raw_payload: &[u8]) -> io::Result<HttpServer>
             }
             "auto-etag" => {
                 cfg.auto_etag = parse_bool(value.trim())?;
+            }
+            "h2c-upgrade" => {
+                cfg.h2c_upgrade = parse_bool(value.trim())?;
+            }
+            "h2c-prior-knowledge" => {
+                cfg.h2c_prior_knowledge = parse_bool(value.trim())?;
+            }
+            "http2-padding" => {
+                cfg.http2_padding = value.parse::<PaddingStrategy>().map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
             }
             "default-version" => {
                 cfg.default_version = HttpVersion::from_str(value.trim()).ok_or_else(|| {
@@ -1357,57 +1602,16 @@ fn is_valid_host(value: &str) -> bool {
     true
 }
 
-impl Default for HttpServer {
-    fn default() -> Self {
-        Self::new()
-    }
+fn request_fields(request: &HttpRequest) -> Vec<(String, String)> {
+    request.headers().iter()
+        .flat_map(|(name, values)| values.iter().map(move |value| (name.clone(), value.clone())))
+        .collect()
 }
 
-impl Default for HttpServerCfg {
-    fn default() -> Self {
-        Self {
-            max_connections: 100,
-            request_timeout: Duration::from_secs(30),
-            max_body_size: 10 * 1024 * 1024,
-            keep_alive_timeout: Duration::from_secs(5),
-            keep_alive: true,
-            default_version: HttpVersion::Http11,
-            max_request_line_size: 8 * 1024,
-            max_header_bytes: 64 * 1024,
-            max_header_count: 100,
-            auto_etag: true,
-        }
-    }
-}
-
-impl std::fmt::Debug for HttpServer {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("HttpServer")
-            .field("cfg", &self.cfg)
-            .field("handler_installed", &self.handler.is_some())
-            .field("listener_installed", &self.listener.is_some())
-            .field("running", &self.running.load(Ordering::SeqCst))
-            .field("address", &self.address)
-            .finish()
-    }
-}
-
-impl From<io::Error> for Http1ReadError {
-    fn from(err: io::Error) -> Self {
-        match err.kind() {
-            io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock => Http1ReadError::Reject(408, "request timed out".to_string()),
-            _ => Http1ReadError::Io(err),
-        }
-    }
-}
-
-impl std::fmt::Display for Http1ReadError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Http1ReadError::Closed => write!(f, "connection closed"),
-            Http1ReadError::Reject(status, reason) => write!(f, "{}: {}", status, reason),
-            Http1ReadError::Io(e) => write!(f, "{}", e),
-        }
+fn h2_to_io(err: Http2Error) -> io::Error {
+    match err {
+        Http2Error::Io(e) => e,
+        e => io::Error::new(io::ErrorKind::Other, format!("HTTP/2 error: {}", e)),
     }
 }
 
@@ -1415,6 +1619,7 @@ impl std::fmt::Display for Http1ReadError {
 mod tests {
     use super::*;
     use std::io::Cursor;
+    use crate::net::http::http2::H2cMode;
 
     const BODY: &[u8] = b"0123456789abcdefghij";
 
@@ -1484,6 +1689,27 @@ mod tests {
 
     fn get(extra_headers: &str) -> Vec<u8> {
         format!("GET /file HTTP/1.1\r\nHost: example.com\r\n{}\r\n", extra_headers).into_bytes()
+    }
+
+    fn spawn_h2c_server(cfg: HttpServerCfg, connections: usize) -> (u16, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = thread::spawn(move || {
+            for _ in 0..connections {
+                let (stream, peer) = listener.accept().unwrap();
+                HttpServer::handle_connection(stream, peer, cfg.clone(), Some(echo_handler())).unwrap();
+            }
+        });
+
+        (port, handle)
+    }
+
+    fn h2c_test_cfg() -> HttpServerCfg {
+        HttpServerCfg { request_timeout: Duration::from_secs(5), ..HttpServerCfg::default() }
+    }
+
+    fn h2c_client(mode: H2cMode) -> crate::net::http::HttpClient {
+        crate::net::http::HttpClient::builder().h2c(mode).timeout(Duration::from_secs(5)).build()
     }
 
     #[test]
@@ -1713,6 +1939,160 @@ mod tests {
         assert_eq!(http10_keep_alive.len(), 2);
         assert_eq!(http10_keep_alive[0].header("connection"), Some("keep-alive"));
         assert_eq!(http10_keep_alive[1].header("connection"), Some("close"));
+    }
+
+    #[test]
+    fn test_h2c_prior_knowledge_end_to_end() {
+        let (port, server) = spawn_h2c_server(h2c_test_cfg(), 1);
+        let mut client = h2c_client(H2cMode::PriorKnowledge);
+
+        let first = client.get(&format!("http://127.0.0.1:{}/file", port)).unwrap();
+        assert_eq!(first.version(), HttpVersion::Http2);
+        assert_eq!(first.status_code(), 200);
+        assert_eq!(first.body(), BODY);
+        assert_eq!(first.header("content-type").map(String::as_str), Some("text/plain"));
+        assert!(first.header("etag").is_some());
+
+        let second = client.post(&format!("http://127.0.0.1:{}/echo", port), b"over h2c".to_vec()).unwrap();
+        assert_eq!(second.version(), HttpVersion::Http2);
+        assert_eq!(second.body(), b"over h2c", "the second request reuses the single accepted connection");
+
+        drop(client);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn test_h2c_upgrade_end_to_end() {
+        let (port, server) = spawn_h2c_server(h2c_test_cfg(), 1);
+        let mut client = h2c_client(H2cMode::Upgrade);
+
+        let upgraded = client.post(&format!("http://127.0.0.1:{}/echo", port), b"sent as HTTP/1.1".to_vec()).unwrap();
+        assert_eq!(upgraded.version(), HttpVersion::Http2, "the response to the upgrade request arrives on stream 1");
+        assert_eq!(upgraded.status_code(), 200);
+        assert_eq!(upgraded.body(), b"sent as HTTP/1.1");
+
+        let follow_up = client.get(&format!("http://127.0.0.1:{}/file", port)).unwrap();
+        assert_eq!(follow_up.version(), HttpVersion::Http2);
+        assert_eq!(follow_up.body(), BODY);
+
+        drop(client);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn test_h2c_upgrade_declined_falls_back_to_http1() {
+        let cfg = HttpServerCfg { h2c_upgrade: false, ..h2c_test_cfg() };
+        let (port, server) = spawn_h2c_server(cfg, 2);
+        let mut client = h2c_client(H2cMode::Upgrade);
+
+        let declined = client.get(&format!("http://127.0.0.1:{}/file", port)).unwrap();
+        assert_eq!(declined.version(), HttpVersion::Http11);
+        assert_eq!(declined.body(), BODY);
+
+        let next = client.get(&format!("http://127.0.0.1:{}/file", port)).unwrap();
+        assert_eq!(next.version(), HttpVersion::Http11, "a host that declined is not asked to upgrade again");
+
+        drop(client);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn test_h2c_upgrade_wire_sequence() {
+        use crate::net::http::http2::{Frame, FrameFlags, FrameType, HpackCodec};
+        use std::io::{Read, Write as _};
+
+        let cfg = HttpServerCfg { http2_padding: PaddingStrategy::Fixed(8), ..h2c_test_cfg() };
+        let (port, server) = spawn_h2c_server(cfg, 1);
+        let mut socket = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let settings = h2c::encode_http2_settings(&[(0x3, 10)]);
+        socket.write_all(format!(
+            "GET /file HTTP/1.1\r\nHost: example.com\r\nConnection: Upgrade, HTTP2-Settings\r\nUpgrade: h2c\r\nHTTP2-Settings: {}\r\n\r\n",
+            settings
+        ).as_bytes()).unwrap();
+
+        let mut head = Vec::new();
+        while !head.ends_with(b"\r\n\r\n") {
+            let mut byte = [0u8; 1];
+            socket.read_exact(&mut byte).unwrap();
+            head.push(byte[0]);
+        }
+        assert_eq!(head, h2c::SWITCHING_PROTOCOLS_RESPONSE);
+
+        let first = Frame::read(&mut socket).unwrap();
+        assert_eq!(first.header.frame_type, FrameType::Settings, "the server's first HTTP/2 frame must be SETTINGS");
+        assert!(!first.header.flags.has(FrameFlags::ACK));
+
+        socket.write_all(CLIENT_PREFACE).unwrap();
+        Frame::settings(Vec::new()).write(&mut socket).unwrap();
+        Frame::settings_ack().write(&mut socket).unwrap();
+
+        let mut decoder = HpackCodec::new(4096);
+        let mut status = None;
+        let mut body = Vec::new();
+        loop {
+            let frame = Frame::read(&mut socket).unwrap();
+            if frame.header.stream_id != 1 {
+                continue;
+            }
+
+            let pad = frame.pad_length().expect("server applies its padding strategy") as usize;
+            let content = &frame.payload[1..frame.payload.len() - pad];
+            match frame.header.frame_type {
+                FrameType::Headers => status = decoder.decode(content).unwrap().get(":status").cloned(),
+                FrameType::Data => body.extend_from_slice(content),
+                other => panic!("unexpected {:?} on stream 1", other),
+            }
+
+            if frame.header.flags.has(FrameFlags::END_STREAM) {
+                break;
+            }
+        }
+
+        assert_eq!(status.as_deref(), Some("200"));
+        assert_eq!(body, BODY);
+        drop(socket);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn test_h2c_preface_rules_on_http1_connections() {
+        let disabled = HttpServerCfg { h2c_prior_knowledge: false, ..HttpServerCfg::default() };
+        let wire = exchange_with(&disabled, echo_handler(), CLIENT_PREFACE);
+        assert_eq!(parse_wire(&wire, false)[0].status, 505);
+
+        let mut late = get("");
+        late.extend_from_slice(CLIENT_PREFACE);
+        let responses = exchange(&late);
+        assert_eq!(responses.len(), 2);
+        assert_eq!(responses[0].status, 200);
+        assert_eq!(responses[1].status, 400, "the preface is only valid as the first bytes on the connection");
+
+        let mangled = exchange(b"PRI * HTTP/2.0\r\n\r\nXX\r\n\r\n");
+        assert_eq!(mangled[0].status, 400);
+
+        let mut reader = Cursor::new(CLIENT_PREFACE.to_vec());
+        let exit = HttpServer::serve_connection(&mut reader, &mut Vec::new(), &HttpServerCfg::default(), None).unwrap();
+        assert!(matches!(exit, Http1Exit::PriorKnowledge));
+        assert_eq!(reader.position() as usize, CLIENT_PREFACE.len(), "nothing past the preface is consumed");
+    }
+
+    #[test]
+    fn test_invalid_or_disabled_upgrades_are_served_as_http1() {
+        let no_settings = exchange(&get("Connection: Upgrade\r\nUpgrade: h2c\r\n"));
+        assert_eq!(no_settings[0].status, 200);
+        assert_eq!(no_settings[0].body, BODY);
+
+        let token = h2c::encode_http2_settings(&[(0x3, 10)]);
+        let upgrade = get(&format!("Connection: Upgrade, HTTP2-Settings\r\nUpgrade: h2c\r\nHTTP2-Settings: {}\r\n", token));
+        let disabled = HttpServerCfg { h2c_upgrade: false, ..HttpServerCfg::default() };
+        assert_eq!(parse_wire(&exchange_with(&disabled, echo_handler(), &upgrade), false)[0].status, 200);
+
+        let http10 = format!("GET /file HTTP/1.0\r\nConnection: Upgrade, HTTP2-Settings\r\nUpgrade: h2c\r\nHTTP2-Settings: {}\r\n\r\n", token);
+        assert_eq!(exchange(http10.as_bytes())[0].status, 200, "HTTP/1.0 requests cannot upgrade");
+
+        let wire = exchange_with(&HttpServerCfg::default(), echo_handler(), &upgrade);
+        assert_eq!(wire, h2c::SWITCHING_PROTOCOLS_RESPONSE);
     }
 
     #[test]

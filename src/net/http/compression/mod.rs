@@ -9,8 +9,11 @@ use crate::crypto::encoding::pem;
 use crate::crypto::hash::hmac::hmac_sha256;
 use crate::crypto::hash::sha2::sha256;
 use crate::crypto::random;
+
 use std::io;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+pub const MAX_DECOMPRESSED_SIZE: usize = 64 * 1024 * 1024;
 
 const COMPRESSION_BLOB_MAGIC: &str = "SINGULARITY_HTTP_COMPRESSION_BLOB_V1";
 const COMPRESSION_BLOB_CONTEXT: &str = "SINGULARITY_HTTP_COMPRESSION_BLOB_BINDING_V1";
@@ -26,6 +29,17 @@ pub struct SecureCompressionBlobMeta {
     pub issued_at_unix: u64,
 }
 
+#[derive(Debug, Clone)]
+pub struct CompressionConfig {
+    pub enabled: bool,
+    pub algorithms: Vec<CompressionAlgorithm>,
+    pub min_size: usize,
+    pub max_size: Option<usize>,
+    pub level: CompressionLevel,
+    pub excluded_content_types: Vec<String>,
+    pub prefer_algorithm: Option<CompressionAlgorithm>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompressionAlgorithm {
     Gzip,
@@ -33,6 +47,28 @@ pub enum CompressionAlgorithm {
     Brotli,
     Zstd,
     Identity,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompressionLevel {
+    Fast,
+    Default,
+    Best,
+    Custom(u8),
+}
+
+pub trait Compressor {
+    fn compress(&mut self, input: &[u8]) -> io::Result<Vec<u8>>;
+    fn compress_stream(&mut self, input: &[u8], output: &mut Vec<u8>) -> io::Result<()>;
+    fn finish(&mut self) -> io::Result<Vec<u8>>;
+    fn reset(&mut self);
+}
+
+pub trait Decompressor {
+    fn decompress(&mut self, input: &[u8]) -> io::Result<Vec<u8>>;
+    fn decompress_stream(&mut self, input: &[u8], output: &mut Vec<u8>) -> io::Result<()>;
+    fn finish(&mut self) -> io::Result<Vec<u8>>;
+    fn reset(&mut self);
 }
 
 impl CompressionAlgorithm {
@@ -88,14 +124,6 @@ impl CompressionAlgorithm {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CompressionLevel {
-    Fast,
-    Default,
-    Best,
-    Custom(u8),
-}
-
 impl CompressionLevel {
     pub fn deflate_level(&self) -> u8 {
         match self {
@@ -123,31 +151,6 @@ impl CompressionLevel {
             CompressionLevel::Custom(level) => (*level as i32).min(22),
         }
     }
-}
-
-pub trait Compressor {
-    fn compress(&mut self, input: &[u8]) -> io::Result<Vec<u8>>;
-    fn compress_stream(&mut self, input: &[u8], output: &mut Vec<u8>) -> io::Result<()>;
-    fn finish(&mut self) -> io::Result<Vec<u8>>;
-    fn reset(&mut self);
-}
-
-pub trait Decompressor {
-    fn decompress(&mut self, input: &[u8]) -> io::Result<Vec<u8>>;
-    fn decompress_stream(&mut self, input: &[u8], output: &mut Vec<u8>) -> io::Result<()>;
-    fn finish(&mut self) -> io::Result<Vec<u8>>;
-    fn reset(&mut self);
-}
-
-#[derive(Debug, Clone)]
-pub struct CompressionConfig {
-    pub enabled: bool,
-    pub algorithms: Vec<CompressionAlgorithm>,
-    pub min_size: usize,
-    pub max_size: Option<usize>,
-    pub level: CompressionLevel,
-    pub excluded_content_types: Vec<String>,
-    pub prefer_algorithm: Option<CompressionAlgorithm>,
 }
 
 impl CompressionConfig {
@@ -191,6 +194,48 @@ impl CompressionConfig {
         }
 
         None
+    }
+}
+
+impl Default for CompressionLevel {
+    fn default() -> Self {
+        CompressionLevel::Default
+    }
+}
+
+impl Default for CompressionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            algorithms: vec![
+                CompressionAlgorithm::Brotli,
+                CompressionAlgorithm::Zstd,
+                CompressionAlgorithm::Gzip,
+                CompressionAlgorithm::Deflate,
+            ],
+            min_size: 860,
+            max_size: Some(10 * 1024 * 1024),
+            level: CompressionLevel::Default,
+            excluded_content_types: vec![
+                // Images
+                "image/jpeg".to_string(),
+                "image/png".to_string(),
+                "image/gif".to_string(),
+                "image/webp".to_string(),
+                "image/avif".to_string(),
+                // Video
+                "video/".to_string(),
+                // Audio
+                "audio/".to_string(),
+                // Already compressed
+                "application/zip".to_string(),
+                "application/gzip".to_string(),
+                "application/x-bzip2".to_string(),
+                "application/x-7z-compressed".to_string(),
+                "application/x-rar-compressed".to_string(),
+            ],
+            prefer_algorithm: Some(CompressionAlgorithm::Brotli),
+        }
     }
 }
 
@@ -368,8 +413,6 @@ pub fn compress(algorithm: CompressionAlgorithm, data: &[u8], level: Compression
         CompressionAlgorithm::Identity => Ok(data.to_vec()),
     }
 }
-
-pub const MAX_DECOMPRESSED_SIZE: usize = 64 * 1024 * 1024;
 
 pub fn decompress(algorithm: CompressionAlgorithm, data: &[u8]) -> io::Result<Vec<u8>> {
     decompress_bounded(algorithm, data, MAX_DECOMPRESSED_SIZE)
@@ -589,48 +632,6 @@ fn parse_secure_compression_blob_meta(header: &str, body_len: usize) -> io::Resu
         encoded_size,
         issued_at_unix,
     })
-}
-
-impl Default for CompressionLevel {
-    fn default() -> Self {
-        CompressionLevel::Default
-    }
-}
-
-impl Default for CompressionConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            algorithms: vec![
-                CompressionAlgorithm::Brotli,
-                CompressionAlgorithm::Zstd,
-                CompressionAlgorithm::Gzip,
-                CompressionAlgorithm::Deflate,
-            ],
-            min_size: 860,
-            max_size: Some(10 * 1024 * 1024),
-            level: CompressionLevel::Default,
-            excluded_content_types: vec![
-                // Images
-                "image/jpeg".to_string(),
-                "image/png".to_string(),
-                "image/gif".to_string(),
-                "image/webp".to_string(),
-                "image/avif".to_string(),
-                // Video
-                "video/".to_string(),
-                // Audio
-                "audio/".to_string(),
-                // Already compressed
-                "application/zip".to_string(),
-                "application/gzip".to_string(),
-                "application/x-bzip2".to_string(),
-                "application/x-7z-compressed".to_string(),
-                "application/x-rar-compressed".to_string(),
-            ],
-            prefer_algorithm: Some(CompressionAlgorithm::Brotli),
-        }
-    }
 }
 
 #[cfg(test)]

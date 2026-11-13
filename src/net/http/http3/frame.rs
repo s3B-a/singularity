@@ -1,11 +1,12 @@
-use super::error::{Error, ErrorCode, Result};
-use super::{decode_varint, encode_varint, ConnectionId};
 use crate::crypto::constant_time_eq;
 use crate::crypto::encoding::pem;
 use crate::crypto::hash::hmac::hmac_sha256;
 use crate::crypto::hash::sha2::sha256;
 use crate::crypto::random;
 use crate::net::http::compression::{self, CompressionAlgorithm, CompressionLevel};
+use super::error::{Error, ErrorCode, Result};
+use super::{decode_varint, encode_varint, ConnectionId};
+
 use std::fmt;
 use std::io;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -22,6 +23,12 @@ pub struct SecureFrameBlobMeta {
     pub raw_size: usize,
     pub encoded_size: usize,
     pub issued_at_unix: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AckRange {
+    pub gap: u64,
+    pub len: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,46 +55,6 @@ pub enum FrameType {
     ConnectionClose = 0x1c,
     ConnectionCloseApp = 0x1d,
     HandshakeDone = 0x1e,
-}
-
-impl FrameType {
-    pub fn from_u64(value: u64) -> Result<Self> {
-        match value {
-            0x00 => Ok(FrameType::Padding),
-            0x01 => Ok(FrameType::Ping),
-            0x02 => Ok(FrameType::Ack),
-            0x03 => Ok(FrameType::AckEcn),
-            0x04 => Ok(FrameType::ResetStream),
-            0x05 => Ok(FrameType::StopSending),
-            0x06 => Ok(FrameType::Crypto),
-            0x07 => Ok(FrameType::NewToken),
-            0x08..=0x0f => Ok(FrameType::Stream),
-            0x10 => Ok(FrameType::MaxData),
-            0x11 => Ok(FrameType::MaxStreamData),
-            0x12 | 0x13 => Ok(FrameType::MaxStreams),
-            0x14 => Ok(FrameType::DataBlocked),
-            0x15 => Ok(FrameType::StreamDataBlocked),
-            0x16 | 0x17 => Ok(FrameType::StreamsBlocked),
-            0x18 => Ok(FrameType::NewConnectionId),
-            0x19 => Ok(FrameType::RetireConnectionId),
-            0x1a => Ok(FrameType::PathChallenge),
-            0x1b => Ok(FrameType::PathResponse),
-            0x1c => Ok(FrameType::ConnectionClose),
-            0x1d => Ok(FrameType::ConnectionCloseApp),
-            0x1e => Ok(FrameType::HandshakeDone),
-            _ => Err(Error::InvalidFrame),
-        }
-    }
-
-    pub fn is_ack_eliciting(&self) -> bool {
-        !matches!(self, FrameType::Ack | FrameType::AckEcn | FrameType::Padding | FrameType::ConnectionClose | FrameType::ConnectionCloseApp)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AckRange {
-    pub gap: u64,
-    pub len: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -191,6 +158,40 @@ pub enum Frame {
     },
 
     HandshakeDone,
+}
+
+impl FrameType {
+    pub fn from_u64(value: u64) -> Result<Self> {
+        match value {
+            0x00 => Ok(FrameType::Padding),
+            0x01 => Ok(FrameType::Ping),
+            0x02 => Ok(FrameType::Ack),
+            0x03 => Ok(FrameType::AckEcn),
+            0x04 => Ok(FrameType::ResetStream),
+            0x05 => Ok(FrameType::StopSending),
+            0x06 => Ok(FrameType::Crypto),
+            0x07 => Ok(FrameType::NewToken),
+            0x08..=0x0f => Ok(FrameType::Stream),
+            0x10 => Ok(FrameType::MaxData),
+            0x11 => Ok(FrameType::MaxStreamData),
+            0x12 | 0x13 => Ok(FrameType::MaxStreams),
+            0x14 => Ok(FrameType::DataBlocked),
+            0x15 => Ok(FrameType::StreamDataBlocked),
+            0x16 | 0x17 => Ok(FrameType::StreamsBlocked),
+            0x18 => Ok(FrameType::NewConnectionId),
+            0x19 => Ok(FrameType::RetireConnectionId),
+            0x1a => Ok(FrameType::PathChallenge),
+            0x1b => Ok(FrameType::PathResponse),
+            0x1c => Ok(FrameType::ConnectionClose),
+            0x1d => Ok(FrameType::ConnectionCloseApp),
+            0x1e => Ok(FrameType::HandshakeDone),
+            _ => Err(Error::InvalidFrame),
+        }
+    }
+
+    pub fn is_ack_eliciting(&self) -> bool {
+        !matches!(self, FrameType::Ack | FrameType::AckEcn | FrameType::Padding | FrameType::ConnectionClose | FrameType::ConnectionCloseApp)
+    }
 }
 
 impl Frame {
@@ -863,6 +864,35 @@ impl Frame {
     }
 }
 
+impl fmt::Display for FrameType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            FrameType::Padding => write!(f, "PADDING"),
+            FrameType::Ping => write!(f, "PING"),
+            FrameType::Ack => write!(f, "ACK"),
+            FrameType::AckEcn => write!(f, "ACK_ECN"),
+            FrameType::ResetStream => write!(f, "RESET_STREAM"),
+            FrameType::StopSending => write!(f, "STOP_SENDING"),
+            FrameType::Crypto => write!(f, "CRYPTO"),
+            FrameType::NewToken => write!(f, "NEW_TOKEN"),
+            FrameType::Stream => write!(f, "STREAM"),
+            FrameType::MaxData => write!(f, "MAX_DATA"),
+            FrameType::MaxStreamData => write!(f, "MAX_STREAM_DATA"),
+            FrameType::MaxStreams => write!(f, "MAX_STREAMS"),
+            FrameType::DataBlocked => write!(f, "DATA_BLOCKED"),
+            FrameType::StreamDataBlocked => write!(f, "STREAM_DATA_BLOCKED"),
+            FrameType::StreamsBlocked => write!(f, "STREAMS_BLOCKED"),
+            FrameType::NewConnectionId => write!(f, "NEW_CONNECTION_ID"),
+            FrameType::RetireConnectionId => write!(f, "RETIRE_CONNECTION_ID"),
+            FrameType::PathChallenge => write!(f, "PATH_CHALLENGE"),
+            FrameType::PathResponse => write!(f, "PATH_RESPONSE"),
+            FrameType::ConnectionClose => write!(f, "CONNECTION_CLOSE"),
+            FrameType::ConnectionCloseApp => write!(f, "CONNECTION_CLOSE_APP"),
+            FrameType::HandshakeDone => write!(f, "HANDSHAKE_DONE"),
+        }
+    }
+}
+
 pub fn select_secure_frame_algorithm(accept_encoding: &str) -> CompressionAlgorithm {
     let accepted = compression::parse_accept_encoding(accept_encoding);
     for (algorithm, quality) in accepted {
@@ -1076,35 +1106,6 @@ fn parse_secure_frame_meta(header: &str, body_len: usize) -> io::Result<SecureFr
     }
 
     Ok(meta)
-}
-
-impl fmt::Display for FrameType {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            FrameType::Padding => write!(f, "PADDING"),
-            FrameType::Ping => write!(f, "PING"),
-            FrameType::Ack => write!(f, "ACK"),
-            FrameType::AckEcn => write!(f, "ACK_ECN"),
-            FrameType::ResetStream => write!(f, "RESET_STREAM"),
-            FrameType::StopSending => write!(f, "STOP_SENDING"),
-            FrameType::Crypto => write!(f, "CRYPTO"),
-            FrameType::NewToken => write!(f, "NEW_TOKEN"),
-            FrameType::Stream => write!(f, "STREAM"),
-            FrameType::MaxData => write!(f, "MAX_DATA"),
-            FrameType::MaxStreamData => write!(f, "MAX_STREAM_DATA"),
-            FrameType::MaxStreams => write!(f, "MAX_STREAMS"),
-            FrameType::DataBlocked => write!(f, "DATA_BLOCKED"),
-            FrameType::StreamDataBlocked => write!(f, "STREAM_DATA_BLOCKED"),
-            FrameType::StreamsBlocked => write!(f, "STREAMS_BLOCKED"),
-            FrameType::NewConnectionId => write!(f, "NEW_CONNECTION_ID"),
-            FrameType::RetireConnectionId => write!(f, "RETIRE_CONNECTION_ID"),
-            FrameType::PathChallenge => write!(f, "PATH_CHALLENGE"),
-            FrameType::PathResponse => write!(f, "PATH_RESPONSE"),
-            FrameType::ConnectionClose => write!(f, "CONNECTION_CLOSE"),
-            FrameType::ConnectionCloseApp => write!(f, "CONNECTION_CLOSE_APP"),
-            FrameType::HandshakeDone => write!(f, "HANDSHAKE_DONE"),
-        }
-    }
 }
 
 #[cfg(test)]

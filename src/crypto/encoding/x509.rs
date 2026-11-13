@@ -7,37 +7,6 @@ use crate::crypto::encoding::pem;
 
 const KEY_USAGE_KEY_CERT_SIGN: u16 = 0x0400;
 
-mod ext_oid {
-    pub const SUBJECT_ALT_NAME: [u64; 4] = [2, 5, 29, 17];
-    pub const BASIC_CONSTRAINTS: [u64; 4] = [2, 5, 29, 19];
-    pub const KEY_USAGE: [u64; 4] = [2, 5, 29, 15];
-    pub const SUBJECT_KEY_IDENTIFIER: [u64; 4] = [2, 5, 29, 14];
-    pub const AUTHORITY_KEY_IDENTIFIER: [u64; 4] = [2, 5, 29, 35];
-    pub const EXTENDED_KEY_USAGE: [u64; 4] = [2, 5, 29, 37];
-    pub const EKU_SERVER_AUTH: [u64; 9] = [1, 3, 6, 1, 5, 5, 7, 3, 1];
-    pub const EKU_ANY: [u64; 5] = [2, 5, 29, 37, 0];
-    pub const CRL_DISTRIBUTION_POINTS: [u64; 4] = [2, 5, 29, 31];
-    pub const SIGNED_CERTIFICATE_TIMESTAMP_LIST: [u64; 10] = [1, 3, 6, 1, 4, 1, 11129, 2, 4, 2];
-}
-
-/**
- * Reads an Extension's `extnID` and skips its OPTIONAL `critical` BOOLEAN (DEFAULT FALSE)
- * without touching the following `extnValue` OCTET STRING
- * Args:
- *    ext - &mut DerDecoder: The decoder positioned at the start of an Extension SEQUENCE
- *
- * Returns:
- *    Result<Vec<u64>>: The extension's OID
- */
-fn read_extension_header(ext: &mut DerDecoder) -> Result<Vec<u64>> {
-    let oid = ext.object_identifier()?;
-    if ext.has_more() && ext.peek_tag().map(|t| t == Tag::Boolean as u8).unwrap_or(false) {
-        let _critical = ext.boolean()?;
-    }
-
-    Ok(oid)
-}
-
 // X.509 Name and Certificate structures
 #[derive(Clone, Debug)]
 pub struct Name {
@@ -1018,6 +987,24 @@ pub fn verify_tbs_signature(tbs: &[u8], signature_algorithm: &[u64], signature: 
 }
 
 /**
+ * Reads an Extension's `extnID` and skips its OPTIONAL `critical` BOOLEAN (DEFAULT FALSE)
+ * without touching the following `extnValue` OCTET STRING
+ * Args:
+ *    ext - &mut DerDecoder: The decoder positioned at the start of an Extension SEQUENCE
+ *
+ * Returns:
+ *    Result<Vec<u64>>: The extension's OID
+ */
+fn read_extension_header(ext: &mut DerDecoder) -> Result<Vec<u64>> {
+    let oid = ext.object_identifier()?;
+    if ext.has_more() && ext.peek_tag().map(|t| t == Tag::Boolean as u8).unwrap_or(false) {
+        let _critical = ext.boolean()?;
+    }
+
+    Ok(oid)
+}
+
+/**
  * Parses an X.509 Name from a DerDecoder
  * Args:
  *    decoder - &mut DerDecoder: The DerDecoder positioned at the Name
@@ -1074,26 +1061,6 @@ fn parse_spki(decoder: &mut DerDecoder) -> Result<SubjectPublicKeyInfo> {
         param,
         public_key,
     })
-}
-
-/**
- * Parses ASN.1 time (UTCTime or GeneralizedTime) to Unix timestamp
- * Args:
- *    decoder: &mut DerDecoder - The decoder positioned at a time value
- * 
- * Returns:
- *    Result<i64>: Unix timestamp (seconds since epoch) or error
- */
-pub(crate) fn parse_time(decoder: &mut DerDecoder) -> Result<i64> {
-    let elem = decoder.read_element()?;
-    
-    match elem.tag {
-        0x17 => parse_utc_time(&elem.data),
-        0x18 => parse_generalized_time(&elem.data),
-        _ => Err(crate::crypto::Error::InvalidData(
-            format!("Expected time type, got tag: 0x{:02X}", elem.tag)
-        )),
-    }
 }
 
 /**
@@ -1335,6 +1302,39 @@ fn hostname_matches(pattern: &str, hostname: &str) -> bool {
     }
 
     false
+}
+
+/**
+ * Parses ASN.1 time (UTCTime or GeneralizedTime) to Unix timestamp
+ * Args:
+ *    decoder: &mut DerDecoder - The decoder positioned at a time value
+ * 
+ * Returns:
+ *    Result<i64>: Unix timestamp (seconds since epoch) or error
+ */
+pub(crate) fn parse_time(decoder: &mut DerDecoder) -> Result<i64> {
+    let elem = decoder.read_element()?;
+    
+    match elem.tag {
+        0x17 => parse_utc_time(&elem.data),
+        0x18 => parse_generalized_time(&elem.data),
+        _ => Err(crate::crypto::Error::InvalidData(
+            format!("Expected time type, got tag: 0x{:02X}", elem.tag)
+        )),
+    }
+}
+
+mod ext_oid {
+    pub const SUBJECT_ALT_NAME: [u64; 4] = [2, 5, 29, 17];
+    pub const BASIC_CONSTRAINTS: [u64; 4] = [2, 5, 29, 19];
+    pub const KEY_USAGE: [u64; 4] = [2, 5, 29, 15];
+    pub const SUBJECT_KEY_IDENTIFIER: [u64; 4] = [2, 5, 29, 14];
+    pub const AUTHORITY_KEY_IDENTIFIER: [u64; 4] = [2, 5, 29, 35];
+    pub const EXTENDED_KEY_USAGE: [u64; 4] = [2, 5, 29, 37];
+    pub const EKU_SERVER_AUTH: [u64; 9] = [1, 3, 6, 1, 5, 5, 7, 3, 1];
+    pub const EKU_ANY: [u64; 5] = [2, 5, 29, 37, 0];
+    pub const CRL_DISTRIBUTION_POINTS: [u64; 4] = [2, 5, 29, 31];
+    pub const SIGNED_CERTIFICATE_TIMESTAMP_LIST: [u64; 10] = [1, 3, 6, 1, 4, 1, 11129, 2, 4, 2];
 }
 
 #[cfg(test)]
